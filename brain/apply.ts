@@ -252,9 +252,26 @@ export async function applyRatified(
     ts: receipt.postedAt,
   });
   if (!recorded) {
+    // W3a (issue #2): WRITE THE DISTINCTION DOWN, here, where it is known.
+    //
+    // Both failure branches above park the work item in `applied`, and from
+    // storage the two are indistinguishable — same status, same ratification,
+    // same `applied` receipt, no `posted` receipt. But they mean opposite
+    // things to a reconcile: the branch above never posted, and THIS branch
+    // did. Leaving the difference in this function's return value alone meant
+    // it died with the process, and a later reconcile had to guess. Guessing
+    // wrong here appends a false line to a public append-only ledger.
+    //
+    // So the marker is recorded before returning. It is deliberately a bare
+    // audit event and not a phase change: nothing about the work item's state
+    // has changed, only what Atlas knows about the post. If this write ALSO
+    // fails (a genuinely degraded store), reconcile's channel cross-check is
+    // the second line of defence for the same fact.
+    deps.state.recordLedgerPostUnrecorded(record.id, receipt.messageId);
     warn(
       `ledger post ${receipt.messageId} landed but its receipt did not record for ` +
-        `${record.id} — the work item stays applied and a reconcile may see it as unposted`,
+        `${record.id} — the work item stays applied; recorded a post-landed marker so ` +
+        `reconcile does not double-post it`,
     );
     return {
       kind: "applied-not-posted",
