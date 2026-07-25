@@ -73,6 +73,36 @@ export interface LedgerTransport {
   post(channelId: string, content: string): Promise<string | null>;
 }
 
+/**
+ * ONE message already in the ledger channel, as seen by a READ (W3a, issue #2).
+ * Deliberately a separate port from `LedgerTransport`: the transport WRITES to
+ * one configured channel, this READS the same one, and keeping them apart means
+ * a reconcile that only wants to look cannot be handed something that can post.
+ */
+export interface LedgerMessage {
+  readonly id: string;
+  /** The message text. UNTRUSTED — matched against, never interpreted or echoed. */
+  readonly content: string;
+  /** Epoch ms. Bounds the window a "this post is gone" conclusion may be drawn in. */
+  readonly createdAt: number;
+}
+
+/**
+ * The channel cross-check (issue #2: *"Atlas's own event log is the primary
+ * index; channel read as cross-check"*).
+ *
+ * OPTIONAL everywhere it is consumed, and used SUBTRACTIVELY ONLY for the
+ * dangerous question — it may remove an item from a catch-up ("that post is
+ * already there"), never add one on the strength of a read that could simply
+ * have missed it. The one place it may ADD drift is a ✅ whose recorded message
+ * id has vanished from a window that provably covers it, which is the deleted-
+ * post kill test and is guarded by `createdAt` (see `reconcile.ts`).
+ */
+export interface LedgerReader {
+  /** Newest-first, bounded. `null` means the channel could not be read AT ALL. */
+  recentMessages(limit: number): Promise<readonly LedgerMessage[] | null>;
+}
+
 /** The receipt a successful post yields. */
 export interface PostReceipt {
   readonly messageId: string;
@@ -169,6 +199,105 @@ export function completionPost(items: readonly CompletionItem[], mapUrl: string)
   return clamp(`${header}\n${rendered.join("\n")}${tail}\n${FOOTER}`);
 }
 
+/**
+ * The RECONCILE CATCH-UP post (W3a, issue #2): ONE post, labelled exactly
+ * `✅ Catch-up — since <timestamp of last ledger entry>:`, itemising every
+ * missed event the pass found.
+ *
+ * `lines` are built by `reconcile.ts` and are already sanitised there; they are
+ * re-sanitised here anyway, for the same reason `state.ts` re-caps strings that
+ * `intake.ts` already capped — a display guarantee that depends on every caller
+ * remembering is not a guarantee.
+ *
+ * Budgeted, never truncated, exactly as `completionPost` is: a catch-up that
+ * silently lost its last three lines to a message-length limit would be a
+ * ledger entry that is wrong about what it caught up on, which is worse than
+ * one that says "…and N more".
+ */
+export function catchUpPost(
+  lines: readonly string[],
+  sinceIso: string,
+  mapUrl: string,
+): { content: string; rendered: number } | null {
+  if (!Array.isArray(lines) || lines.length === 0) return null;
+  const header = `✅ Catch-up — since ${sanitizeForDisplay(sinceIso)}: · ${mapUrl}`;
+  const rendered: string[] = [];
+  const tailReserve = 48;
+  let used = header.length + FOOTER.length + 2;
+  for (const raw of lines) {
+    if (rendered.length >= MAX_BATCH_ITEMS) break;
+    const candidate = `• ${sanitizeForDisplay(typeof raw === "string" ? raw : "")}`;
+    if (used + candidate.length + 1 + tailReserve > MAX_POST_LEN) break;
+    rendered.push(candidate);
+    used += candidate.length + 1;
+  }
+  if (rendered.length === 0) return null;
+  const omitted = lines.length - rendered.length;
+  const tail = omitted > 0 ? `\n• …and ${omitted} more (see the map)` : "";
+  // `rendered` is returned, not just the text: the caller marks drift as
+  // "covered" so it never repeats, and marking an item covered that this post
+  // did NOT actually name would delete it from the ledger silently. The count
+  // of lines that really went out is therefore part of the contract.
+  return {
+    content: clamp(`${header}\n${rendered.join("\n")}${tail}\n${FOOTER}`),
+    rendered: rendered.length,
+  };
+}
+
+/**
+ * Does this channel message record the ➕/➖ ledger entry for proposal
+ * `displayId` about `url`? The channel-side half of the double-post question.
+ *
+ * ANCHORED AT POSITION 0, deliberately. Every post Atlas makes puts untrusted
+ * text (a why-field, an issue title) somewhere in the MIDDLE — never at the
+ * start, which is always a marker this module chose. So an attacker who titles
+ * a GitHub issue `➕ Plan body changed — #3: added <url>` gets that string
+ * quoted into the middle of a ✅ post and still cannot make this function say
+ * yes. A `content.includes(...)` version of this check was forgeable exactly
+ * that way, and forging it would SUPPRESS a catch-up line — a silent hole in
+ * the ledger, which is the failure this whole slice exists to close.
+ */
+export function messageRecordsPlanChange(
+  content: string,
+  displayId: number,
+  url: string,
+): boolean {
+  if (typeof content !== "string" || typeof url !== "string" || url.length === 0) return false;
+  if (!Number.isSafeInteger(displayId) || displayId <= 0) return false;
+  const added = `➕ Plan body changed — #${displayId}: `;
+  const removed = `➖ Plan body changed — #${displayId}: `;
+  if (!content.startsWith(added) && !content.startsWith(removed)) return false;
+  return mentionsUrl(content, url);
+}
+
+/**
+ * Does this text reference EXACTLY this issue URL?
+ *
+ * The trailing-digit guard is the same one `apply.ts`'s `lineMentionsUrl`
+ * carries, and it is load-bearing for the same reason: a bare
+ * `content.includes(url)` lets `…/issues/12` satisfy a search for
+ * `…/issues/1`. Here that would mean a ➕ post about one issue answering for a
+ * DIFFERENT one — i.e. subtracting a real drift item from a catch-up on the
+ * strength of a substring. (Found by the test that asserts it; the display-id
+ * anchor above happens to make it unexploitable today, since two proposals
+ * never share a number, but a guard that only works because of a neighbouring
+ * invariant is one refactor away from not working.)
+ *
+ * Duplicated rather than imported: `apply.ts` already imports this module, so
+ * reaching the other way would close a cycle. Two copies of eight lines is the
+ * cheaper price than a dependency loop through the effect layer.
+ */
+function mentionsUrl(content: string, url: string): boolean {
+  let from = 0;
+  for (;;) {
+    const at = content.indexOf(url, from);
+    if (at < 0) return false;
+    const after = content[at + url.length];
+    if (after === undefined || !/[0-9]/.test(after)) return true;
+    from = at + 1;
+  }
+}
+
 /** The UTC day number for an epoch-ms instant. Deterministic; no host timezone. */
 export function utcDay(ts: number): number {
   return Math.floor(ts / 86_400_000);
@@ -209,6 +338,25 @@ export class DiscordLedger {
   async postPlanChange(entry: PlanChangeEntry): Promise<PostReceipt | null> {
     const content = planChangePost(entry, this.cfg.planUrl);
     return this.send(content);
+  }
+
+  /**
+   * The reconcile catch-up (W3a). NOT batched and NOT day-limited, for the same
+   * reason `postPlanChange` is not: a catch-up is emitted only when a pass has
+   * already established that the ledger is BEHIND, and holding it for a day
+   * would leave the drift unrecorded while the next pass re-detects it. The
+   * silence rule is upstream of this method — `reconcile.ts` does not call it
+   * at all when there is nothing to say.
+   */
+  async postCatchUp(
+    lines: readonly string[],
+    sinceIso: string,
+  ): Promise<{ receipt: PostReceipt; rendered: number } | null> {
+    const built = catchUpPost(lines, sinceIso, this.cfg.planUrl);
+    if (built === null) return null;
+    const receipt = await this.send(built.content);
+    if (receipt === null) return null;
+    return { receipt, rendered: built.rendered };
   }
 
   /** Queue a completion for the next flush. Never posts by itself. */

@@ -7,7 +7,7 @@
 
 import type { GhIssueInfo, LinkedIssueReader, LinkedIssueState, ReadOnlyGh } from "./gh";
 import type { GhInvocation } from "./effects/gh";
-import type { LedgerTransport } from "./effects/discord";
+import type { LedgerMessage, LedgerReader, LedgerTransport } from "./effects/discord";
 
 export type GhCall =
   | { method: "getIssue"; url: string }
@@ -123,7 +123,8 @@ function argvRepo(argv: readonly string[]): string {
 
 /** Records every ledger post, with the channel id it was aimed at. */
 export class RecordingTransport implements LedgerTransport {
-  readonly posts: Array<{ channelId: string; content: string }> = [];
+  /** `messageId` is recorded too (W3a) so a channel reader can mirror this list. */
+  readonly posts: Array<{ channelId: string; content: string; messageId: string }> = [];
   /** Number of leading attempts to fail. `Infinity` fails every attempt. */
   failFirst = 0;
   /** When true, `post` throws instead of returning `null`. */
@@ -136,8 +137,53 @@ export class RecordingTransport implements LedgerTransport {
       this.failFirst -= 1;
       return null;
     }
-    this.posts.push({ channelId, content });
-    return `msg-fixture-${this.nextId++}`;
+    const messageId = `msg-fixture-${this.nextId++}`;
+    this.posts.push({ channelId, content, messageId });
+    return messageId;
+  }
+}
+
+/**
+ * A readable ledger channel (W3a). Deliberately backed by the SAME
+ * `RecordingTransport` a test posts through, so "the post is in the channel"
+ * and "the post was made" are one fact — a fake where those two could disagree
+ * would let a reconcile test pass against a world that cannot exist.
+ * `delete(messageId)` is the kill test: it removes a post the way a human
+ * deleting it in Discord would, leaving Atlas's durable record untouched.
+ */
+export class FakeLedgerChannel implements LedgerReader {
+  /** Set to make every read fail — "the channel told us nothing". */
+  failReads = false;
+  readonly reads: number[] = [];
+  private readonly messages: LedgerMessage[] = [];
+
+  constructor(private readonly transport?: RecordingTransport) {}
+
+  /** Mirror everything the transport has posted since the last sync. */
+  sync(createdAt: number): void {
+    if (this.transport === undefined) return;
+    for (let i = this.messages.length; i < this.transport.posts.length; i += 1) {
+      const post = this.transport.posts[i]!;
+      this.messages.push({ id: post.messageId, content: post.content, createdAt });
+    }
+  }
+
+  add(message: LedgerMessage): void {
+    this.messages.push(message);
+  }
+
+  /** Remove one message, as a human deleting it in the channel would. */
+  delete(messageId: string): boolean {
+    const at = this.messages.findIndex((m) => m.id === messageId);
+    if (at < 0) return false;
+    this.messages.splice(at, 1);
+    return true;
+  }
+
+  async recentMessages(limit: number): Promise<readonly LedgerMessage[] | null> {
+    this.reads.push(limit);
+    if (this.failReads) return null;
+    return [...this.messages].reverse().slice(0, limit);
   }
 }
 

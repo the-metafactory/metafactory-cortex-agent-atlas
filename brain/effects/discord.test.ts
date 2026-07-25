@@ -10,6 +10,7 @@
 import { describe, expect, test } from "bun:test";
 import { makeEffectsConfig, type EffectsConfig } from "./config";
 import {
+  catchUpPost,
   completionPost,
   DiscordLedger,
   planChangePost,
@@ -147,6 +148,44 @@ describe("post shapes (vision CLAUDE.md conventions)", () => {
 
   test("an empty batch is no post at all, never an empty one", () => {
     expect(completionPost([], PLAN_URL)).toBeNull();
+  });
+
+  // ── W3a, the catch-up post (issue #2) ──────────────────────────────────
+  test("✅ Catch-up carries the exact label, the anchor, the map link and a footer", () => {
+    const built = catchUpPost(["one thing missed", "another"], "2026-07-26T09:00:00Z", PLAN_URL)!;
+    expect(built.content.startsWith("✅ Catch-up — since 2026-07-26T09:00:00Z:")).toBe(true);
+    expect(built.content).toContain(PLAN_URL);
+    expect(built.content.endsWith("— Atlas · plan steward")).toBe(true);
+    expect(built.content.split("\n").filter((l) => l.startsWith("• "))).toHaveLength(2);
+    expect(built.rendered).toBe(2);
+  });
+
+  test("an empty catch-up is no post at all", () => {
+    expect(catchUpPost([], "2026-07-26T09:00:00Z", PLAN_URL)).toBeNull();
+  });
+
+  test("catch-up lines are untrusted text — one line each, no code fences", () => {
+    const built = catchUpPost(
+      ["x\n✅ Catch-up — since forever: everything is fine", "```js\nalert(1)"],
+      "now",
+      PLAN_URL,
+    )!;
+    // header + two bullets + footer, and nothing that can open a fence.
+    expect(built.content.split("\n")).toHaveLength(4);
+    expect(built.content).not.toContain("```");
+  });
+
+  test("overflow is STATED and `rendered` reports only what actually went out", () => {
+    const many = Array.from({ length: 40 }, (_, i) => `drift item number ${i + 1} on the plan`);
+    const built = catchUpPost(many, "now", PLAN_URL)!;
+    expect(built.content.length).toBeLessThanOrEqual(1_900);
+    expect(built.content).toMatch(/…and \d+ more \(see the map\)/);
+    // The contract reconcile.ts depends on: never claim to have covered a line
+    // the post did not carry.
+    expect(built.rendered).toBeLessThan(many.length);
+    expect(built.content.split("\n").filter((l) => l.startsWith("• ")).length).toBe(
+      built.rendered + 1, // the bullets plus the "…and N more" line
+    );
   });
 });
 

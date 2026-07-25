@@ -321,6 +321,20 @@ export interface AtlasStateOptions {
    * disables dashboard regeneration entirely (tests use this).
    */
   bundleDir?: string | null;
+  /**
+   * Fired (fire-and-forget) after EVERY work-item transition this store makes
+   * — W3a, issue #2: *"regenerate `dashboard.md` on every state change"*.
+   *
+   * It is a hook rather than a direct call because Atlas's plan dashboard is
+   * derived from the PLAN BODY as well as from state, and fetching the plan
+   * body is an async network read that must never happen inside a SQLite
+   * transaction. So the state layer announces "something moved" and
+   * `brain/dashboard.ts` decides what to do about it; `brain/main.ts` is what
+   * wires the two together. Errors are swallowed here for the same reason
+   * `regenDashboard` swallows its own: a dashboard is a derived view, and a
+   * failure to redraw it must never roll back or mask a real transition.
+   */
+  onTransition?: (() => void) | null;
 }
 
 /** `~/.config/cortex/agents/atlas` — matches arc-manifest.yaml's `owns.state`. */
@@ -544,12 +558,24 @@ export class AtlasStateStore {
   private readonly db: Database;
   private readonly dir: string;
   private readonly bundleDir: string | null;
+  private readonly onTransition: (() => void) | null;
   private dashboardWarned = false;
 
-  private constructor(db: Database, dir: string, bundleDir: string | null) {
+  private constructor(
+    db: Database,
+    dir: string,
+    bundleDir: string | null,
+    onTransition: (() => void) | null,
+  ) {
     this.db = db;
     this.dir = dir;
     this.bundleDir = bundleDir;
+    this.onTransition = onTransition;
+  }
+
+  /** The instance dir — where dashboards and retros are written alongside the DB. */
+  get instanceDir(): string {
+    return this.dir;
   }
 
   /** Fail-soft open: any error logs to stderr and returns `null`. */
@@ -562,7 +588,7 @@ export class AtlasStateStore {
       db.exec("PRAGMA busy_timeout = 5000;");
       applyMigration(db);
       warn(`open — ${join(opts.dir, "state.sqlite")}`);
-      return new AtlasStateStore(db, opts.dir, opts.bundleDir ?? null);
+      return new AtlasStateStore(db, opts.dir, opts.bundleDir ?? null, opts.onTransition ?? null);
     } catch (err) {
       warn(
         `unavailable, running memory-only: ${err instanceof Error ? err.message : String(err)}`,
@@ -1244,6 +1270,332 @@ export class AtlasStateStore {
       );
   }
 
+  // ── W3a, the reconcile loop (issue #2, J5) ───────────────────────────────
+  //
+  // Every method in this block is a READ, except the three explicitly named
+  // `record…`. Reconcile is read-only apart from the catch-up post itself and
+  // the records that make that post converge — so this block is deliberately
+  // shaped as "many readers, three narrow writers", and none of the writers
+  // touches a work item's STATUS. No phase transition is reachable from here,
+  // and no certificate is minted or consumed: a catch-up entry is a ledger
+  // line about work that already happened, never an authorisation for new work.
+
+  /**
+   * THE DOUBLE-POST MARKER — the durable half of "did the ledger post land?".
+   *
+   * `apply.ts` ends in one of two parked shapes when the atomic pair breaks,
+   * and from STORAGE ALONE they are identical: both are `done` + a ratification
+   * + an `applied` receipt + no `posted` receipt (see `rowPhase`). The
+   * difference — `postLanded` on the `applied-not-posted` outcome — was known
+   * only to the in-process caller and died with it.
+   *
+   * That difference is the single most dangerous fact in this slice. If the post
+   * DID land and reconcile itemises the item as "ledger entry missing", the
+   * catch-up asserts something false about a public, append-only ledger — the
+   * one corruption issue #2 says must never happen. So the fact is written down
+   * AT THE MOMENT IT IS KNOWN rather than inferred later: `apply.ts` records
+   * this marker on the `postLanded: true` branch, and reconcile treats its
+   * presence as "may already have posted — do not post again".
+   *
+   * The residual window is honest and narrow: a crash between the ledger post
+   * landing and this marker committing leaves an item that LOOKS like it was
+   * never posted. The channel cross-check in `reconcile.ts` exists for exactly
+   * that window, and it is SUBTRACTIVE ONLY — it can remove an item from a
+   * catch-up, never add one.
+   */
+  recordLedgerPostUnrecorded(workItemId: string, messageId: string): void {
+    const capId = boundedKey(workItemId);
+    if (capId.length === 0) return;
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(
+        Date.now(),
+        "ledger_post_unrecorded",
+        OWNER,
+        JSON.stringify({ work_item_id: capId, message_id: cap(messageId, MAX_ID_LEN) }),
+      );
+  }
+
+  /**
+   * Did a ledger post for this work item LAND without its receipt recording?
+   * `true` means "a post may already exist" — reconcile must then stay silent
+   * about this item. Note `work_item_id` is NULL on the event row (it is an
+   * audit fact about a post, not a work-item transition), so the id is matched
+   * out of the payload.
+   */
+  hasLedgerPostUnrecorded(workItemId: string): boolean {
+    const capId = boundedKey(workItemId);
+    if (capId.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type = 'ledger_post_unrecorded'
+            AND ${jsonField("payload", "$.work_item_id")} = ?
+          LIMIT 1`,
+      )
+      .get(capId);
+    return row !== null && row !== undefined;
+  }
+
+  /**
+   * Every work item parked in `applied` — the map changed and the ledger did
+   * not. This is the population W3a exists to find; `rowPhase` is what defines
+   * it, so the filter goes through `rowToRecord` rather than re-deriving the
+   * rule in SQL (two statements of one invariant is how they drift apart).
+   */
+  appliedUnposted(limit = 200): ProposalRecord[] {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 1_000) : 200;
+    const rows = this.db
+      .query<WorkItemRow, [string, number]>(
+        `SELECT id, status, payload, notes FROM work_items
+          WHERE kind = ? AND status = 'done'
+          ORDER BY updated_at ASC
+          LIMIT ?`,
+      )
+      .all(KIND, bounded);
+    const out: ProposalRecord[] = [];
+    for (const row of rows) {
+      const record = rowToRecord(row);
+      if (record !== null && record.phase === "applied") out.push(record);
+    }
+    return out;
+  }
+
+  /**
+   * The most recently touched proposal work items, newest first. The
+   * dashboard's work-item half (W3a): it needs every LIVE proposal, not one
+   * looked up by id, and it is the only consumer — hence a bounded read rather
+   * than an unbounded `all()`. Rows `rowToRecord` cannot recognise are dropped,
+   * exactly as `get` drops them.
+   */
+  recentProposals(limit = 500): ProposalRecord[] {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 2_000) : 500;
+    const rows = this.db
+      .query<WorkItemRow, [string, number]>(
+        `SELECT id, status, payload, notes FROM work_items
+          WHERE kind = ?
+          ORDER BY updated_at DESC
+          LIMIT ?`,
+      )
+      .all(KIND, bounded);
+    const out: ProposalRecord[] = [];
+    for (const row of rows) {
+      const record = rowToRecord(row);
+      if (record !== null) out.push(record);
+    }
+    return out;
+  }
+
+  /**
+   * The recorded ✅ announcement for one issue URL — its message id and when it
+   * was recorded — or `null`. The message id is what lets a channel cross-check
+   * ask "is that post still there?"; the timestamp is what keeps the answer
+   * honest, because a message id absent from a BOUNDED read window means
+   * "scrolled out of view", not "deleted", unless the announcement is newer
+   * than the oldest message the window contains.
+   */
+  completionAnnouncement(issueUrl: string): { messageId: string; ts: number } | null {
+    const key = boundedKey(cap(issueUrl, 300));
+    if (key.length === 0) return null;
+    const row = this.db
+      .query<{ ts: number; message_id: string | null }, [string]>(
+        `SELECT ts, ${jsonField("payload", "$.message_id")} AS message_id FROM events
+          WHERE type = 'completion_announced'
+            AND ${jsonField("payload", "$.issue_url")} = ?
+          ORDER BY ts DESC LIMIT 1`,
+      )
+      .get(key);
+    if (row === null || row === undefined) return null;
+    const messageId = typeof row.message_id === "string" ? row.message_id : "";
+    if (messageId.length === 0) return null;
+    if (!Number.isSafeInteger(row.ts) || row.ts <= 0) return null;
+    return { messageId, ts: row.ts };
+  }
+
+  /**
+   * When the most recent LEDGER ENTRY Atlas knows about was recorded — the
+   * anchor the catch-up post is labelled with ("since <timestamp>"). Three
+   * event types qualify, and only three: a ➕/➖ receipt, a ✅ announcement, and
+   * a previous catch-up. `null` when Atlas has never recorded one.
+   */
+  lastLedgerEntryTs(): number | null {
+    const row = this.db
+      .query<{ ts: number | null }, []>(
+        `SELECT MAX(ts) AS ts FROM events
+          WHERE type IN ('work_item_posted', 'completion_announced', 'reconcile_catchup_recorded')`,
+      )
+      .get();
+    const ts = row?.ts ?? null;
+    return typeof ts === "number" && Number.isSafeInteger(ts) && ts > 0 ? ts : null;
+  }
+
+  /**
+   * Every plan-body revision Atlas can ACCOUNT FOR: the revisions its own
+   * applies produced, plus the revisions past reconcile passes observed and
+   * wrote down. A live revision outside this set is a plan-body edit with no
+   * matching ➕/➖ event — detector (c).
+   */
+  observedPlanRevisions(limit = 1_000): Set<string> {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 5_000) : 1_000;
+    const rows = this.db
+      .query<{ revision: string | null }, [number]>(
+        `SELECT revision FROM (
+           SELECT ts, ${jsonField("payload", "$.plan_revision")} AS revision FROM events
+             WHERE type IN ('work_item_resolved', 'reconcile_completed')
+         )
+         WHERE revision IS NOT NULL
+         ORDER BY ts DESC LIMIT ?`,
+      )
+      .all(bounded);
+    const out = new Set<string>();
+    for (const row of rows) {
+      if (typeof row.revision === "string" && row.revision.length > 0) out.add(row.revision);
+    }
+    return out;
+  }
+
+  /**
+   * Has a reconcile pass ever completed? The FIRST pass establishes the
+   * revision baseline instead of reporting on it: Atlas cannot honestly claim a
+   * plan-body edit is unaccounted-for when it has no record of any edit at all,
+   * and an install-time catch-up naming every pre-existing revision would be
+   * noise in a channel whose whole value is that it is not noisy.
+   */
+  hasReconciled(): boolean {
+    const row = this.db
+      .query<{ one: number }, []>(
+        `SELECT 1 AS one FROM events WHERE type = 'reconcile_completed' LIMIT 1`,
+      )
+      .get();
+    return row !== null && row !== undefined;
+  }
+
+  /**
+   * Has a catch-up already covered this drift? THE convergence mechanism: a
+   * drift item that has been itemised once is never itemised again, so the
+   * second reconcile after a catch-up is silent — the property issue #2 asks
+   * to be asserted.
+   */
+  hasReconcileCatchUp(driftKey: string): boolean {
+    const key = boundedKey(cap(driftKey, 512));
+    if (key.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type = 'reconcile_catchup_recorded'
+            AND ${jsonField("payload", "$.drift_key")} = ?
+          LIMIT 1`,
+      )
+      .get(key);
+    return row !== null && row !== undefined;
+  }
+
+  /**
+   * Record that a landed catch-up post covered this drift. Written ONLY after
+   * the post lands (same discipline as `recordCompletionAnnounced`): a catch-up
+   * that failed to post records nothing, so the next pass retries it.
+   */
+  recordReconcileCatchUp(driftKey: string, messageId: string): void {
+    const key = boundedKey(cap(driftKey, 512));
+    if (key.length === 0) return;
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(
+        Date.now(),
+        "reconcile_catchup_recorded",
+        OWNER,
+        JSON.stringify({ drift_key: key, message_id: cap(messageId, MAX_ID_LEN) }),
+      );
+  }
+
+  /**
+   * Close out one reconcile pass. Written on EVERY pass, including a pass that
+   * found nothing — because "silence" is a statement about the CHANNEL, never
+   * about the event log. The drift count recorded here is the health metric the
+   * weekly retro reports, and a metric that is only written when it is non-zero
+   * cannot be shown to trend to zero.
+   */
+  recordReconcilePass(driftCount: number, planRevision: string | null, catchUpMessageId: string | null): void {
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(
+        Date.now(),
+        "reconcile_completed",
+        OWNER,
+        JSON.stringify({
+          drift_count: Number.isSafeInteger(driftCount) && driftCount >= 0 ? driftCount : 0,
+          plan_revision: planRevision === null ? null : cap(planRevision, 128),
+          catch_up_message_id: catchUpMessageId === null ? null : cap(catchUpMessageId, MAX_ID_LEN),
+        }),
+      );
+  }
+
+  // ── W3a, the weekly retro's counters (issue #2, item 3) ──────────────────
+
+  /** `type → count` for every event in `[fromTs, toTs)`. Aggregated in SQL. */
+  countEventTypes(fromTs: number, toTs: number): Record<string, number> {
+    if (!Number.isSafeInteger(fromTs) || !Number.isSafeInteger(toTs)) return {};
+    const rows = this.db
+      .query<{ type: string; n: number }, [number, number]>(
+        `SELECT type, COUNT(*) AS n FROM events WHERE ts >= ? AND ts < ? GROUP BY type`,
+      )
+      .all(fromTs, toTs);
+    const out: Record<string, number> = {};
+    for (const row of rows) out[row.type] = row.n;
+    return out;
+  }
+
+  /**
+   * `reason → count` over `work_item_resolved` in `[fromTs, toTs)`. A separate
+   * query because "declined" and "applied" are both resolutions and the retro
+   * must not conflate them — the reason lives in the payload, not the type.
+   */
+  countResolvedReasons(fromTs: number, toTs: number): Record<string, number> {
+    if (!Number.isSafeInteger(fromTs) || !Number.isSafeInteger(toTs)) return {};
+    const rows = this.db
+      .query<{ reason: string | null; n: number }, [number, number]>(
+        `SELECT ${jsonField("payload", "$.reason")} AS reason, COUNT(*) AS n FROM events
+          WHERE type = 'work_item_resolved' AND ts >= ? AND ts < ?
+          GROUP BY reason`,
+      )
+      .all(fromTs, toTs);
+    const out: Record<string, number> = {};
+    for (const row of rows) {
+      if (typeof row.reason === "string" && row.reason.length > 0) out[row.reason] = row.n;
+    }
+    return out;
+  }
+
+  /**
+   * How many reconcile passes actually POSTED a catch-up in `[fromTs, toTs)`.
+   * Distinct from the drift total: one post can carry many items, and the retro
+   * reports "posts made" and "drift found" as two different facts.
+   */
+  countCatchUpPosts(fromTs: number, toTs: number): number {
+    if (!Number.isSafeInteger(fromTs) || !Number.isSafeInteger(toTs)) return 0;
+    const row = this.db
+      .query<{ n: number }, [number, number]>(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE type = 'reconcile_completed' AND ts >= ? AND ts < ?
+            AND ${jsonField("payload", "$.catch_up_message_id")} IS NOT NULL`,
+      )
+      .get(fromTs, toTs);
+    return row?.n ?? 0;
+  }
+
+  /** Total drift found by reconcile in `[fromTs, toTs)` — the health metric. */
+  sumReconcileDrift(fromTs: number, toTs: number): number {
+    if (!Number.isSafeInteger(fromTs) || !Number.isSafeInteger(toTs)) return 0;
+    const row = this.db
+      .query<{ total: number | null }, [number, number]>(
+        `SELECT SUM(${jsonField("payload", "$.drift_count")}) AS total FROM events
+          WHERE type = 'reconcile_completed' AND ts >= ? AND ts < ?`,
+      )
+      .get(fromTs, toTs);
+    const total = row?.total ?? 0;
+    return typeof total === "number" && Number.isFinite(total) ? total : 0;
+  }
+
   /**
    * An append-only audit event with NO work item attached — how a rejected
    * gate attempt (self-ratify, unmapped author, wrong principal) is recorded.
@@ -1358,6 +1710,17 @@ export class AtlasStateStore {
    * workflow, exactly mirroring escort's fire-and-forget subprocess call.
    */
   private regenDashboard(): void {
+    // W3a: announce the transition FIRST, and independently of the agent-state
+    // bundle. Atlas's own plan dashboard must redraw on every state change even
+    // on a host where the agent-state bundle is absent (the `bundleDir === null`
+    // early return below), which is exactly the case every test runs in.
+    if (this.onTransition !== null) {
+      try {
+        this.onTransition();
+      } catch (err) {
+        warn(`transition hook failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     if (this.bundleDir === null) return;
     try {
       const script = join(this.bundleDir, "skill", "scripts", "dashboard.ts");
@@ -1519,6 +1882,87 @@ class MemoryProposals {
   /** Nothing durable to record — see `recordGateEvent` above. */
   recordCompletionAnnounced(): void {
     // deliberately empty; degraded mode records nothing.
+  }
+
+  // ── W3a in degraded mode: every answer is the one that CAUSES NO POST ─────
+  //
+  // `reconcile.ts` refuses the whole pass while the store is degraded, so none
+  // of these are reachable from it. They are written fail-closed anyway,
+  // because "unreachable" is a claim about today's call graph and the ledger's
+  // integrity should not rest on one. Note which way round each is: the
+  // question is always answered so that reconcile stays SILENT.
+
+  /** `true`: a post may already have landed. Never re-post on a guess. */
+  hasLedgerPostUnrecorded(): boolean {
+    return true;
+  }
+
+  /** `true`: treat every drift as already covered. Silence over duplication. */
+  hasReconcileCatchUp(): boolean {
+    return true;
+  }
+
+  /** Nothing is parked where this store can see it. */
+  appliedUnposted(): ProposalRecord[] {
+    return [];
+  }
+
+  /** Degraded mode keeps no durable queue to draw a dashboard from. */
+  recentProposals(): ProposalRecord[] {
+    return [];
+  }
+
+  /** No durable announcement to cross-check. */
+  completionAnnouncement(): { messageId: string; ts: number } | null {
+    return null;
+  }
+
+  /** No durable ledger history. */
+  lastLedgerEntryTs(): number | null {
+    return null;
+  }
+
+  /** No accounted-for revisions — and no way to report on one either. */
+  observedPlanRevisions(): Set<string> {
+    return new Set<string>();
+  }
+
+  /**
+   * `true` — i.e. "not the first pass". The first-pass branch is the one that
+   * SUPPRESSES revision drift, and a degraded store must not be able to claim
+   * a baseline it cannot store; claiming the pass is a later one keeps the
+   * baseline unwritten rather than falsely recorded.
+   */
+  hasReconciled(): boolean {
+    return true;
+  }
+
+  recordLedgerPostUnrecorded(): void {
+    // deliberately empty; degraded mode records nothing.
+  }
+
+  recordReconcileCatchUp(): void {
+    // deliberately empty; degraded mode records nothing.
+  }
+
+  recordReconcilePass(): void {
+    // deliberately empty; degraded mode records nothing.
+  }
+
+  countEventTypes(): Record<string, number> {
+    return {};
+  }
+
+  countResolvedReasons(): Record<string, number> {
+    return {};
+  }
+
+  countCatchUpPosts(): number {
+    return 0;
+  }
+
+  sumReconcileDrift(): number {
+    return 0;
   }
 
   recordGateEvent(): void {
@@ -1765,6 +2209,124 @@ export class AtlasProposals {
     );
   }
 
+  // ── W3a, the reconcile loop (issue #2) ───────────────────────────────────
+  // Thin pass-throughs; every degraded answer is the fail-closed one — see
+  // `MemoryProposals`'s W3a block for which way round each of them is.
+
+  /** See `AtlasStateStore.recordLedgerPostUnrecorded` — THE double-post marker. */
+  recordLedgerPostUnrecorded(workItemId: string, messageId: string): void {
+    this.run(
+      (db) => db.recordLedgerPostUnrecorded(workItemId, messageId),
+      (m) => m.recordLedgerPostUnrecorded(),
+    );
+  }
+
+  /** See `AtlasStateStore.hasLedgerPostUnrecorded`. Degraded answers `true`. */
+  hasLedgerPostUnrecorded(workItemId: string): boolean {
+    return this.run(
+      (db) => db.hasLedgerPostUnrecorded(workItemId),
+      (m) => m.hasLedgerPostUnrecorded(),
+    );
+  }
+
+  /** Work items parked in `applied` — the recovery population. */
+  appliedUnposted(limit?: number): ProposalRecord[] {
+    return this.run(
+      (db) => db.appliedUnposted(limit),
+      (m) => m.appliedUnposted(),
+    );
+  }
+
+  /** Every live proposal, newest first — the dashboard's work-item half. */
+  recentProposals(limit?: number): ProposalRecord[] {
+    return this.run(
+      (db) => db.recentProposals(limit),
+      (m) => m.recentProposals(),
+    );
+  }
+
+  completionAnnouncement(issueUrl: string): { messageId: string; ts: number } | null {
+    return this.run(
+      (db) => db.completionAnnouncement(issueUrl),
+      (m) => m.completionAnnouncement(),
+    );
+  }
+
+  lastLedgerEntryTs(): number | null {
+    return this.run(
+      (db) => db.lastLedgerEntryTs(),
+      (m) => m.lastLedgerEntryTs(),
+    );
+  }
+
+  observedPlanRevisions(limit?: number): Set<string> {
+    return this.run(
+      (db) => db.observedPlanRevisions(limit),
+      (m) => m.observedPlanRevisions(),
+    );
+  }
+
+  hasReconciled(): boolean {
+    return this.run(
+      (db) => db.hasReconciled(),
+      (m) => m.hasReconciled(),
+    );
+  }
+
+  /** See `AtlasStateStore.hasReconcileCatchUp` — the convergence mechanism. */
+  hasReconcileCatchUp(driftKey: string): boolean {
+    return this.run(
+      (db) => db.hasReconcileCatchUp(driftKey),
+      (m) => m.hasReconcileCatchUp(),
+    );
+  }
+
+  recordReconcileCatchUp(driftKey: string, messageId: string): void {
+    this.run(
+      (db) => db.recordReconcileCatchUp(driftKey, messageId),
+      (m) => m.recordReconcileCatchUp(),
+    );
+  }
+
+  recordReconcilePass(
+    driftCount: number,
+    planRevision: string | null,
+    catchUpMessageId: string | null,
+  ): void {
+    this.run(
+      (db) => db.recordReconcilePass(driftCount, planRevision, catchUpMessageId),
+      (m) => m.recordReconcilePass(),
+    );
+  }
+
+  countEventTypes(fromTs: number, toTs: number): Record<string, number> {
+    return this.run(
+      (db) => db.countEventTypes(fromTs, toTs),
+      (m) => m.countEventTypes(),
+    );
+  }
+
+  countResolvedReasons(fromTs: number, toTs: number): Record<string, number> {
+    return this.run(
+      (db) => db.countResolvedReasons(fromTs, toTs),
+      (m) => m.countResolvedReasons(),
+    );
+  }
+
+  countCatchUpPosts(fromTs: number, toTs: number): number {
+    return this.run(
+      (db) => db.countCatchUpPosts(fromTs, toTs),
+      (m) => m.countCatchUpPosts(),
+    );
+  }
+
+  sumReconcileDrift(fromTs: number, toTs: number): number {
+    return this.run(
+      (db) => db.sumReconcileDrift(fromTs, toTs),
+      (m) => m.sumReconcileDrift(),
+    );
+  }
+
   close(): void {
     this.db?.close();
   }
@@ -1802,12 +2364,16 @@ export class AtlasProposals {
  *   ATLAS_AGENT_STATE_DIR  → agent-state bundle root (default arc install path)
  * Never throws; `null` = run memory-only.
  */
-export function openAtlasStateFromEnv(): AtlasStateStore | null {
+export function openAtlasStateFromEnv(
+  /** W3a: the plan-dashboard redraw hook. See `AtlasStateOptions.onTransition`. */
+  onTransition: (() => void) | null = null,
+): AtlasStateStore | null {
   const dirEnv = process.env.ATLAS_STATE_DIR;
   const bundleEnv = process.env.ATLAS_AGENT_STATE_DIR;
   return AtlasStateStore.open({
     dir: dirEnv !== undefined && dirEnv.length > 0 ? dirEnv : defaultInstanceDir(),
     bundleDir: bundleEnv !== undefined && bundleEnv.length > 0 ? bundleEnv : defaultBundleDir(),
+    onTransition,
   });
 }
 
