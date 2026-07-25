@@ -1,0 +1,578 @@
+/**
+ * The Atlas daemon's BEHAVIOURAL shell — cortex events in, brain effects out.
+ *
+ * `main.ts` is the socket; this file is what the socket carries. The split is
+ * escort's (`brain/main.ts` thin, `brain/handler.ts` behavioural) and exists
+ * for one reason: everything below is drivable from a test without a socket, a
+ * subprocess, or a live cortex.
+ *
+ * ── This file WIRES; it does not DECIDE ────────────────────────────────────
+ * Every judgement Atlas makes already lives in a reviewed module:
+ * `proposal.ts` (intake), `ratify.ts` (the gate), `apply.ts` (effects),
+ * `watch.ts` and `reconcile.ts` (the loops). Not one of them is re-implemented,
+ * second-guessed, or wrapped in a shortcut here. What this file owns is the
+ * three questions none of them can answer alone:
+ *
+ *   1. WHICH inbound events reach them (admission),
+ *   2. WHEN the timer-driven passes run, and
+ *   3. WHETHER an effect can physically leave right now (the post window).
+ *
+ * ── The post window, and why the schedulers care ───────────────────────────
+ * `cortex-brain/v1` has no free-standing post: every effect must correlate to a
+ * task the host currently owns (see `transport.ts`). A task opens when cortex
+ * delivers it and closes when Atlas emits `result`. So a reconcile that runs on
+ * a 6-hour timer at 03:00, with nobody talking to Atlas, CANNOT post its
+ * catch-up.
+ *
+ * That is handled honestly rather than hidden. The passes still run on their
+ * intervals — detection and state convergence are the bulk of their value, and
+ * both loops are built to record NOTHING when their post fails
+ * (`reconcile.ts`'s `post-failed` records not even the pass; `watch.ts` keeps
+ * its queue and only records after a landed post). A pass that could not speak
+ * sets a DUE flag, and the next task window re-runs it with the window open.
+ * The result is: correct always, prompt when there is traffic, and never a
+ * claim that something was said when it was not.
+ *
+ * ── Admission is config-pinned ─────────────────────────────────────────────
+ * A task is served only when its HOST-RESOLVED `source.channel` is the
+ * configured ledger channel. Atlas's presence already binds it to one channel,
+ * so this is defence in depth — but it is the difference between "the adapter
+ * is expected not to deliver that" and "Atlas will not act on it". A
+ * non-admitted task is answered with silence (a `log` effect, no `post`):
+ * replying would let anyone anywhere make Atlas speak.
+ *
+ * ── Untrusted input is DATA ────────────────────────────────────────────────
+ * `payload.text` is written by arbitrary internet users. It is passed to
+ * `processComment` / `processGateMessage` as an opaque body and NOWHERE else —
+ * never into a `result` summary, never into a log line, never into any
+ * structural field of any effect. Identity comes only from `source.surface` +
+ * `source.user`, which are platform-authenticated and host-resolved.
+ */
+
+import { applyRatified } from "./apply";
+import { regeneratePlanDashboard } from "./dashboard";
+import type { EffectsConfig } from "./effects/config";
+import type { DiscordLedger } from "./effects/discord";
+import type { PlanWriter } from "./effects/gh";
+import type { LinkedIssueReader, ReadOnlyGh } from "./gh";
+import type { RatifyIdentityConfig } from "./identity";
+import { processComment } from "./proposal";
+import type { BrainEffect, BrainEvent, TaskEvent } from "./protocol";
+import { processGateMessage } from "./ratify";
+import { reconcilePlan } from "./reconcile";
+import type { AtlasProposals } from "./state";
+import type { HostLedgerTransport } from "./transport";
+import { pollCompletions } from "./watch";
+
+function warn(msg: string): void {
+  process.stderr.write(`atlas: runtime: ${msg}\n`);
+}
+
+/**
+ * Everything that only exists once Atlas has an effect target. Absent (`null`)
+ * when `loadEffectsConfigFromEnv` refused: Atlas then admits nothing and says
+ * so, rather than intaking proposals it could never act on.
+ */
+export interface EffectLayer {
+  readonly effects: EffectsConfig;
+  readonly plan: PlanWriter;
+  readonly linked: LinkedIssueReader;
+  readonly ledger: DiscordLedger;
+  readonly transport: HostLedgerTransport;
+}
+
+export interface AtlasRuntimeDeps {
+  /** Writes one effect line. Owned by `main.ts` (socket) or a test (array). */
+  readonly send: (effect: BrainEffect) => void;
+  readonly state: AtlasProposals;
+  /** `null` ⇒ the gate is UNARMED; `ratify.ts` refuses every verb. */
+  readonly identity: RatifyIdentityConfig | null;
+  /** The intake validation read port. */
+  readonly gh: ReadOnlyGh;
+  readonly effectLayer: EffectLayer | null;
+  /** Where `plan-dashboard.md` is redrawn. `null` skips the redraw. */
+  readonly instanceDir: string | null;
+  readonly watchIntervalMs: number;
+  readonly reconcileIntervalMs: number;
+  /** Injectable clock/timers so no test ever waits on a real interval. */
+  readonly now?: () => number;
+  readonly setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  readonly clearIntervalFn?: (handle: unknown) => void;
+}
+
+/** What one served task did. Recorded for the `result` summary and for tests. */
+export type TaskDisposition =
+  | "not-admitted"
+  | "no-effect-layer"
+  | "proposal-surfaced"
+  | "proposal-declined"
+  | "proposal-duplicate"
+  | "gate-ratified"
+  | "gate-declined"
+  | "gate-replied"
+  | "gate-ignored";
+
+export class AtlasRuntime {
+  private readonly deps: AtlasRuntimeDeps;
+  private readonly now: () => number;
+  private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
+  private readonly clearIntervalFn: (handle: unknown) => void;
+
+  /**
+   * Serialises EVERYTHING — served tasks and scheduled passes alike — onto one
+   * chain. Two reasons, both load-bearing: a pass and a task both mutate the
+   * same durable state and the same in-memory completion queue, and the post
+   * window is a single global resource (there is one socket and one live task).
+   * Concurrency here would be a correctness bug, not a performance win.
+   */
+  private queue: Promise<void> = Promise.resolve();
+  private timers: unknown[] = [];
+  private stopped = false;
+
+  /**
+   * A pass whose post could not leave. Re-run inside the next post window.
+   * Set ONLY on a post failure — never on a refusal (`state-degraded`,
+   * `plan-unreadable`), because retrying those inside a window would just fail
+   * the same way while holding up a user's task.
+   */
+  private due = { watch: false, reconcile: false };
+
+  /**
+   * Set by `state.ts`'s `onTransition` hook — the derived plan dashboard is out
+   * of date. Redrawn at the END of a served task rather than inside the hook:
+   * the hook fires synchronously from inside a state transaction, and a redraw
+   * needs an async plan read. Coalescing here bounds it at ONE extra read per
+   * task no matter how many transitions that task caused.
+   */
+  private dashboardStale = false;
+
+  /** Observable counters — asserted by tests, reported in the shutdown line. */
+  readonly stats = {
+    tasks: 0,
+    notAdmitted: 0,
+    surfaced: 0,
+    ratified: 0,
+    applied: 0,
+    applyRefused: 0,
+    watchPasses: 0,
+    reconcilePasses: 0,
+    effectRejections: 0,
+  };
+
+  constructor(deps: AtlasRuntimeDeps) {
+    this.deps = deps;
+    this.now = deps.now ?? (() => Date.now());
+    this.setIntervalFn =
+      deps.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms) as unknown);
+    this.clearIntervalFn =
+      deps.clearIntervalFn ?? ((h) => { clearInterval(h as ReturnType<typeof setInterval>); });
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+  /**
+   * Arm the schedulers and reconcile ON WAKE.
+   *
+   * The wake pass runs with the window CLOSED (no task can be in flight before
+   * the first one arrives), which is exactly right: it re-derives the truth
+   * from the plan body and Atlas's own event log, converges the observed
+   * revision, and redraws the dashboard. If it finds drift it cannot announce,
+   * it says so and flags itself due — the first inbound task carries the
+   * catch-up out.
+   */
+  start(): void {
+    if (this.stopped) return;
+    this.enqueue(() => this.reconcilePass("wake"));
+    this.timers.push(
+      this.setIntervalFn(() => {
+        this.enqueue(() => this.reconcilePass("interval"));
+      }, this.deps.reconcileIntervalMs),
+    );
+    this.timers.push(
+      this.setIntervalFn(() => {
+        this.enqueue(() => this.watchPass("interval"));
+      }, this.deps.watchIntervalMs),
+    );
+  }
+
+  /** Disarm the schedulers. In-flight work is left to finish; see `drained`. */
+  stop(): void {
+    this.stopped = true;
+    for (const t of this.timers) this.clearIntervalFn(t);
+    this.timers = [];
+  }
+
+  /** Resolves once every queued task/pass has settled. */
+  async drained(): Promise<void> {
+    // Await the chain twice: work enqueued by work already on the chain lands
+    // behind it, and one await would return before that tail ran.
+    await this.queue;
+    await this.queue;
+  }
+
+  // ── Event intake ──────────────────────────────────────────────────────────
+
+  /**
+   * Route one cortex → brain event. Synchronous and total: the socket's data
+   * callback must never block and must never throw. Real work is enqueued.
+   */
+  onEvent(event: BrainEvent): void {
+    switch (event.type) {
+      case "hello":
+        // Host-authoritative identity. Logged, never trusted for anything —
+        // it is a cortex agent id ("atlas"), not a platform identity, so it
+        // cannot serve as the constitution-rule-3 self-check.
+        process.stderr.write(
+          `atlas: hello — host says agent="${event.agent}" protocol=${event.protocol}\n`,
+        );
+        return;
+      case "task":
+        this.stats.tasks += 1;
+        this.enqueue(() => this.serveTask(event));
+        return;
+      case "message":
+        // A follow-up in an open task's thread. Atlas settles every task in the
+        // same turn it receives it, so by the time one of these could arrive
+        // the task is closed and no effect could ride it. Dropped LOUDLY rather
+        // than silently: if these ever start appearing, the task model changed.
+        warn(`dropping a follow-up message for already-settled task ${event.task_id}`);
+        return;
+      case "effect_rejected":
+        this.stats.effectRejections += 1;
+        this.deps.effectLayer?.transport.noteRejection(event.task_id, event.effect);
+        warn(
+          `HOST REFUSED effect "${event.effect}" on task ${event.task_id} ` +
+            `(${event.reason.kind}): ${event.reason.detail}`,
+        );
+        return;
+      case "cancel":
+        warn(`cancel for task ${event.task_id} — nothing long-running to abandon`);
+        return;
+      case "gate_verdict":
+      case "thread_created":
+      case "composed":
+        // Atlas emits none of the effects these answer (see protocol.ts). An
+        // arrival means a host/agent-identity mix-up, which is worth a line.
+        warn(`unexpected "${event.type}" event — Atlas emits no effect that asks for one`);
+        return;
+      case "shutdown":
+        // Owned by main.ts (it must drain, flush the socket and exit).
+        return;
+      default: {
+        const _never: never = event;
+        void _never;
+        return;
+      }
+    }
+  }
+
+  // ── Serving one task ──────────────────────────────────────────────────────
+
+  private async serveTask(task: TaskEvent): Promise<void> {
+    const layer = this.deps.effectLayer;
+    const source = task.source;
+    const channel = typeof source?.channel === "string" ? source.channel : "";
+    let disposition: TaskDisposition;
+
+    if (layer === null) {
+      // No effect target at all. Nothing is admitted, and nothing is written to
+      // durable state — an intake queue Atlas could never act on is a promise
+      // it cannot keep. `main.ts`'s startup line already said this out loud.
+      this.log("error", "no effect config — Atlas admits nothing and can perform no effect");
+      disposition = "no-effect-layer";
+    } else if (channel !== layer.effects.channelId) {
+      // Config-pinned admission. Silent to the surface on purpose: a reply here
+      // would let anyone, anywhere, make Atlas speak.
+      this.stats.notAdmitted += 1;
+      this.log("warn", "task from a channel Atlas is not bound to — ignored, nothing recorded");
+      disposition = "not-admitted";
+    } else {
+      layer.transport.openWindow(task.task_id, channel);
+      try {
+        disposition = await this.handleAdmitted(task);
+        await this.runDuePassesInWindow();
+        await this.redrawDashboardIfStale();
+      } catch (err) {
+        // A throw escaping into the socket callback would take the daemon down
+        // and burn a restart. Nothing above is expected to throw; if it does,
+        // the task fails honestly and the process survives.
+        warn(`unhandled error serving task: ${err instanceof Error ? err.message : String(err)}`);
+        layer.transport.closeWindow();
+        this.deps.send({
+          v: 1,
+          type: "result",
+          task_id: task.task_id,
+          status: "failed",
+          reason: { kind: "cant_do", detail: "atlas failed to serve this message" },
+        });
+        return;
+      }
+      // The window closes BEFORE `result`, never after: an effect emitted
+      // after the host settles the task is refused, and a refused ledger post
+      // that had already returned a receipt would be a recorded lie.
+      layer.transport.closeWindow();
+    }
+
+    this.deps.send({
+      v: 1,
+      type: "result",
+      task_id: task.task_id,
+      status: "complete",
+      // The summary is a fixed vocabulary term — never the user's text.
+      summary: disposition,
+    });
+  }
+
+  /** Intake first, then the gate. Both are total; neither throws. */
+  private async handleAdmitted(task: TaskEvent): Promise<TaskDisposition> {
+    const layer = this.deps.effectLayer;
+    if (layer === null) return "no-effect-layer";
+    const text = typeof task.payload?.text === "string" ? task.payload.text : "";
+    const platform = typeof task.source.surface === "string" ? task.source.surface : "";
+    const authorId = typeof task.source.user === "string" ? task.source.user : "";
+
+    // ── Intake ──────────────────────────────────────────────────────────────
+    // `task_id` is cortex's envelope id (see protocol.ts): stable across a
+    // JetStream redelivery of the SAME message, distinct between two different
+    // ones. That is exactly the idempotency key `processComment` documents —
+    // a redelivery short-circuits to `duplicate` and emits no second reply.
+    const outcome = await processComment(
+      {
+        id: task.task_id,
+        body: text,
+        // Credit. `proposer` is documented as a GitHub login, and a Discord
+        // surface simply does not carry one — so the honest value is the
+        // qualified platform identity, NOT a bare id that would render as a
+        // plausible-looking `@login` in the ledger. `effects/discord.ts`'s
+        // `safeLogin` quotes it (the colon fails GitHub's login grammar),
+        // which is the correct outcome: it is not a login and must not look
+        // like one. Mapping platform ids → GitHub logins needs a real identity
+        // link and is not invented here.
+        authorLogin: `${platform}:${authorId}`.slice(0, 100),
+      },
+      this.deps.gh,
+      this.deps.state,
+    );
+
+    if (outcome.kind === "surfaced") {
+      this.stats.surfaced += 1;
+      this.reply(task.task_id, outcome.reply);
+      return "proposal-surfaced";
+    }
+    if (outcome.kind === "declined") {
+      this.reply(task.task_id, outcome.reply);
+      return "proposal-declined";
+    }
+    if (outcome.kind === "duplicate") {
+      // Already resolved — no second reply, by contract.
+      return "proposal-duplicate";
+    }
+
+    // ── The gate ────────────────────────────────────────────────────────────
+    // Reached only for text that was not a proposal attempt at all. Identity
+    // is the host-resolved author; `hostResolvedPrincipal` is deliberately not
+    // supplied, because this protocol carries no principal on a `task` event —
+    // and `ratify.ts` treats an absent one as "no cross-check available",
+    // never as agreement.
+    const gate = processGateMessage(
+      { id: task.task_id, body: text, authorPlatform: platform, authorId },
+      this.deps.identity,
+      this.deps.state,
+    );
+
+    switch (gate.kind) {
+      case "ignored":
+        return "gate-ignored";
+      case "stale":
+      case "too-long":
+      case "state-unavailable":
+      case "ratified-not-certified":
+        this.reply(task.task_id, gate.reply);
+        return "gate-replied";
+      case "declined":
+        this.reply(task.task_id, gate.reply);
+        return "gate-declined";
+      case "ratified": {
+        this.stats.ratified += 1;
+        this.reply(task.task_id, gate.reply);
+        // The identity config is necessarily non-null on this branch — the gate
+        // refuses `gate-unconfigured` before it can reach `ratified` — but
+        // `apply.ts` requires the witness, so it is checked rather than
+        // asserted. There is no path from here to an effect without one.
+        const identity = this.deps.identity;
+        if (identity === null) {
+          warn("BUG: a ratified outcome with no identity config — no effect will follow");
+          return "gate-ratified";
+        }
+        const applied = await applyRatified(gate.certificate, {
+          state: this.deps.state,
+          identity,
+          effects: layer.effects,
+          gh: layer.plan,
+          ledger: layer.ledger,
+        });
+        if (applied.kind === "posted") {
+          this.stats.applied += 1;
+        } else if (applied.kind === "applied-not-posted") {
+          // The map moved and the ledger did not. Reconcile is the recovery
+          // path, and it is flagged due so the very next window carries it.
+          this.due.reconcile = true;
+          this.log("error", "plan changed but the ledger entry did not land — reconcile will catch up");
+        } else {
+          this.stats.applyRefused += 1;
+          this.log("error", `apply refused (${applied.reason})`);
+        }
+        return "gate-ratified";
+      }
+      default: {
+        const _never: never = gate;
+        void _never;
+        return "gate-ignored";
+      }
+    }
+  }
+
+  // ── Scheduled passes ──────────────────────────────────────────────────────
+
+  /**
+   * Re-run whichever pass previously failed to post, now that a window is
+   * open. At most ONE of each per window: the reads are bounded (50 per pass)
+   * but a user's task is waiting behind them, and the host fails a task that
+   * takes longer than its liveness timeout.
+   */
+  private async runDuePassesInWindow(): Promise<void> {
+    const layer = this.deps.effectLayer;
+    if (layer === null || !layer.transport.canPost) return;
+    if (this.due.reconcile) await this.reconcilePass("window");
+    if (this.due.watch) await this.watchPass("window");
+  }
+
+  /** ONE completion-watcher pass. Public so a test can drive it without timers. */
+  async watchPass(trigger: string): Promise<void> {
+    const layer = this.deps.effectLayer;
+    if (layer === null) return;
+    this.stats.watchPasses += 1;
+    const outcome = await pollCompletions(
+      {
+        state: this.deps.state,
+        plan: layer.plan,
+        gh: layer.linked,
+        ledger: layer.ledger,
+      },
+      this.now(),
+    );
+    if (outcome.kind === "refused") {
+      warn(`watch pass (${trigger}) refused: ${outcome.reason} — ${outcome.detail}`);
+      // NOT due: a degraded store or an unreadable plan will fail identically
+      // inside a window, and retrying there would delay a user's task for
+      // nothing.
+      this.due.watch = false;
+      return;
+    }
+    // `held` is the one-post-per-UTC-day rule doing its job, not a failure.
+    const flush = outcome.flush;
+    this.due.watch = flush.kind === "failed";
+    if (flush.kind === "failed") {
+      warn(
+        `watch pass (${trigger}) could not post ${flush.pending} queued completion(s) — ` +
+          `they stay queued and go out on the next post window`,
+      );
+    }
+  }
+
+  /** ONE reconcile pass. Public so a test can drive it without timers. */
+  async reconcilePass(trigger: string): Promise<void> {
+    const layer = this.deps.effectLayer;
+    if (layer === null) return;
+    this.stats.reconcilePasses += 1;
+    // `reconcile.ts` redraws the dashboard itself at the end of every pass, so
+    // a pending coalesced redraw is satisfied by this one.
+    this.dashboardStale = false;
+    const outcome = await reconcilePlan(
+      {
+        state: this.deps.state,
+        plan: layer.plan,
+        gh: layer.linked,
+        ledger: layer.ledger,
+        effects: layer.effects,
+        // NO channel cross-check — and that is a wiring FACT, not a choice
+        // deferred. `cortex-brain/v1` has no read-a-channel effect, and the
+        // receipts this transport mints are local ids that could never be
+        // found in a channel window (`transport.ts`). Wiring a reader that
+        // could not see them would make `reconcile.ts`'s deleted-✅ detector
+        // report every announcement as deleted. Absent, that detector cannot
+        // fire at all — which is the correct degradation and the one
+        // `reconcile.ts` is written for ("no reader ⇒ no claim").
+        channel: null,
+        instanceDir: this.deps.instanceDir,
+      },
+      this.now(),
+    );
+    if (outcome.kind === "refused") {
+      warn(`reconcile pass (${trigger}) refused: ${outcome.reason} — ${outcome.detail}`);
+      this.due.reconcile = false;
+      return;
+    }
+    this.due.reconcile = outcome.kind === "post-failed";
+    if (outcome.kind === "post-failed") {
+      warn(
+        `reconcile pass (${trigger}) found ${outcome.items.length} drift item(s) it could not ` +
+          `announce — NOTHING recorded; retrying on the next post window`,
+      );
+    }
+  }
+
+  /** The plan dashboard is derived; mark it for a coalesced redraw. */
+  markDashboardStale(): void {
+    this.dashboardStale = true;
+  }
+
+  /**
+   * Redraw the derived dashboard, at most once per task. Never throws and
+   * never fails a task: `regeneratePlanDashboard` reports a skip rather than
+   * writing a dashboard it cannot stand behind (a degraded store asserts
+   * nothing).
+   */
+  private async redrawDashboardIfStale(): Promise<void> {
+    if (!this.dashboardStale) return;
+    this.dashboardStale = false;
+    const layer = this.deps.effectLayer;
+    const dir = this.deps.instanceDir;
+    if (layer === null || dir === null || dir.length === 0) return;
+    const outcome = await regeneratePlanDashboard(
+      { state: this.deps.state, plan: layer.plan, dir, planUrl: layer.effects.planUrl },
+      this.now(),
+    );
+    if (outcome.kind === "skipped") {
+      warn(`dashboard not redrawn (${outcome.reason}): ${outcome.detail}`);
+    }
+  }
+
+  // ── Effect helpers ────────────────────────────────────────────────────────
+
+  /**
+   * A conversational reply — the surfaced summary, a decline, a gate ack. It
+   * goes to the TASK'S OWN thread (the host derives the target), which is where
+   * the person who typed is looking.
+   *
+   * Deliberately NOT routed through `HostLedgerTransport`: that port exists to
+   * pin LEDGER posts to one configured channel, and conflating the two would
+   * either send replies to the wrong place or let a reply masquerade as a
+   * ledger entry with a receipt.
+   */
+  private reply(taskId: string, text: string): void {
+    if (typeof text !== "string" || text.trim().length === 0) return;
+    this.deps.send({ v: 1, type: "post", task_id: taskId, text });
+  }
+
+  /** A diagnostic line. Task-agnostic; never carries user text. */
+  private log(level: "debug" | "info" | "warn" | "error", text: string): void {
+    this.deps.send({ v: 1, type: "log", level, text: `atlas: ${text}` });
+  }
+
+  private enqueue(work: () => Promise<void>): void {
+    this.queue = this.queue.then(work).catch((err: unknown) => {
+      warn(`queued work threw: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+}
