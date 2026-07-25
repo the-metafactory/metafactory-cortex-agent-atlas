@@ -344,6 +344,31 @@ function parseStoredRatification(value: unknown): StoredRatification | null {
   return { principal, platform, platformId, messageId, displayId, ts };
 }
 
+/**
+ * Field-for-field equality of two ratification records. Used by `markRatified`
+ * to prove the row it just wrote is the row storage now reports — see the
+ * read-back block there.
+ */
+function sameRatification(a: StoredRatification, b: StoredRatification): boolean {
+  return (
+    a.principal === b.principal &&
+    a.platform === b.platform &&
+    a.platformId === b.platformId &&
+    a.messageId === b.messageId &&
+    a.displayId === b.displayId &&
+    a.ts === b.ts
+  );
+}
+
+/**
+ * Module-private sentinel: the in-transaction read-back did not agree with the
+ * writes that were about to be committed. Thrown so the transaction ROLLS BACK
+ * — never caught by `AtlasProposals.run` (`markRatified` catches it itself),
+ * because it is a disagreement about content, not a storage failure, and the
+ * store is still perfectly readable.
+ */
+class RatificationReadbackFailed extends Error {}
+
 function serializeRatification(r: StoredRatification): Record<string, unknown> {
   return {
     principal: r.principal,
@@ -645,6 +670,31 @@ export class AtlasStateStore {
    * value that was just written) — so a caller can only proceed on what
    * durably persisted. `null` on any precondition violation, per this class's
    * no-throw-on-precondition discipline.
+   *
+   * ── The read-back happens INSIDE the transaction (issue #6, finding 3) ─────
+   * It used to be a separate `this.readRatification(capId)` AFTER the
+   * transaction had committed. That is a commit followed by a FALLIBLE read,
+   * and the failure mode is the worst one this pack has: the read throws (a
+   * single injected `SQLITE_IOERR` reproduces it), `AtlasProposals.run` swallows
+   * it and returns `null`, and ratify.ts reads `null` as "not recorded" and
+   * tells the principal *"Nothing was changed and the proposal is still awaiting
+   * a decision"* — while storage holds a committed `status='in_flight'`, a
+   * `$.ratification` note, and a `work_item_ratified` event. A split brain on
+   * the one question the trust path exists to answer, from which W2c could later
+   * mint a valid certificate and perform the public plan edit the principal was
+   * told never happened.
+   *
+   * Doing the read-back inside the committing transaction removes the window
+   * rather than narrowing it. There are now exactly two outcomes and both are
+   * honest:
+   *   - the read succeeds and agrees → COMMIT, and the value returned is what
+   *     durably persisted (the original property, unweakened);
+   *   - the read throws, or disagrees with what was written → ROLLBACK, so
+   *     nothing was committed, and every `null`/throw out of this method is a
+   *     truthful "nothing changed".
+   * There is no third outcome, because there is no fallible operation left
+   * between COMMIT and `return`. (`regenDashboard` below is fire-and-forget and
+   * catches its own errors; it reads nothing this method reports on.)
    */
   markRatified(
     id: string,
@@ -683,7 +733,7 @@ export class AtlasStateStore {
     // same file, so "nothing else writes here" is an assumption worth not
     // making on the trust path.
     const ts = Date.now();
-    const outcome = this.db.transaction((): StoredRatification | null => {
+    const txn = this.db.transaction((): StoredRatification | null => {
       const row = this.getRow(capId);
       if (row === null || row.status !== "waiting_human") return null;
       const existingNotes = notesToObject(row.notes);
@@ -729,13 +779,45 @@ export class AtlasStateStore {
         },
         ts,
       );
-      return stored;
-    })();
+      // Read back what was just written, THROUGH THE SAME READ PATH the
+      // certificate is later minted from (`readRatificationByKey` — the
+      // json-boundary re-validation AND the append-only event check, not a
+      // convenient shortcut). Still inside the transaction, so a failure here
+      // un-writes the rows above instead of contradicting them.
+      const durable = this.readRatificationByKey(capId);
+      if (durable === null) {
+        throw new RatificationReadbackFailed(
+          `ratification for ${capId} was not readable back inside its own transaction`,
+        );
+      }
+      if (!sameRatification(durable, stored)) {
+        throw new RatificationReadbackFailed(
+          `ratification read back for ${capId} does not match what was written`,
+        );
+      }
+      // What STORAGE says, not the in-memory `stored` — the caller must only
+      // ever proceed on a durable read (see ratification.ts's file header).
+      return durable;
+    });
+    let outcome: StoredRatification | null;
+    try {
+      outcome = txn();
+    } catch (err) {
+      if (err instanceof RatificationReadbackFailed) {
+        // The transaction rolled back, so `null` here is TRUE: nothing was
+        // committed. Not rethrown — the store is readable, so degrading the
+        // whole process (which `run`'s catch-all would do) would be a
+        // misdiagnosis of a content disagreement as a storage failure.
+        warn(`markRatified rolled back — ${err.message}`);
+        return null;
+      }
+      // A real storage failure. The transaction rolled back too, so
+      // `AtlasProposals.run`'s degradation path also reports truthfully.
+      throw err;
+    }
     if (outcome === null) return null;
     this.regenDashboard();
-    // Return what STORAGE says, not `outcome` — the caller must only ever
-    // proceed on a durable read (see ratification.ts's file header).
-    return this.readRatification(capId);
+    return outcome;
   }
 
   /**
@@ -756,7 +838,16 @@ export class AtlasStateStore {
    * Read-back for audit purposes should query the events table directly.
    */
   readRatification(id: string): StoredRatification | null {
-    const capId = boundedKey(id);
+    return this.readRatificationByKey(boundedKey(id));
+  }
+
+  /**
+   * `readRatification`'s body, taking an ALREADY-bounded key. Split out so
+   * `markRatified`'s in-transaction read-back goes through the identical
+   * checks — same status gate, same JSON re-validation, same append-only event
+   * requirement — rather than a cheaper lookalike that could drift from it.
+   */
+  private readRatificationByKey(capId: string): StoredRatification | null {
     const row = this.getRow(capId);
     if (row === null) return null;
     if (row.status !== "in_flight") return null; // `ratified` only, never `applied`
@@ -1110,12 +1201,13 @@ class MemoryProposals {
   // once the DB is back. Fail-closed AND recoverable — the item is not lost,
   // it is simply not actioned on an audit trail that does not exist.
 
-  findSurfacedByDisplayId(displayId: number): ProposalRecord | null {
-    for (const r of this.byId.values()) {
-      if (r.phase === "surfaced" && r.displayId === displayId) return { ...r };
-    }
-    return null;
-  }
+  // NOTE there is deliberately no `findSurfacedByDisplayId` here (issue #6,
+  // finding 2). "Is proposal #3 currently awaiting a decision?" is a question
+  // about DURABLE state, and a store that cannot see durable state has no
+  // honest answer to it — least of all `null`, which the caller cannot tell
+  // apart from "there is no such proposal". Answering that question is
+  // therefore lifted to `AtlasProposals.lookupSurfacedByDisplayId`, which
+  // returns `unavailable` whenever this class is the one being consulted.
 
   /** No durable event log in degraded mode — nothing has been "seen". */
   hasSeenGateMessage(): boolean {
@@ -1150,6 +1242,37 @@ class MemoryProposals {
 }
 
 /**
+ * The answer to "is display id N currently awaiting a decision?".
+ *
+ * Three-valued ON PURPOSE (issue #6, finding 2). The old two-valued
+ * `ProposalRecord | null` collapsed two facts a caller must not confuse:
+ *   - `absent`      — storage was read, and no proposal with that number is
+ *                     awaiting a decision. An assertion about the queue.
+ *   - `unavailable` — storage could not be read at all. An assertion about
+ *                     ATLAS, and about nothing else. Answering `absent` here
+ *                     told the principal "no proposal with that number is
+ *                     currently awaiting a decision. Nothing was changed."
+ *                     about a row sitting in `waiting_human` on disk, and kept
+ *                     saying it for every subsequent verb until restart.
+ * Callers route `unavailable` to `stateDegradedReply`, never to
+ * `nothingToRatifyReply`.
+ */
+export type SurfacedLookup =
+  | { kind: "found"; record: ProposalRecord }
+  | { kind: "absent" }
+  | { kind: "unavailable"; reason: string };
+
+/** What `AtlasProposals.degradation()` reports once durability has been lost. */
+export interface StateDegradation {
+  /** Epoch ms at which durable state stopped being readable. */
+  readonly since: number;
+  /** The underlying error message, or why no store existed at start-up. */
+  readonly reason: string;
+  /** How many storage failures have been observed (0 = never had a store). */
+  readonly storageFailures: number;
+}
+
+/**
  * What callers actually hold: DB-authoritative reads/writes with the
  * inverted fail-soft (state is memory, not authority) — identical posture to
  * escort's EscortSessions.
@@ -1157,10 +1280,42 @@ class MemoryProposals {
 export class AtlasProposals {
   private db: AtlasStateStore | null;
   private memory: MemoryProposals | null;
+  private degradedSince: number | null;
+  private degradedReason: string | null;
+  private storageFailures = 0;
 
   constructor(db: AtlasStateStore | null) {
     this.db = db;
     this.memory = db === null ? new MemoryProposals() : null;
+    // A store that never had a DB is degraded from birth, not "empty". It
+    // cannot see the durable queue either, and must say so rather than report
+    // every proposal as absent.
+    this.degradedSince = db === null ? Date.now() : null;
+    this.degradedReason =
+      db === null ? "no durable state store was available at start-up" : null;
+  }
+
+  /** True while durable storage is readable. The gate's honesty hinges on it. */
+  isDurable(): boolean {
+    return this.db !== null;
+  }
+
+  /**
+   * Non-null once durability has been lost — the machine-readable form of the
+   * stderr line `run` emits, for a health surface / status command to report.
+   * Degradation is still PERMANENT until restart (this class deliberately does
+   * not reopen the DB: an automatic retry loop against a genuinely failing
+   * disk is its own hazard, and re-acquiring the ability to act must be an
+   * explicit, supervised event on the trust path). Making it observable is the
+   * part that was missing.
+   */
+  degradation(): StateDegradation | null {
+    if (this.degradedSince === null || this.degradedReason === null) return null;
+    return {
+      since: this.degradedSince,
+      reason: this.degradedReason,
+      storageFailures: this.storageFailures,
+    };
   }
 
   get(id: string): ProposalRecord | null {
@@ -1214,11 +1369,36 @@ export class AtlasProposals {
 
   // ── W2b, the ratification gate (issue #3) ────────────────────────────────
 
-  findSurfacedByDisplayId(displayId: number): ProposalRecord | null {
-    return this.run(
+  /**
+   * The gate's lookup. Three-valued so "I cannot see storage" is never
+   * delivered to the principal as "no such proposal" (issue #6, finding 2).
+   *
+   * Durability is checked BOTH SIDES of the read, and both checks are load
+   * bearing:
+   *   - BEFORE, because a store that is already degraded (or never had a DB)
+   *     would otherwise answer out of an empty in-memory map;
+   *   - AFTER, because `run` degrades on a throw and then FALLS THROUGH to the
+   *     memory branch, so the very call that broke durability returns a `null`
+   *     that looks exactly like a clean miss. That fall-through is the whole
+   *     mechanism of the reported bug.
+   */
+  lookupSurfacedByDisplayId(displayId: number): SurfacedLookup {
+    const before = this.unavailable();
+    if (before !== null) return before;
+    const record = this.run<ProposalRecord | null>(
       (db) => db.findSurfacedByDisplayId(displayId),
-      (m) => m.findSurfacedByDisplayId(displayId),
+      // Not consulted: a degraded store's honest answer is `unavailable`, and
+      // the check below turns this `null` into exactly that.
+      () => null,
     );
+    const after = this.unavailable();
+    if (after !== null) return after;
+    return record === null ? { kind: "absent" } : { kind: "found", record };
+  }
+
+  private unavailable(): { kind: "unavailable"; reason: string } | null {
+    if (this.db !== null) return null;
+    return { kind: "unavailable", reason: this.degradedReason ?? "durable state is unreadable" };
   }
 
   hasSeenGateMessage(messageId: string): boolean {
@@ -1281,8 +1461,18 @@ export class AtlasProposals {
       try {
         return dbFn(this.db);
       } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.storageFailures += 1;
+        this.degradedSince = Date.now();
+        this.degradedReason = reason;
+        // Loud on purpose (issue #6 item 3). The old line read like a routine
+        // fallback; what actually happened is that the ratification gate is now
+        // shut for the lifetime of the process, so the operator needs to see
+        // the consequence, not just the cause.
         warn(
-          `read/write failed — degrading to memory-only proposals until restart: ${err instanceof Error ? err.message : String(err)}`,
+          `DEGRADED — durable state is unreadable and this process will NOT recover ` +
+            `until restart. The ratification gate now refuses every RATIFY/DECLINE, ` +
+            `mints no certificates, and records no audit events. Cause: ${reason}`,
         );
         this.db.close();
         this.db = null;

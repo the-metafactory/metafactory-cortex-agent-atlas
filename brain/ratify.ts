@@ -47,6 +47,23 @@
  * command". A rejected outsider learns nothing about the queue's contents and
  * cannot use Atlas to spam the channel.
  *
+ * ── Replies must also be TRUE (issue #6) ────────────────────────────────────
+ * Failing closed is not the same as being honest, and the two were not both
+ * held. An independent adversarial review confirmed two cases where a storage
+ * error made this file tell the principal something untrue — a `null` from the
+ * state layer was read as "nothing happened" when it could equally mean
+ * "committed, but I could not read it back" or "I cannot see storage at all".
+ * So there are now three distinct outcomes where there was one, and each says
+ * only what is actually known:
+ *
+ *   nothing committed, queue readable   → `stale`                (absent)
+ *   nothing committed, queue unreadable → `state-unavailable`    (degraded)
+ *   COMMITTED, certificate unreadable   → `ratified-not-certified`
+ *
+ * The effects posture is unchanged by all of this: a certificate is minted
+ * only from a durable read, and the third outcome above deliberately carries
+ * none. Nothing here became more permissive; the replies became true.
+ *
  * ── This file still causes no effects ───────────────────────────────────────
  * As with W2a, this module returns descriptions of replies; it has no posting
  * capability, no gh handle, and no import that could acquire one. The one
@@ -66,6 +83,7 @@ import {
   declinedByRatifierAck,
   nothingToRatifyReply,
   ratifiedAck,
+  ratifiedNotCertifiedReply,
   stateDegradedReply,
 } from "./templates";
 
@@ -249,6 +267,14 @@ export type GateOutcome =
   | { kind: "too-long"; verb: RatifyVerb; reply: string }
   /** The gate passed but the store could not durably record it. Reply, no transition. */
   | { kind: "state-unavailable"; displayId: number; verb: RatifyVerb; reply: string }
+  /**
+   * The ratification DID durably commit, but the certificate read-back failed,
+   * so no certificate exists and no effect can follow (issue #6, finding 3).
+   * A transition happened; the reply says so. Deliberately carries NO
+   * certificate field — there is no shape of this outcome that authorises an
+   * effect.
+   */
+  | { kind: "ratified-not-certified"; workItemId: string; displayId: number; reply: string }
   | {
       kind: "ratified";
       workItemId: string;
@@ -368,8 +394,21 @@ export function processGateMessage(
   }
   const command = parsed.command;
 
-  const target = state.findSurfacedByDisplayId(command.displayId);
-  if (target === null) {
+  const lookup = state.lookupSurfacedByDisplayId(command.displayId);
+  if (lookup.kind === "unavailable") {
+    // Atlas cannot READ the queue. That is a fact about Atlas, not about the
+    // queue, and it must not be reported as one (issue #6, finding 2): a
+    // single events-table read failure used to land here as
+    // `nothingToRatifyReply` — "no proposal with that number is currently
+    // awaiting a decision. Nothing was changed." — about a row sitting in
+    // `waiting_human` on disk, and kept saying it for every subsequent verb
+    // until restart. Same refusal, same absence of effect; honest reply.
+    process.stderr.write(
+      `atlas: ratify: refusing ${command.verb} ${command.displayId} — state unreadable: ${lookup.reason}\n`,
+    );
+    return notRecorded(state, msg, gateKey, command.displayId, command.verb);
+  }
+  if (lookup.kind === "absent") {
     // Unknown id, already ratified, already declined, already applied, or
     // still in intake/validated — one branch, because the query's status
     // filter makes them one case. No transition, one templated reply (the
@@ -381,6 +420,7 @@ export function processGateMessage(
     });
     return { kind: "stale", displayId: command.displayId, verb: command.verb, reply };
   }
+  const target = lookup.record;
 
   const actor = {
     principal: resolved,
@@ -414,7 +454,28 @@ export function processGateMessage(
   // survive — so no certificate, so no effect. Fail closed.
   const certificate = requireRatification(state, target.id);
   if (certificate === null) {
-    return notRecorded(state, msg, gateKey, command.displayId, "RATIFY");
+    // FAIL CLOSED on the effect, but do NOT reuse `notRecorded` here (issue
+    // #6, finding 3 — the same split brain, one layer up from state.ts).
+    // `stored !== null` above means `markRatified` returned a value it read
+    // back INSIDE its own committing transaction: the ratification is durably
+    // committed, full stop. This is therefore a second, post-commit fallible
+    // read, and `stateDegradedReply`'s "Nothing was changed and the proposal
+    // is still awaiting a decision; send the verb again" would be false on all
+    // three counts. Say what actually happened instead.
+    recordGateDecision(state, msg, gateKey, "gate_state_unavailable", {
+      verb: "RATIFY",
+      display_id: command.displayId,
+      ratification_committed: true,
+    });
+    process.stderr.write(
+      `atlas: ratify: RATIFY ${command.displayId} committed but could not be read back — no certificate minted, no effect will follow\n`,
+    );
+    return {
+      kind: "ratified-not-certified",
+      workItemId: target.id,
+      displayId: command.displayId,
+      reply: ratifiedNotCertifiedReply(command.displayId),
+    };
   }
   return {
     kind: "ratified",
@@ -428,9 +489,22 @@ export function processGateMessage(
 /**
  * The gate passed but the transition did not happen. Deliberately NOT named
  * "degraded": a degraded store is the common cause but not the only one (a
- * precondition the state layer refuses also lands here), and the reply must
- * not assert a cause it cannot know. What it CAN assert, and what matters, is
- * that nothing changed and the proposal is still awaiting a decision.
+ * precondition the state layer refuses also lands here, as does "the queue is
+ * unreadable"), and the reply must not assert a cause it cannot know. What it
+ * CAN assert, and what matters, is that nothing changed and the proposal is
+ * still awaiting a decision.
+ *
+ * ── Both of those claims are now GUARANTEED, not merely intended ────────────
+ * Every caller of this helper is a path on which no write committed:
+ *   - `markDeclinedByRatifier === false` — its writes and its return value are
+ *     one transaction; a throw rolls back and `run` reports false.
+ *   - `markRatified === null` — since issue #6 its read-back happens inside the
+ *     committing transaction, so a failure un-writes rather than contradicts.
+ *   - `lookup.kind === "unavailable"` — a read, no writes attempted.
+ * The one path where a write DID commit (`markRatified` succeeded but the
+ * certificate read-back failed) deliberately does NOT come here; it has its own
+ * outcome and its own truthful template. If a future caller is added, check it
+ * against that list before routing it here.
  */
 function notRecorded(
   state: AtlasProposals,

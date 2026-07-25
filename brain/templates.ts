@@ -172,3 +172,31 @@ export function stateDegradedReply(verb: "RATIFY" | "DECLINE", displayId: number
     `failing, check Atlas's state store.`
   );
 }
+
+/**
+ * The ratification DID durably commit, but Atlas could not then re-read it to
+ * mint the certificate every effect requires (issue #6, finding 3).
+ *
+ * This template exists because the alternative was a lie. The old code sent
+ * `stateDegradedReply` here — "Nothing was changed and the proposal is still
+ * awaiting a decision; send the verb again" — while storage held a committed
+ * `work_item_ratified` event. Two things were wrong with that, and the second
+ * is the nastier one: the proposal is NO LONGER awaiting a decision, so
+ * re-sending the verb (as that reply instructs) gets `nothingToRatifyReply`,
+ * i.e. "no proposal with that number is currently awaiting a decision" — the
+ * principal is walked from one false statement to a second, contradictory one.
+ *
+ * So this reply asserts exactly the three facts that are true, and nothing
+ * beyond them: the decision is recorded; no plan edit or ledger post has
+ * happened; do not re-send. Fail-closed on effects is untouched — no
+ * certificate was minted, so there is nothing for W2c to act on.
+ */
+export function ratifiedNotCertifiedReply(displayId: number): string {
+  return (
+    `RATIFY ${displayId} IS recorded — your decision was durably stored against ` +
+    `your identity. Atlas then could not read that record back, so it has NOT ` +
+    `updated the plan or posted a ledger entry, and it will not act until the ` +
+    `record is readable again. Do NOT send the verb again — #${displayId} is no ` +
+    `longer awaiting a decision. Check Atlas's state store.`
+  );
+}
