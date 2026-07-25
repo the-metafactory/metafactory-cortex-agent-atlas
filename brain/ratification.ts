@@ -35,20 +35,33 @@
  *      what storage actually says. A certificate is therefore not "permission
  *      granted", it is "a stored ratification event was observed just now".
  *   4. `state.ts`'s `markApplied` takes ONLY a certificate (there is no
- *      overload taking a bare work-item id) PLUS the principal id the gate is
- *      configured for, and STILL re-reads storage and compares it
- *      field-by-field before transitioning — see `certificateMatchesStorage`.
- *      The expected-ratifier parameter closes the gap that a certificate on
- *      its own says a ratification happened, but not that the RIGHT person
- *      made it; a caller cannot forget to check, because it cannot call
- *      without supplying the answer.
+ *      overload taking a bare work-item id) PLUS the CONFIGURED ratifier, and
+ *      STILL re-reads storage and compares it field-by-field before
+ *      transitioning — see `certificateMatchesStorage`. The expected-ratifier
+ *      parameter closes the gap that a certificate on its own says a
+ *      ratification happened, but not that the RIGHT person made it; a caller
+ *      cannot forget to check, because it cannot call without supplying the
+ *      answer.
+ *
+ *      That parameter was a bare `string` until issue #7, which made it
+ *      VACUOUSLY satisfiable: `markApplied(cert, cert.ratifierPrincipalId)`
+ *      returned `true`, so the most natural W2c call-site typo answered the
+ *      question from the very certificate under inspection, with no type or
+ *      lint signal. It is now identity.ts's `ConfiguredRatifier` — a branded
+ *      witness minted only when a config is built — so that call no longer
+ *      compiles, and a hand-cast look-alike is refused by the same WeakSet
+ *      discipline this file uses for certificates.
  *
  * ── Why the port instead of importing state.ts ─────────────────────────────
  * `RatificationReader` is deliberately the narrowest possible view of the
- * store (one read method). It keeps this module dependency-free — `state.ts`
- * imports these types, this file imports nothing — so the dependency graph is
- * a DAG and the certificate's provenance rules cannot be diluted by a cycle.
+ * store (one read method). It keeps this module all but dependency-free — the
+ * ONLY import is identity.ts's configured-ratifier witness, and identity.ts is
+ * itself a leaf that imports nothing — so `state.ts` still imports these types
+ * rather than the other way round, the dependency graph is still a DAG, and the
+ * certificate's provenance rules cannot be diluted by a cycle.
  */
+
+import { isConfiguredRatifier, type ConfiguredRatifier } from "./identity";
 
 /**
  * Declared, never exported. The key of the brand below. Outside this module
@@ -141,18 +154,22 @@ const MINTED = new WeakSet<object>();
  * since changed, and a certificate naming the wrong ratifier cannot authorise
  * one at all.
  *
- * `expectedRatifierPrincipalId` is REQUIRED, not optional. A certificate on
- * its own attests that a ratification is stored; only the caller knows which
- * principal the gate is configured for, so only the caller can close the
- * remaining question — and making the parameter mandatory means it cannot be
- * quietly skipped.
+ * `expectedRatifier` is REQUIRED, not optional, and is a `ConfiguredRatifier`
+ * rather than a string. A certificate on its own attests that a ratification is
+ * stored; only the CONFIGURATION knows which principal the gate is armed for,
+ * so only the configuration can close the remaining question. Requiring the
+ * branded witness means the answer cannot be sourced from the certificate under
+ * inspection (`markApplied(cert, cert.ratifierPrincipalId)` does not compile),
+ * and a cast-alike is refused here by identity.ts's own WeakSet.
  */
 export function certificateMatchesStorage(
   reader: RatificationReader,
   cert: RatificationCertificate,
-  expectedRatifierPrincipalId: string,
+  expectedRatifier: ConfiguredRatifier,
 ): boolean {
   if (!MINTED.has(cert)) return false;
+  if (!isConfiguredRatifier(expectedRatifier)) return false;
+  const expectedRatifierPrincipalId = expectedRatifier.principalId;
   if (
     typeof expectedRatifierPrincipalId !== "string" ||
     expectedRatifierPrincipalId.length === 0 ||
