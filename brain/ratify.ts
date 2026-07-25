@@ -23,11 +23,42 @@
  * parser unreachable. Likewise step 3 before step 4 means untrusted bodies are
  * never parsed at all: the parser is dead code for everyone but the principal.
  *
- * Step 1 also runs before step 3, which matters for a specific misconfiguration:
- * if a deployment ever listed Atlas's own platform id among the ratifier
- * principal's `platform_ids`, the self-block still wins. Constitution rule 3
- * cannot be configured around. (Tested — see "self-block wins over a
- * misconfigured principal-map".)
+ * ── Constitution rule 3: what is ACTUALLY enforced (issue #7, finding 6) ────
+ * Step 1 also runs before step 3, which matters for a specific
+ * misconfiguration: if a config somehow listed Atlas's own platform id among
+ * the ratifier principal's `platform_ids`, the self-block still wins. (Tested —
+ * see "self-block wins over a misconfigured principal-map".)
+ *
+ * That ordering used to be the WHOLE of the claim, and the claim was overstated.
+ * It held only while `ATLAS_SELF_PLATFORM_IDS` was correct and current, and
+ * nothing checked the self set and the ratifier map were disjoint. With a STALE
+ * self id (bot-token rotation, a re-invite, or an operator projecting the
+ * application id instead of the bot user id) plus Atlas's CURRENT id among the
+ * ratifier's `platform_ids`, this function returned `{kind: "ratified"}` for a
+ * message Atlas authored — two individually defensible config facts composing
+ * into a rule-3 violation. So, precisely:
+ *
+ *   ENFORCED (structural). A config in which any (platform, id) appears in BOTH
+ *   `ATLAS_SELF_PLATFORM_IDS` and the ratifier's `platform_ids` is REFUSED at
+ *   load with the named reason `self-and-ratifier-platform-ids-overlap`
+ *   (identity.ts). A refused config is `null` here, so the gate is not armed and
+ *   every verb is ignored. The check is not order-dependent and cannot be
+ *   "configured around", because the config does not load at all.
+ *
+ *   ENFORCED (ordering, defence in depth). If such a config is nevertheless
+ *   constructed in-process (the ports seam, `identityConfigFromPorts`), step 1
+ *   still refuses Atlas-authored messages before parse — and
+ *   `authorizeRatifierAction` re-checks the self-block a second time before any
+ *   transition can be authorised.
+ *
+ *   NOT ENFORCED, and not enforceable here. If `ATLAS_SELF_PLATFORM_IDS` names
+ *   an id Atlas no longer posts under, while its CURRENT id is a legitimate,
+ *   non-overlapping entry in the ratifier's `platform_ids`, nothing static can
+ *   see it: the config never states Atlas's true current id, so there is no
+ *   disagreement to detect. Closing that requires the surface adapter to assert
+ *   at start-up that the id it is authenticated as is in the self set — a
+ *   wiring-time check, on a wiring site (`brain/main.ts`) this pack does not yet
+ *   have. Recorded here so the claim is not read as stronger than it is.
  *
  * ── Identity: authenticated ids only ────────────────────────────────────────
  * The ONLY identity input to any decision is `authorPlatform` + `authorId`,
@@ -72,7 +103,7 @@
  * read-back, never from this file's own belief that the gate passed.
  */
 
-import type { RatifyIdentityConfig } from "./identity";
+import { authorizeRatifierAction, type RatifyIdentityConfig } from "./identity";
 import {
   requireRatification,
   type RatificationCertificate,
@@ -363,7 +394,7 @@ export function processGateMessage(
     auditRejection(state, msg, gateKey, "unmapped-author");
     return { kind: "ignored", reason: "unmapped-author" };
   }
-  if (resolved !== config.ratifierPrincipalId) {
+  if (resolved !== config.ratifier.principalId) {
     auditRejection(state, msg, gateKey, "not-the-ratifier");
     return { kind: "ignored", reason: "not-the-ratifier" };
   }
@@ -422,15 +453,33 @@ export function processGateMessage(
   }
   const target = lookup.record;
 
-  const actor = {
-    principal: resolved,
+  // ── 5. Mint the transition authority (issue #7, finding 4) ───────────────
+  // The state layer will not accept an identity claim any more — it accepts a
+  // `GateAuthority` and reads the identity off it. `authorizeRatifierAction`
+  // re-runs the self-block and the principal-map resolution ITSELF rather than
+  // trusting the checks above, so the authority attests to what it verified
+  // rather than to what its caller says it verified. Nothing is passed in that
+  // could name a principal: the recorded principal comes from `config`.
+  //
+  // Unreachable in practice (steps 1 and 3 already passed on the same inputs),
+  // so a `null` here means the injected resolvers disagreed with themselves
+  // between two calls. That is a refusal, and no write has been attempted, so
+  // `notRecorded`'s two claims — nothing changed, still awaiting a decision —
+  // are both true.
+  const authority = authorizeRatifierAction(config, {
     platform: msg.authorPlatform,
     platformId: msg.authorId,
     messageId: msg.id,
-  };
+  });
+  if (authority === null) {
+    process.stderr.write(
+      `atlas: ratify: refusing ${command.verb} ${command.displayId} — identity re-check did not grant a gate authority\n`,
+    );
+    return notRecorded(state, msg, gateKey, command.displayId, command.verb);
+  }
 
   if (command.verb === "DECLINE") {
-    const ok = state.markDeclinedByRatifier(target.id, actor, command.reason);
+    const ok = state.markDeclinedByRatifier(target.id, authority, command.reason);
     if (!ok) {
       return notRecorded(state, msg, gateKey, command.displayId, "DECLINE");
     }
@@ -444,7 +493,7 @@ export function processGateMessage(
   }
 
   // RATIFY — surfaced → ratified.
-  const stored = state.markRatified(target.id, actor);
+  const stored = state.markRatified(target.id, authority);
   if (stored === null) {
     return notRecorded(state, msg, gateKey, command.displayId, "RATIFY");
   }
@@ -501,6 +550,8 @@ export function processGateMessage(
  *   - `markRatified === null` — since issue #6 its read-back happens inside the
  *     committing transaction, so a failure un-writes rather than contradicts.
  *   - `lookup.kind === "unavailable"` — a read, no writes attempted.
+ *   - `authorizeRatifierAction === null` (issue #7) — an identity re-check that
+ *     granted nothing. Pure computation over the config; it touches no store.
  * The one path where a write DID commit (`markRatified` succeeded but the
  * certificate read-back failed) deliberately does NOT come here; it has its own
  * outcome and its own truthful template. If a future caller is added, check it

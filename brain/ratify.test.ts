@@ -14,14 +14,25 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  authorizeRatifierAction,
+  identityConfigFromPorts,
+  isConfiguredRatifier,
+  isGateAuthority,
+  loadIdentityConfig,
   loadIdentityConfigFromEnv,
+  makeIdentityConfig,
   NoSelfIdentity,
   parsePlatformActors,
   StaticPrincipalMap,
   StaticSelfIdentity,
+  type ConfiguredRatifier,
+  type GateAuthority,
+  type IdentityConfigRefusal,
+  type PrincipalResolver,
   type RatifyIdentityConfig,
+  type SelfIdentity,
 } from "./identity";
-import { requireRatification } from "./ratification";
+import { requireRatification, type RatificationCertificate } from "./ratification";
 import { parseGateCommand, processGateMessage, type GateMessage } from "./ratify";
 import { AtlasProposals, AtlasStateStore, gateMessageKey } from "./state";
 import { nothingToRatifyReply, stateDegradedReply } from "./templates";
@@ -44,6 +55,23 @@ let store: AtlasStateStore;
 let state: AtlasProposals;
 let config: RatifyIdentityConfig;
 
+/**
+ * A config around INJECTED ports — the seam identity.ts documents for tests.
+ * Used throughout this suite because most fixtures need a resolver/self-check
+ * that `makeIdentityConfig`'s actor-list form cannot express (a throwing port,
+ * a map with two principals, a ratifier id nobody maps to). Throws on `null`
+ * so a fixture mistake is a test failure, never a silently unarmed gate.
+ */
+function ports(input: {
+  ratifierPrincipalId: string;
+  principals: PrincipalResolver;
+  self: SelfIdentity;
+}): RatifyIdentityConfig {
+  const cfg = identityConfigFromPorts(input);
+  if (cfg === null) throw new Error("fixture: expected identityConfigFromPorts to build a config");
+  return cfg;
+}
+
 function makeConfig(
   overrides: {
     principalPlatformIds?: string[];
@@ -53,13 +81,33 @@ function makeConfig(
 ): RatifyIdentityConfig {
   const principalIds = overrides.principalPlatformIds ?? [PRINCIPAL_PLATFORM_ID];
   const atlasIds = overrides.atlasPlatformIds ?? [ATLAS_PLATFORM_ID];
-  return {
+  return ports({
     ratifierPrincipalId: overrides.ratifierPrincipalId ?? PRINCIPAL_ID,
     principals: new StaticPrincipalMap(
       principalIds.map((id) => ({ actor: { platform: PLATFORM, id }, principalId: PRINCIPAL_ID })),
     ),
     self: new StaticSelfIdentity(atlasIds.map((id) => ({ platform: PLATFORM, id }))),
-  };
+  });
+}
+
+/**
+ * A `GateAuthority` for the standard fixture principal, obtained the only way
+ * one can be: through `authorizeRatifierAction`. Tests that need to drive a
+ * state transition directly (rather than through `processGateMessage`) use this
+ * — deliberately, so that "the state layer accepts only gate-minted
+ * authorities" is exercised rather than worked around.
+ */
+function grantAuthority(
+  messageId: string,
+  overrides: { platformId?: string; config?: RatifyIdentityConfig } = {},
+): GateAuthority {
+  const granted = authorizeRatifierAction(overrides.config ?? config, {
+    platform: PLATFORM,
+    platformId: overrides.platformId ?? PRINCIPAL_PLATFORM_ID,
+    messageId,
+  });
+  if (granted === null) throw new Error("fixture: expected authorizeRatifierAction to grant");
+  return granted;
 }
 
 /** A message from the real principal unless overridden. */
@@ -374,7 +422,7 @@ describe("parsePlatformActors / loadIdentityConfigFromEnv", () => {
       ATLAS_SELF_PLATFORM_IDS: "discord:2",
     });
     expect(cfg).not.toBeNull();
-    expect(cfg?.ratifierPrincipalId).toBe("plan-steward");
+    expect(cfg?.ratifier.principalId).toBe("plan-steward");
     expect(cfg?.principals.resolve("discord", "1")).toBe("plan-steward");
     expect(cfg?.self.isSelf("discord", "2")).toBe(true);
   });
@@ -613,14 +661,14 @@ describe("ATTACK: display-name spoofing", () => {
 
   test("a mapped principal who is NOT the configured ratifier is rejected", () => {
     const displayId = surface("c1");
-    const twoPrincipals: RatifyIdentityConfig = {
+    const twoPrincipals = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([
         { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
         { actor: { platform: PLATFORM, id: STRANGER_PLATFORM_ID }, principalId: "someone-else" },
       ]),
       self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
-    };
+    });
     const out = processGateMessage(
       msg(`RATIFY ${displayId}`, { authorId: STRANGER_PLATFORM_ID }),
       twoPrincipals,
@@ -816,11 +864,11 @@ describe("the gate fails closed", () => {
 
   test("an empty principal-map -> nothing resolves", () => {
     const displayId = surface("c1");
-    const empty: RatifyIdentityConfig = {
+    const empty = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([]),
       self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
-    };
+    });
     const out = processGateMessage(msg(`RATIFY ${displayId}`), empty, state);
     expect(out).toEqual({ kind: "ignored", reason: "unmapped-author" });
     expect(state.get("c1")?.phase).toBe("surfaced");
@@ -904,7 +952,7 @@ describe("invariant — no `applied` without a stored ratification event", () =>
     const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
     if (out.kind !== "ratified") throw new Error("expected ratified");
 
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(true);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
     expect(state.get("c1")?.phase).toBe("applied");
   });
 
@@ -912,8 +960,8 @@ describe("invariant — no `applied` without a stored ratification event", () =>
     const displayId = surface("c1");
     const out = processGateMessage(msg(`RATIFY ${displayId}`), config, state);
     if (out.kind !== "ratified") throw new Error("expected ratified");
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(true);
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(false);
   });
 
   test("a certificate for one work item cannot apply another", () => {
@@ -925,7 +973,7 @@ describe("invariant — no `applied` without a stored ratification event", () =>
     // `as unknown as` escape hatch a determined caller would use. The runtime
     // re-read is what stops it.
     const forged = { ...out.certificate, workItemId: "b" } as typeof out.certificate;
-    expect(state.markApplied(forged, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(forged, config.ratifier)).toBe(false);
     expect(state.get("b")?.phase).toBe("surfaced");
   });
 
@@ -942,7 +990,7 @@ describe("invariant — no `applied` without a stored ratification event", () =>
       { ...out.certificate, displayId: out.certificate.displayId + 1 },
       { ...out.certificate, ratifierPlatform: "slack" },
     ]) {
-      expect(state.markApplied(tampered as typeof out.certificate, PRINCIPAL_ID)).toBe(false);
+      expect(state.markApplied(tampered as typeof out.certificate, config.ratifier)).toBe(false);
     }
     expect(state.get("c1")?.phase).toBe("ratified"); // still not applied
   });
@@ -959,7 +1007,7 @@ describe("invariant — no `applied` without a stored ratification event", () =>
 
     expect(state.readRatification("c1")).toBeNull();
     expect(requireRatification(state, "c1")).toBeNull();
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(false);
   });
 
   test("hand-writing a ratification note without the event does not create a ratification", () => {
@@ -1208,7 +1256,7 @@ describe("regression — the replay key is scoped and non-truncating", () => {
     const a = surface("a");
     const out = processGateMessage(msg(`RATIFY ${a}`, { id: "m1" }), config, state);
     if (out.kind !== "ratified") throw new Error("expected ratified");
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(true);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
     // Exactly one replay-index entry for m1 (the ratification), not two.
     const db = (store as unknown as { db: Database }).db;
     const n = db
@@ -1230,34 +1278,50 @@ describe("regression — certificate forgery by clone", () => {
     if (out.kind !== "ratified") throw new Error("expected ratified");
 
     const cloned = structuredClone(out.certificate);
-    expect(state.markApplied(cloned, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(cloned, config.ratifier)).toBe(false);
 
     const assigned = Object.assign({}, out.certificate);
-    expect(state.markApplied(assigned, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(assigned, config.ratifier)).toBe(false);
 
     const roundTripped = JSON.parse(JSON.stringify(out.certificate)) as typeof out.certificate;
-    expect(state.markApplied(roundTripped, PRINCIPAL_ID)).toBe(false);
+    expect(state.markApplied(roundTripped, config.ratifier)).toBe(false);
 
     expect(state.get("c1")?.phase).toBe("ratified");
     // The genuine article still works.
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(true);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
   });
 
   test("a certificate naming a different ratifier cannot apply", () => {
     // Was: nothing bound the certificate to the CONFIGURED principal, so an
     // in-process caller could store a ratification by "mallory" and apply it.
-    surface("c1");
-    state.markRatified("c1", {
-      principal: "mallory",
-      platform: PLATFORM,
-      platformId: STRANGER_PLATFORM_ID,
-      messageId: "forged",
+    //
+    // The original version of this test drove `state.markRatified` directly
+    // with `{ principal: "mallory", … }`. That call no longer exists (issue #7,
+    // finding 4 — see "ATTACK: a ratification that never came through the
+    // gate"), so the ratification here is produced the only way one now can be:
+    // through a real gate pass, under a config armed for a DIFFERENT principal.
+    // Same property, reached honestly.
+    const displayId = surface("c1");
+    const otherGate = ports({
+      ratifierPrincipalId: "mallory",
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: STRANGER_PLATFORM_ID }, principalId: "mallory" },
+      ]),
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
     });
-    const cert = requireRatification(state, "c1");
-    expect(cert).not.toBeNull();
-    expect(cert?.ratifierPrincipalId).toBe("mallory");
-    expect(state.markApplied(cert!, PRINCIPAL_ID)).toBe(false);
+    const out = processGateMessage(
+      msg(`RATIFY ${displayId}`, { id: "m-mallory", authorId: STRANGER_PLATFORM_ID }),
+      otherGate,
+      state,
+    );
+    if (out.kind !== "ratified") throw new Error("expected ratified");
+    expect(out.certificate.ratifierPrincipalId).toBe("mallory");
+    // Applying it against the deployment's OWN configured ratifier is refused.
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(false);
     expect(state.get("c1")?.phase).toBe("ratified"); // recorded, but never applied
+    // …and it does apply under its own gate's ratifier, so the refusal above is
+    // the expected-ratifier check and not some unrelated failure.
+    expect(state.markApplied(out.certificate, otherGate.ratifier)).toBe(true);
   });
 });
 
@@ -1340,13 +1404,13 @@ describe("regression — second adversarial pass", () => {
     // under a key nothing would look up — and DECLINE, which passed raw
     // values, did not drift. Two doors out of one room disagreeing.
     const longAuthor = "9".repeat(400);
-    const cfg: RatifyIdentityConfig = {
+    const cfg = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([
         { actor: { platform: PLATFORM, id: longAuthor }, principalId: PRINCIPAL_ID },
       ]),
       self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
-    };
+    });
     const displayId = surface("c1");
     const message = msg(`RATIFY ${displayId}`, { id: "m1", authorId: longAuthor });
     expect(processGateMessage(message, cfg, state).kind).toBe("ratified");
@@ -1358,13 +1422,13 @@ describe("regression — second adversarial pass", () => {
 
   test("DECLINE agrees with RATIFY on the key for over-long platform ids", () => {
     const longAuthor = "8".repeat(400);
-    const cfg: RatifyIdentityConfig = {
+    const cfg = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([
         { actor: { platform: PLATFORM, id: longAuthor }, principalId: PRINCIPAL_ID },
       ]),
       self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
-    };
+    });
     const displayId = surface("c1");
     const message = msg(`DECLINE ${displayId} no thanks`, { id: "m1", authorId: longAuthor });
     expect(processGateMessage(message, cfg, state).kind).toBe("declined");
@@ -1379,7 +1443,7 @@ describe("regression — second adversarial pass", () => {
     // and `self-authored` is durably audited — so an outsider could once again
     // drive unbounded durable writes. Two fixes composing badly.
     surface("c1");
-    const exploding: RatifyIdentityConfig = {
+    const exploding = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([
         { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
@@ -1389,7 +1453,7 @@ describe("regression — second adversarial pass", () => {
           throw new Error("self-identity unavailable");
         },
       },
-    };
+    });
     for (let i = 0; i < 100; i++) {
       const out = processGateMessage(
         msg("RATIFY 1", { id: `spam-${i}`, authorId: STRANGER_PLATFORM_ID }),
@@ -1429,7 +1493,7 @@ describe("regression — second adversarial pass", () => {
     const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
     if (out.kind !== "ratified") throw new Error("expected ratified");
     expect(requireRatification(state, "c1")).not.toBeNull(); // outstanding
-    expect(state.markApplied(out.certificate, PRINCIPAL_ID)).toBe(true);
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
     expect(state.get("c1")?.phase).toBe("applied");
     expect(state.readRatification("c1")).toBeNull();
     expect(requireRatification(state, "c1")).toBeNull(); // no longer outstanding
@@ -1470,7 +1534,7 @@ describe("regression — second adversarial pass", () => {
 describe("regression — an injected identity resolver that throws fails closed", () => {
   test("a throwing principal resolver refuses rather than propagating", () => {
     const displayId = surface("c1");
-    const exploding: RatifyIdentityConfig = {
+    const exploding = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: {
         resolve(): string | null {
@@ -1479,7 +1543,7 @@ describe("regression — an injected identity resolver that throws fails closed"
         knows: () => true,
       },
       self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
-    };
+    });
     const out = processGateMessage(msg(`RATIFY ${displayId}`), exploding, state);
     expect(out).toEqual({ kind: "ignored", reason: "unmapped-author" });
     expect(state.get("c1")?.phase).toBe("surfaced");
@@ -1487,7 +1551,7 @@ describe("regression — an injected identity resolver that throws fails closed"
 
   test("a throwing self-identity check treats the author AS Atlas (fail closed)", () => {
     const displayId = surface("c1");
-    const exploding: RatifyIdentityConfig = {
+    const exploding = ports({
       ratifierPrincipalId: PRINCIPAL_ID,
       principals: new StaticPrincipalMap([
         { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
@@ -1497,7 +1561,7 @@ describe("regression — an injected identity resolver that throws fails closed"
           throw new Error("self-identity unavailable");
         },
       },
-    };
+    });
     const out = processGateMessage(msg(`RATIFY ${displayId}`), exploding, state);
     expect(out).toEqual({ kind: "ignored", reason: "self-authored" });
     expect(state.get("c1")?.phase).toBe("surfaced");
@@ -1902,5 +1966,379 @@ describe("issue #6 finding 2 — degraded is not absent", () => {
     const out = processGateMessage(msg("RATIFY 1", { id: "m1" }), config, memOnly);
     expect(out.kind).toBe("state-unavailable");
     expect(requireRatification(memOnly, "c1")).toBeNull();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. Issue #7 — the two structural gaps W2c would have landed on top of
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compile-time assertions. These are not runtime checks: if either fix is
+ * reverted, `bunx tsc --noEmit` fails here, which is the whole point — the
+ * finding was that the natural call-site mistake produced NO type or lint
+ * signal. `[A] extends [B]` is the assignability question, tupled so a union
+ * distributes as one type rather than member-wise.
+ */
+type IsAssignable<From, To> = [From] extends [To] ? true : false;
+
+/**
+ * `markApplied(cert, cert.ratifierPrincipalId)` must not compile. The
+ * expected-ratifier argument is a witness minted from CONFIGURATION, so no
+ * string — least of all one read off the certificate under inspection —
+ * satisfies it. (Reverting it to `string` makes this line `true = false`.)
+ */
+const _stringIsNotAConfiguredRatifier: IsAssignable<
+  string,
+  Parameters<AtlasProposals["markApplied"]>[1]
+> = false;
+const _certificateFieldIsNotAConfiguredRatifier: IsAssignable<
+  RatificationCertificate["ratifierPrincipalId"],
+  Parameters<AtlasProposals["markApplied"]>[1]
+> = false;
+
+/**
+ * `markRatified(id, { principal: "…", … })` must not compile either — the
+ * reviewer's bypass, in its original literal form.
+ */
+const _plainActorIsNotAGateAuthority: IsAssignable<
+  { principal: string; platform: string; platformId: string; messageId: string },
+  Parameters<AtlasProposals["markRatified"]>[1]
+> = false;
+const _plainActorIsNotADeclineAuthority: IsAssignable<
+  { principal: string; platform: string; platformId: string; messageId: string },
+  Parameters<AtlasProposals["markDeclinedByRatifier"]>[1]
+> = false;
+
+describe("ATTACK: a ratification that never came through the gate (issue #7, finding 4)", () => {
+  /** The reviewer's exploit, verbatim, with the cast a determined caller would use. */
+  function bypassAuthority(overrides: Partial<Record<string, string>> = {}): GateAuthority {
+    return {
+      principal: PRINCIPAL_ID,
+      platform: PLATFORM,
+      platformId: "anything",
+      messageId: "never-existed",
+      ...overrides,
+    } as unknown as GateAuthority;
+  }
+
+  test("markRatified refuses a hand-built authority, so no certificate can follow", () => {
+    surface("c1");
+    // The proved bypass: a caller that never touches ratify.ts, identity.ts or
+    // a GateMessage names itself the principal and records a ratification.
+    expect(state.markRatified("c1", bypassAuthority())).toBeNull();
+    // …and then cannot mint a certificate from it, because there is nothing to
+    // mint one from. Every layer of the chain the finding described is dead.
+    expect(state.readRatification("c1")).toBeNull();
+    expect(requireRatification(state, "c1")).toBeNull();
+    expect(state.get("c1")?.phase).toBe("surfaced");
+    expect(state.get("c1")?.ratification).toBeNull();
+    expect(rawRatifiedEvents("c1")).toBe(0);
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+  });
+
+  test("the RAW store refuses it too — the guard is not just on the wrapper", () => {
+    surface("c1");
+    expect(store.markRatified("c1", bypassAuthority())).toBeNull();
+    expect(store.markDeclinedByRatifier("c1", bypassAuthority(), "no")).toBe(false);
+    expect(store.readRatification("c1")).toBeNull();
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+  });
+
+  test("a CLONE of a genuine authority is refused (the WeakSet, not the type)", () => {
+    // structuredClone / Object.assign / a JSON round-trip are all typed
+    // generically enough to hand back the branded type with no cast at all —
+    // the same escape hatches ratification.ts documents for certificates.
+    surface("c1");
+    const genuine = grantAuthority("m1");
+    for (const forged of [
+      structuredClone(genuine),
+      Object.assign({}, genuine),
+      JSON.parse(JSON.stringify(genuine)) as GateAuthority,
+    ]) {
+      expect(state.markRatified("c1", forged)).toBeNull();
+      expect(state.markDeclinedByRatifier("c1", forged, "nope")).toBe(false);
+    }
+    expect(state.get("c1")?.phase).toBe("surfaced");
+    // The genuine article still works — so the refusals above are the guard,
+    // not some unrelated precondition failing.
+    expect(state.markRatified("c1", genuine)).not.toBeNull();
+    expect(state.get("c1")?.phase).toBe("ratified");
+  });
+
+  test("DECLINE is guarded identically — two doors out of one room, one key", () => {
+    surface("c1");
+    expect(state.markDeclinedByRatifier("c1", bypassAuthority(), "out of scope")).toBe(false);
+    expect(state.get("c1")?.phase).toBe("surfaced");
+    expect(state.markDeclinedByRatifier("c1", grantAuthority("m1"), "out of scope")).toBe(true);
+    expect(state.get("c1")?.phase).toBe("declined");
+  });
+
+  test("the recorded principal comes from the CONFIG, not from the caller", () => {
+    // The authority carries no caller-supplied principal at all: it is read off
+    // `config.ratifier`. Asking for one under a different name is not a thing
+    // the API can express.
+    const displayId = surface("c1");
+    const authority = grantAuthority("m1");
+    expect(authority.principal).toBe(PRINCIPAL_ID);
+    const stored = state.markRatified("c1", authority);
+    expect(stored?.principal).toBe(PRINCIPAL_ID);
+    expect(stored?.displayId).toBe(displayId);
+  });
+});
+
+describe("authorizeRatifierAction — the only producer of a gate authority", () => {
+  test("grants for the configured ratifier, and the grant is recognised", () => {
+    const granted = authorizeRatifierAction(config, {
+      platform: PLATFORM,
+      platformId: PRINCIPAL_PLATFORM_ID,
+      messageId: "m1",
+    });
+    expect(granted).not.toBeNull();
+    expect(isGateAuthority(granted)).toBe(true);
+    expect(granted?.principal).toBe(PRINCIPAL_ID);
+    expect(granted?.platformId).toBe(PRINCIPAL_PLATFORM_ID);
+  });
+
+  test("refuses Atlas itself EVEN when the map resolves Atlas to the ratifier", () => {
+    // Constitution rule 3, re-checked here rather than assumed from the caller.
+    const misconfigured = makeConfig({
+      principalPlatformIds: [PRINCIPAL_PLATFORM_ID, ATLAS_PLATFORM_ID],
+      atlasPlatformIds: [ATLAS_PLATFORM_ID],
+    });
+    expect(misconfigured.principals.resolve(PLATFORM, ATLAS_PLATFORM_ID)).toBe(PRINCIPAL_ID);
+    expect(
+      authorizeRatifierAction(misconfigured, {
+        platform: PLATFORM,
+        platformId: ATLAS_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+  });
+
+  test("refuses an unmapped author, a non-ratifier principal, and a null config", () => {
+    expect(
+      authorizeRatifierAction(config, {
+        platform: PLATFORM,
+        platformId: STRANGER_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+    const otherPrincipal = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: STRANGER_PLATFORM_ID }, principalId: "someone-else" },
+      ]),
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    expect(
+      authorizeRatifierAction(otherPrincipal, {
+        platform: PLATFORM,
+        platformId: STRANGER_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+    expect(
+      authorizeRatifierAction(null, {
+        platform: PLATFORM,
+        platformId: PRINCIPAL_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+  });
+
+  test("refuses blank components — including a missing message id (no audit receipt)", () => {
+    for (const actor of [
+      { platform: "", platformId: PRINCIPAL_PLATFORM_ID, messageId: "m1" },
+      { platform: PLATFORM, platformId: "", messageId: "m1" },
+      { platform: PLATFORM, platformId: PRINCIPAL_PLATFORM_ID, messageId: "" },
+    ]) {
+      expect(authorizeRatifierAction(config, actor)).toBeNull();
+    }
+  });
+
+  test("a config carrying a FORGED configured-ratifier witness grants nothing", () => {
+    const forgedConfig = {
+      ...config,
+      ratifier: { principalId: PRINCIPAL_ID } as unknown as ConfiguredRatifier,
+    };
+    expect(isConfiguredRatifier(forgedConfig.ratifier)).toBe(false);
+    expect(
+      authorizeRatifierAction(forgedConfig, {
+        platform: PLATFORM,
+        platformId: PRINCIPAL_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+  });
+
+  test("throwing ports fail closed rather than escaping as an exception", () => {
+    const explodingSelf = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
+      ]),
+      self: {
+        isSelf(): boolean {
+          throw new Error("self-identity unavailable");
+        },
+      },
+    });
+    const explodingResolver = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: {
+        resolve(): string | null {
+          throw new Error("cortex config read failed");
+        },
+        knows: () => true,
+      },
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    for (const cfg of [explodingSelf, explodingResolver]) {
+      expect(
+        authorizeRatifierAction(cfg, {
+          platform: PLATFORM,
+          platformId: PRINCIPAL_PLATFORM_ID,
+          messageId: "m1",
+        }),
+      ).toBeNull();
+    }
+  });
+});
+
+describe("the expected-ratifier check is no longer vacuous (issue #7, finding 4b)", () => {
+  test("answering from the certificate under inspection does not satisfy it", () => {
+    // Was: `state.markApplied(cert, cert.ratifierPrincipalId)` returned TRUE.
+    // It now does not compile (see the type assertions above); the cast a
+    // caller would reach for instead is refused at runtime by the WeakSet.
+    const displayId = surface("c1");
+    const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    if (out.kind !== "ratified") throw new Error("expected ratified");
+
+    const selfReferential = {
+      principalId: out.certificate.ratifierPrincipalId,
+    } as unknown as ConfiguredRatifier;
+    expect(isConfiguredRatifier(selfReferential)).toBe(false);
+    expect(state.markApplied(out.certificate, selfReferential)).toBe(false);
+    expect(state.get("c1")?.phase).toBe("ratified"); // NOT applied
+
+    // A clone of the genuine witness is a different object, so also refused.
+    expect(state.markApplied(out.certificate, structuredClone(config.ratifier))).toBe(false);
+    expect(state.markApplied(out.certificate, Object.assign({}, config.ratifier))).toBe(false);
+
+    // The witness that actually came from the configuration still applies.
+    expect(state.markApplied(out.certificate, config.ratifier)).toBe(true);
+    expect(state.get("c1")?.phase).toBe("applied");
+  });
+});
+
+describe("identity config: self and ratifier ids must be disjoint (issue #7, finding 6)", () => {
+  /** A stale self id — the bot-rotation / re-invite case the finding describes. */
+  const ATLAS_STALE_PLATFORM_ID = "pid-atlas-stale-fixture";
+
+  test("the stale-self-id + overlapping-ratifier composition is REFUSED at load", () => {
+    // Two individually defensible facts: the operator left a stale id in the
+    // self set, and Atlas's CURRENT id is among the ratifier's platform_ids.
+    // Composed, `processGateMessage` used to return {kind:"ratified"} for a
+    // message Atlas authored. The config no longer loads at all.
+    const env = {
+      ATLAS_RATIFIER_PRINCIPAL: PRINCIPAL_ID,
+      ATLAS_RATIFIER_PLATFORM_IDS: `${PLATFORM}:${PRINCIPAL_PLATFORM_ID} ${PLATFORM}:${ATLAS_PLATFORM_ID}`,
+      ATLAS_SELF_PLATFORM_IDS: `${PLATFORM}:${ATLAS_STALE_PLATFORM_ID} ${PLATFORM}:${ATLAS_PLATFORM_ID}`,
+    };
+    const result = loadIdentityConfig(env);
+    expect(result.kind).toBe("refused");
+    if (result.kind !== "refused") throw new Error("expected refused");
+    expect(result.reason).toBe("self-and-ratifier-platform-ids-overlap");
+    expect(result.detail).toContain(ATLAS_PLATFORM_ID);
+    // The fail-closed collapse the gate consumes: no config, so no gate.
+    expect(loadIdentityConfigFromEnv(env)).toBeNull();
+  });
+
+  test("…and Atlas's own message is STILL refused if such a config is built anyway", () => {
+    // Defence in depth: the ports seam can construct what the loader refuses
+    // (it cannot enumerate a port), so the ordering guarantee must still hold.
+    const displayId = surface("c1");
+    const overlapping = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
+        { actor: { platform: PLATFORM, id: ATLAS_PLATFORM_ID }, principalId: PRINCIPAL_ID },
+      ]),
+      // The STALE id — Atlas no longer posts under it, but it is what the
+      // deployment declared. Its current id is ATLAS_PLATFORM_ID, and the map
+      // above resolves that to the ratifier.
+      self: new StaticSelfIdentity([
+        { platform: PLATFORM, id: ATLAS_STALE_PLATFORM_ID },
+        { platform: PLATFORM, id: ATLAS_PLATFORM_ID },
+      ]),
+    });
+    const out = processGateMessage(
+      msg(`RATIFY ${displayId}`, { id: "m1", authorId: ATLAS_PLATFORM_ID }),
+      overlapping,
+      state,
+    );
+    expect(out).toEqual({ kind: "ignored", reason: "self-authored" });
+    expect(state.get("c1")?.phase).toBe("surfaced");
+    // And no authority could have been granted for it either.
+    expect(
+      authorizeRatifierAction(overlapping, {
+        platform: PLATFORM,
+        platformId: ATLAS_PLATFORM_ID,
+        messageId: "m1",
+      }),
+    ).toBeNull();
+  });
+
+  test("overlap is decided per (platform, id), not by a looser string match", () => {
+    // The same opaque id under two DIFFERENT platforms is two identities, and
+    // refusing that would be a false positive that blocks a legitimate deploy.
+    const shared = "pid-shared-across-platforms-fixture";
+    expect(
+      loadIdentityConfig({
+        ATLAS_RATIFIER_PRINCIPAL: PRINCIPAL_ID,
+        ATLAS_RATIFIER_PLATFORM_IDS: `discord:${shared}`,
+        ATLAS_SELF_PLATFORM_IDS: `slack:${shared}`,
+      }).kind,
+    ).toBe("ok");
+  });
+
+  test("every other refusal is named too — a dead gate is never silent", () => {
+    const base = {
+      ATLAS_RATIFIER_PRINCIPAL: PRINCIPAL_ID,
+      ATLAS_RATIFIER_PLATFORM_IDS: `${PLATFORM}:${PRINCIPAL_PLATFORM_ID}`,
+      ATLAS_SELF_PLATFORM_IDS: `${PLATFORM}:${ATLAS_PLATFORM_ID}`,
+    };
+    expect(loadIdentityConfig(base).kind).toBe("ok");
+    const cases: Array<[Record<string, string | undefined>, IdentityConfigRefusal]> = [
+      [{ ...base, ATLAS_RATIFIER_PRINCIPAL: "  " }, "missing-ratifier-principal"],
+      [{ ...base, ATLAS_RATIFIER_PLATFORM_IDS: "garbage" }, "no-usable-ratifier-platform-ids"],
+      [{ ...base, ATLAS_SELF_PLATFORM_IDS: "" }, "no-usable-self-platform-ids"],
+    ];
+    for (const [env, reason] of cases) {
+      const result = loadIdentityConfig(env);
+      expect(result.kind).toBe("refused");
+      if (result.kind !== "refused") throw new Error("expected refused");
+      expect(result.reason).toBe(reason);
+    }
+  });
+
+  test("a checked config still arms a working gate end to end", () => {
+    // The disjointness check must not have broken the ordinary path.
+    const loaded = loadIdentityConfig({
+      ATLAS_RATIFIER_PRINCIPAL: PRINCIPAL_ID,
+      ATLAS_RATIFIER_PLATFORM_IDS: `${PLATFORM}:${PRINCIPAL_PLATFORM_ID}`,
+      ATLAS_SELF_PLATFORM_IDS: `${PLATFORM}:${ATLAS_PLATFORM_ID}`,
+    });
+    if (loaded.kind !== "ok") throw new Error("expected ok");
+    const displayId = surface("c1");
+    const out = processGateMessage(
+      msg(`RATIFY ${displayId}`, { id: "m1" }),
+      loaded.config,
+      state,
+    );
+    if (out.kind !== "ratified") throw new Error("expected ratified");
+    expect(state.markApplied(out.certificate, loaded.config.ratifier)).toBe(true);
+    expect(state.get("c1")?.phase).toBe("applied");
   });
 });

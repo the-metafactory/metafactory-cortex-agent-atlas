@@ -34,10 +34,22 @@
  * A surfaced proposal leaves `waiting_human` through EXACTLY two methods —
  * `markRatified` and `markDeclinedByRatifier` — and nothing else in this file
  * accepts `waiting_human` as a source status (`markDeclined`, the validator's
- * decline, explicitly refuses it). Both are called only by ratify.ts, only
- * after the identity gate. The state layer does not itself check identity;
- * it makes the SHAPE of the transition narrow enough that the gate is the
- * only place identity CAN be checked.
+ * decline, explicitly refuses it).
+ *
+ * Both now require a `GateAuthority` (issue #7, finding 4). The state layer
+ * still does not RUN an identity check; it demands proof that one was run.
+ * Until #7 the argument here was that the transition's shape was narrow enough
+ * that "the gate is the only place identity CAN be checked" — but that argument
+ * only ever held for `markApplied`. `markRatified` was a public method taking a
+ * caller-supplied `principal` STRING with zero validation, so a caller that
+ * never touched ratify.ts, identity.ts or a `GateMessage` could record a
+ * ratification naming any principal it liked and then mint a genuine
+ * certificate from it. The only thing preventing that was "no other module
+ * calls it" — precisely the property the certificate machinery exists in order
+ * NOT to depend on. Now the principal a ratification is recorded under is read
+ * off the authority (i.e. off the deployment's CONFIG), and an authority can
+ * only be obtained from `authorizeRatifierAction`, which re-runs the self-block
+ * and the principal-map resolution itself.
  *
  * ── Unlike escort: no orphan-sweep dance ────────────────────────────────────
  * Escort's state.ts has a `pending` phase that waits on an ASYNC host
@@ -66,6 +78,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isGateAuthority, type ConfiguredRatifier, type GateAuthority } from "./identity";
 import type { ProposalVerb } from "./intake";
 import {
   certificateMatchesStorage,
@@ -695,11 +708,22 @@ export class AtlasStateStore {
    * There is no third outcome, because there is no fallible operation left
    * between COMMIT and `return`. (`regenDashboard` below is fire-and-forget and
    * catches its own errors; it reads nothing this method reports on.)
+   *
+   * ── The authority is the identity (issue #7, finding 4) ───────────────────
+   * `ratifier` is a `GateAuthority` — it replaces what used to be a plain
+   * `{ principal, platform, platformId, messageId }` object literal that any
+   * caller could write out by hand. Every identity field below is read
+   * OFF it, so there is no longer any way to tell this method who ratified: the
+   * `principal` it records is the one the deployment is configured for, checked
+   * by `authorizeRatifierAction` against the self-block and the principal-map
+   * at the moment the authority was granted. `isGateAuthority` is the runtime
+   * half (the type alone is a speed bump — see ratification.ts's header on
+   * `structuredClone`/`Object.assign`/`as unknown as`), and a refusal is a
+   * `null` like every other precondition violation here.
    */
-  markRatified(
-    id: string,
-    ratifier: { principal: string; platform: string; platformId: string; messageId: string },
-  ): StoredRatification | null {
+  markRatified(id: string, ratifier: GateAuthority): StoredRatification | null {
+    // A ratification that did not come through the gate is not a ratification.
+    if (!isGateAuthority(ratifier)) return null;
     const capId = boundedKey(id);
     const principal = cap(ratifier.principal, MAX_ID_LEN);
     const platform = cap(ratifier.platform, 64);
@@ -875,12 +899,15 @@ export class AtlasStateStore {
    * had asymmetric validation, so a row that `markRatified` correctly refused
    * (no usable display id) was still declinable. Two doors out of one room
    * should need the same key.
+   *
+   * That is why this takes a `GateAuthority` too (issue #7). The finding named
+   * `markRatified`, but guarding only one exit would have RE-CREATED the exact
+   * asymmetry the paragraph above exists to prevent — and a decline is a
+   * recorded decision that kills a proposal, so it is a real transition, not a
+   * read. Same key, both doors.
    */
-  markDeclinedByRatifier(
-    id: string,
-    decliner: { principal: string; platform: string; platformId: string; messageId: string },
-    reason: string,
-  ): boolean {
+  markDeclinedByRatifier(id: string, decliner: GateAuthority, reason: string): boolean {
+    if (!isGateAuthority(decliner)) return false;
     const capId = boundedKey(id);
     const ts = Date.now();
     // Precondition read inside the transaction — same reasoning as markRatified.
@@ -942,15 +969,21 @@ export class AtlasStateStore {
    * Plus `status = 'in_flight'` gating, which makes a second apply a no-op,
    * and a transaction around the whole check-then-act.
    *
-   * `expectedRatifierPrincipalId` is required for the reason spelled out in
+   * `expectedRatifier` is required for the reason spelled out in
    * `certificateMatchesStorage`: the certificate proves a ratification is
    * stored, not that the right person made it. Callers pass their
-   * `RatifyIdentityConfig.ratifierPrincipalId`.
+   * `RatifyIdentityConfig.ratifier`.
+   *
+   * It is a `ConfiguredRatifier`, not a string, because a string made the check
+   * VACUOUS (issue #7): `markApplied(cert, cert.ratifierPrincipalId)` answered
+   * the question out of the certificate under inspection and returned `true`.
+   * The branded witness can only come from a built config, so the natural
+   * call-site typo is now a compile error rather than a silent no-op check.
    *
    * The effects themselves are W2c's; this transition exists here so that
    * W2c is BORN unable to express "apply without ratification".
    */
-  markApplied(cert: RatificationCertificate, expectedRatifierPrincipalId: string): boolean {
+  markApplied(cert: RatificationCertificate, expectedRatifier: ConfiguredRatifier): boolean {
     const capId = boundedKey(cert.workItemId);
     const ts = Date.now();
     // The whole check-then-act inside one transaction. `markRatified` already
@@ -959,7 +992,7 @@ export class AtlasStateStore {
     return this.db.transaction((): boolean => {
       const row = this.getRow(capId);
       if (row === null || row.status !== "in_flight") return false;
-      if (!certificateMatchesStorage(this, cert, expectedRatifierPrincipalId)) return false;
+      if (!certificateMatchesStorage(this, cert, expectedRatifier)) return false;
       this.db
         .query(`UPDATE work_items SET status = 'done', updated_at = ? WHERE id = ?`)
         .run(ts, capId);
@@ -1408,12 +1441,10 @@ export class AtlasProposals {
     );
   }
 
-  markRatified(
-    id: string,
-    ratifier: { principal: string; platform: string; platformId: string; messageId: string },
-  ): StoredRatification | null {
+  /** See `AtlasStateStore.markRatified` — the authority-only ratify transition. */
+  markRatified(id: string, authority: GateAuthority): StoredRatification | null {
     return this.run(
-      (db) => db.markRatified(id, ratifier),
+      (db) => db.markRatified(id, authority),
       (m) => m.markRatified(),
     );
   }
@@ -1426,11 +1457,7 @@ export class AtlasProposals {
     );
   }
 
-  markDeclinedByRatifier(
-    id: string,
-    decliner: { principal: string; platform: string; platformId: string; messageId: string },
-    reason: string,
-  ): boolean {
+  markDeclinedByRatifier(id: string, decliner: GateAuthority, reason: string): boolean {
     return this.run(
       (db) => db.markDeclinedByRatifier(id, decliner, reason),
       (m) => m.markDeclinedByRatifier(),
@@ -1438,9 +1465,9 @@ export class AtlasProposals {
   }
 
   /** See `AtlasStateStore.markApplied` — the certificate-only apply transition. */
-  markApplied(cert: RatificationCertificate, expectedRatifierPrincipalId: string): boolean {
+  markApplied(cert: RatificationCertificate, expectedRatifier: ConfiguredRatifier): boolean {
     return this.run(
-      (db) => db.markApplied(cert, expectedRatifierPrincipalId),
+      (db) => db.markApplied(cert, expectedRatifier),
       (m) => m.markApplied(),
     );
   }
