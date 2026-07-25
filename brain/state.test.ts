@@ -3,6 +3,14 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  authorizeRatifierAction,
+  identityConfigFromPorts,
+  StaticPrincipalMap,
+  StaticSelfIdentity,
+  type RatifyIdentityConfig,
+} from "./identity";
+import { requireRatification, type RatificationCertificate } from "./ratification";
 import { AtlasProposals, AtlasStateStore } from "./state";
 
 let dir: string;
@@ -112,6 +120,130 @@ describe("AtlasStateStore — events table (raw check)", () => {
       "work_item_parked",
       "work_item_annotated", // display_id annotation
     ]);
+  });
+});
+
+describe("W2c — the applied → posted transition and completion records", () => {
+  const PLATFORM = "discord";
+  const PRINCIPAL_ID = "plan-steward";
+  const PRINCIPAL_PLATFORM_ID = "pid-principal-fixture";
+  const ATLAS_PLATFORM_ID = "pid-atlas-self-fixture";
+
+  function identity(): RatifyIdentityConfig {
+    const cfg = identityConfigFromPorts({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: PRINCIPAL_PLATFORM_ID }, principalId: PRINCIPAL_ID },
+      ]),
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    if (cfg === null) throw new Error("fixture: expected an identity config");
+    return cfg;
+  }
+
+  /** Drive a proposal all the way to a real certificate, the only way there is. */
+  function certify(id: string, cfg: RatifyIdentityConfig): RatificationCertificate {
+    proposals.createIntake(id, "ADD", URL, "Backend", "reason", "octocat");
+    proposals.markValidated(id, true);
+    proposals.markSurfaced(id);
+    const authority = authorizeRatifierAction(cfg, {
+      platform: PLATFORM,
+      platformId: PRINCIPAL_PLATFORM_ID,
+      messageId: `m-${id}`,
+    });
+    if (authority === null) throw new Error("fixture: expected an authority");
+    if (proposals.markRatified(id, authority) === null) {
+      throw new Error("fixture: expected a ratification");
+    }
+    const cert = requireRatification(proposals, id);
+    if (cert === null) throw new Error("fixture: expected a certificate");
+    return cert;
+  }
+
+  const RECEIPT = { messageId: "msg-fixture-1", channelId: "chan-fixture-0000", ts: Date.now() };
+
+  test("posted requires an APPLIED row — it cannot skip the plan edit", () => {
+    const cfg = identity();
+    const cert = certify("p1", cfg);
+    // Still `ratified`: there is no path from here to `posted`.
+    expect(proposals.markPosted(cert, cfg.ratifier, RECEIPT)).toBe(false);
+    expect(proposals.get("p1")?.phase).toBe("ratified");
+  });
+
+  test("applied → posted records the receipt and moves the phase", () => {
+    const cfg = identity();
+    const cert = certify("p2", cfg);
+    expect(proposals.markApplied(cert, cfg.ratifier, { revision: "rev-1", ts: Date.now() })).toBe(true);
+    expect(proposals.get("p2")?.phase).toBe("applied");
+    expect(proposals.get("p2")?.applied?.revision).toBe("rev-1");
+
+    expect(proposals.markPosted(cert, cfg.ratifier, RECEIPT)).toBe(true);
+    const record = proposals.get("p2");
+    expect(record?.phase).toBe("posted");
+    expect(record?.posted?.messageId).toBe("msg-fixture-1");
+    expect(record?.posted?.channelId).toBe("chan-fixture-0000");
+  });
+
+  test("a posted receipt is never rewritten (constitution rule 4)", () => {
+    const cfg = identity();
+    const cert = certify("p3", cfg);
+    proposals.markApplied(cert, cfg.ratifier, { revision: "rev-1", ts: Date.now() });
+    expect(proposals.markPosted(cert, cfg.ratifier, RECEIPT)).toBe(true);
+    expect(
+      proposals.markPosted(cert, cfg.ratifier, { ...RECEIPT, messageId: "msg-fixture-2" }),
+    ).toBe(false);
+    expect(proposals.get("p3")?.posted?.messageId).toBe("msg-fixture-1");
+  });
+
+  test("a FORGED certificate cannot record a posted receipt either", () => {
+    const cfg = identity();
+    const cert = certify("p4", cfg);
+    proposals.markApplied(cert, cfg.ratifier, { revision: "rev-1", ts: Date.now() });
+    const forged = { ...cert } as RatificationCertificate;
+    expect(proposals.markPosted(forged, cfg.ratifier, RECEIPT)).toBe(false);
+    expect(proposals.get("p4")?.phase).toBe("applied");
+  });
+
+  test("a certificate naming a DIFFERENT configured ratifier is refused", () => {
+    const cfg = identity();
+    const cert = certify("p5", cfg);
+    proposals.markApplied(cert, cfg.ratifier, { revision: "rev-1", ts: Date.now() });
+    const other = identityConfigFromPorts({
+      ratifierPrincipalId: "someone-else",
+      principals: new StaticPrincipalMap([]),
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    if (other === null) throw new Error("fixture");
+    expect(proposals.markPosted(cert, other.ratifier, RECEIPT)).toBe(false);
+  });
+
+  test("a receipt with no message id or no channel id is not a receipt", () => {
+    const cfg = identity();
+    const cert = certify("p6", cfg);
+    proposals.markApplied(cert, cfg.ratifier, { revision: "rev-1", ts: Date.now() });
+    expect(proposals.markPosted(cert, cfg.ratifier, { ...RECEIPT, messageId: "" })).toBe(false);
+    expect(proposals.markPosted(cert, cfg.ratifier, { ...RECEIPT, channelId: "" })).toBe(false);
+    expect(proposals.get("p6")?.phase).toBe("applied");
+  });
+
+  test("completion announcements are durable, per URL, and never burn a gate replay key", () => {
+    const url = "https://github.com/acme/widgets/issues/9";
+    expect(proposals.hasAnnouncedCompletion(url)).toBe(false);
+    proposals.recordCompletionAnnounced(url, "msg-fixture-1");
+    expect(proposals.hasAnnouncedCompletion(url)).toBe(true);
+    expect(proposals.hasAnnouncedCompletion("https://github.com/acme/widgets/issues/90")).toBe(false);
+    // The record lives OUTSIDE the gate's replay index, so it cannot consume a
+    // gate message key — see state.ts's GATE_EVENT_TYPES.
+    const db = (store as unknown as { db: Database }).db;
+    const rows = db
+      .query<{ type: string }, []>(`SELECT type FROM events WHERE work_item_id IS NULL`)
+      .all();
+    expect(rows.map((r) => r.type)).toEqual(["completion_announced"]);
+  });
+
+  test("a degraded store answers 'already announced' — fail closed, never a post loop", () => {
+    const memOnly = new AtlasProposals(null);
+    expect(memOnly.hasAnnouncedCompletion("https://github.com/acme/widgets/issues/9")).toBe(true);
   });
 });
 

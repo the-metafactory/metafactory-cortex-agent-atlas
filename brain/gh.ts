@@ -30,6 +30,35 @@ export interface ReadOnlyGh {
   getPlanBody(): Promise<string>;
 }
 
+/**
+ * What the completion watcher (W2c, J4) needs to know about ONE issue linked
+ * from the plan body. A READ, over an arbitrary repo — which is why it belongs
+ * on this adapter and not on `effects/gh.ts`, whose whole property is that it
+ * can only be aimed at the one configured repo.
+ */
+export interface LinkedIssueState {
+  readonly closed: boolean;
+  /** The issue title. UNTRUSTED text — quoted by the ledger template, never interpreted. */
+  readonly title: string;
+  /** ISO 8601, or `null` when the issue is still open. */
+  readonly closedAt: string | null;
+  /**
+   * A PR that references this issue, best-effort — the "how it was verified"
+   * receipt the ✅ shape asks for. `null` whenever it cannot be determined,
+   * and the ledger then falls back to the issue URL, which is always a valid
+   * receipt. REST does not expose an issue's actual closer (that is a GraphQL
+   * `ClosedEvent.closer` field, and GraphQL is a POST this read-only adapter
+   * will not make), so this is the strongest honest answer available here.
+   */
+  readonly referencingPrUrl: string | null;
+}
+
+/** The narrow port `watch.ts` depends on. Satisfied by `GhCliReadOnly`. */
+export interface LinkedIssueReader {
+  /** `null` on any failure — a failed read is never reported as "closed". */
+  getLinkedIssue(url: string): Promise<LinkedIssueState | null>;
+}
+
 export interface IssueRef {
   owner: string;
   repo: string;
@@ -89,8 +118,64 @@ async function runGh(args: string[]): Promise<{ ok: boolean; stdout: string }> {
  * recording in-memory fake (test/*.test.ts) so the suite runs without
  * network access or a real `gh` auth context.
  */
-export class GhCliReadOnly implements ReadOnlyGh {
+export class GhCliReadOnly implements ReadOnlyGh, LinkedIssueReader {
   constructor(private readonly plan: PlanCoordinates) {}
+
+  /**
+   * The completion watcher's read (W2c, J4). Two GETs, and the second only
+   * happens for an issue that is actually closed — an open issue costs exactly
+   * one call, the same lazy discipline validate.ts follows.
+   */
+  async getLinkedIssue(url: string): Promise<LinkedIssueState | null> {
+    const ref = parseIssueUrl(url);
+    if (ref === null) return null;
+    const base = `repos/${ref.owner}/${ref.repo}/issues/${ref.number}`;
+    const { ok, stdout } = await runGh(buildGhApiArgs(base));
+    if (!ok) return null;
+    let state: unknown;
+    let title: unknown;
+    let closedAt: unknown;
+    try {
+      const parsed: unknown = JSON.parse(stdout);
+      if (parsed === null || typeof parsed !== "object") return null;
+      const o = parsed as Record<string, unknown>;
+      state = o.state;
+      title = o.title;
+      closedAt = o.closed_at;
+    } catch {
+      return null;
+    }
+    if (state !== "open" && state !== "closed") return null;
+    const safeTitle = typeof title === "string" ? title : "";
+    if (state === "open") {
+      return { closed: false, title: safeTitle, closedAt: null, referencingPrUrl: null };
+    }
+    return {
+      closed: true,
+      title: safeTitle,
+      closedAt: typeof closedAt === "string" && closedAt.length > 0 ? closedAt : null,
+      referencingPrUrl: await this.referencingPr(base),
+    };
+  }
+
+  /**
+   * Best-effort: the most recent PR that cross-referenced this issue. Any
+   * failure — a non-zero exit, unparseable output, no such event — is `null`,
+   * never a guess, and the caller has a guaranteed fallback receipt (the issue
+   * URL itself), so this read is allowed to be imperfect without the post ever
+   * being unreceipted.
+   */
+  private async referencingPr(base: string): Promise<string | null> {
+    const { ok, stdout } = await runGh(
+      buildGhApiArgs(
+        `${base}/timeline`,
+        '[.[] | select(.event == "cross-referenced") | .source.issue.pull_request.html_url] | last // ""',
+      ),
+    );
+    if (!ok) return null;
+    const url = stdout.trim();
+    return /^https:\/\/github\.com\/[^\s]+\/pull\/[0-9]+$/.test(url) ? url : null;
+  }
 
   async getIssue(url: string): Promise<GhIssueInfo | null> {
     const ref = parseIssueUrl(url);

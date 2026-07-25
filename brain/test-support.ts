@@ -5,7 +5,9 @@
  * command) needs no extra include path.
  */
 
-import type { GhIssueInfo, ReadOnlyGh } from "./gh";
+import type { GhIssueInfo, LinkedIssueReader, LinkedIssueState, ReadOnlyGh } from "./gh";
+import type { GhInvocation } from "./effects/gh";
+import type { LedgerTransport } from "./effects/discord";
 
 export type GhCall =
   | { method: "getIssue"; url: string }
@@ -42,5 +44,114 @@ export class RecordingGh implements ReadOnlyGh {
   async getPlanBody(): Promise<string> {
     this.calls.push({ method: "getPlanBody" });
     return this.planBody;
+  }
+}
+
+// ── W2c effect doubles (issue #1) ───────────────────────────────────────────
+
+/**
+ * A fake GitHub for the WRITE adapter, plugged in as `GhCliPlanWriter`'s spawn
+ * function — deliberately BELOW the adapter rather than replacing it, so every
+ * test that touches this class exercises the real `buildInvocation` and the
+ * real `assertAllowed` chokepoint. A test asserting "the argv carried the
+ * configured repo" is then asserting something about the shipped code, not
+ * about a stub that agreed to say so.
+ */
+export class FakePlanRepo {
+  readonly invocations: GhInvocation[] = [];
+  readonly comments: string[] = [];
+  readonly pushes: string[] = [];
+  readonly pullRequests: Array<{ argv: readonly string[]; body: string }> = [];
+  body: string;
+  revisedAt: string;
+  /** When true, every `issue edit` reports failure (the "write failed" case). */
+  failWrites = false;
+  /** When true, `issue view` reports failure (the "plan unreadable" case). */
+  failReads = false;
+  private revisions = 0;
+
+  constructor(body = "", revisedAt = "2026-07-26T00:00:00Z") {
+    this.body = body;
+    this.revisedAt = revisedAt;
+  }
+
+  /** Bound method — passed directly as the adapter's spawn dependency. */
+  readonly spawn = async (
+    inv: GhInvocation,
+  ): Promise<{ ok: boolean; stdout: string; stderr: string }> => {
+    this.invocations.push(inv);
+    const argv = inv.argv;
+    if (argv[0] === "git") {
+      this.pushes.push(argv[3] ?? "");
+      return { ok: true, stdout: "", stderr: "" };
+    }
+    if (argv[1] === "issue" && argv[2] === "view") {
+      if (this.failReads) return { ok: false, stdout: "", stderr: "not found" };
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          body: this.body,
+          updatedAt: this.revisedAt,
+          url: `https://github.com/${argvRepo(argv)}/issues/${argv[3]}`,
+        }),
+        stderr: "",
+      };
+    }
+    if (argv[1] === "issue" && argv[2] === "edit") {
+      if (this.failWrites) return { ok: false, stdout: "", stderr: "edit failed" };
+      this.body = inv.stdin ?? "";
+      this.revisions += 1;
+      this.revisedAt = `2026-07-26T00:00:0${this.revisions}Z`;
+      return { ok: true, stdout: "", stderr: "" };
+    }
+    if (argv[1] === "issue" && argv[2] === "comment") {
+      this.comments.push(inv.stdin ?? "");
+      return { ok: true, stdout: "", stderr: "" };
+    }
+    if (argv[1] === "pr" && argv[2] === "create") {
+      this.pullRequests.push({ argv, body: inv.stdin ?? "" });
+      return { ok: true, stdout: `https://github.com/${argvRepo(argv)}/pull/1\n`, stderr: "" };
+    }
+    return { ok: false, stdout: "", stderr: "unrecognised" };
+  };
+}
+
+function argvRepo(argv: readonly string[]): string {
+  const i = argv.indexOf("--repo");
+  return i >= 0 ? (argv[i + 1] ?? "") : "";
+}
+
+/** Records every ledger post, with the channel id it was aimed at. */
+export class RecordingTransport implements LedgerTransport {
+  readonly posts: Array<{ channelId: string; content: string }> = [];
+  /** Number of leading attempts to fail. `Infinity` fails every attempt. */
+  failFirst = 0;
+  /** When true, `post` throws instead of returning `null`. */
+  throwOnPost = false;
+  private nextId = 1;
+
+  async post(channelId: string, content: string): Promise<string | null> {
+    if (this.throwOnPost) throw new Error("transport exploded");
+    if (this.failFirst > 0) {
+      this.failFirst -= 1;
+      return null;
+    }
+    this.posts.push({ channelId, content });
+    return `msg-fixture-${this.nextId++}`;
+  }
+}
+
+/** Canned linked-issue states for the completion watcher. */
+export class FakeLinkedIssues implements LinkedIssueReader {
+  readonly calls: string[] = [];
+  constructor(private readonly states: Record<string, LinkedIssueState | null> = {}) {}
+
+  set(url: string, state: LinkedIssueState | null): void {
+    this.states[url] = state;
+  }
+
+  async getLinkedIssue(url: string): Promise<LinkedIssueState | null> {
+    this.calls.push(url);
+    return this.states[url] ?? null;
   }
 }
