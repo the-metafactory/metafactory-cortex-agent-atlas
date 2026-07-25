@@ -24,6 +24,7 @@ import {
 import { requireRatification } from "./ratification";
 import { parseGateCommand, processGateMessage, type GateMessage } from "./ratify";
 import { AtlasProposals, AtlasStateStore, gateMessageKey } from "./state";
+import { nothingToRatifyReply, stateDegradedReply } from "./templates";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,12 @@ function msg(body: string, overrides: Partial<GateMessage> = {}): GateMessage {
     authorId: PRINCIPAL_PLATFORM_ID,
     ...overrides,
   };
+}
+
+/** The work-item id currently surfaced under `displayId`, or `null`. */
+function surfacedIdOf(displayId: number): string | null {
+  const lookup = state.lookupSurfacedByDisplayId(displayId);
+  return lookup.kind === "found" ? lookup.record.id : null;
 }
 
 /** Create a proposal and drive it to `surfaced`, returning its display id. */
@@ -754,7 +761,7 @@ describe("ATTACK: premature ratification", () => {
     state.createIntake("c1", "ADD", URL, null, "why", "octocat");
     state.markValidated("c1", true);
     expect(state.get("c1")?.displayId).toBeNull();
-    expect(state.findSurfacedByDisplayId(1)).toBeNull();
+    expect(state.lookupSurfacedByDisplayId(1)).toEqual({ kind: "absent" });
   });
 
   test("RATIFY for an unknown id is the same single code path", () => {
@@ -1047,7 +1054,7 @@ describe("regression — a ratified proposal cannot be re-surfaced", () => {
     expect(state.markSurfaced("a")).toBeNull();
     const c = surface("c");
     expect(c).toBe(3);
-    expect(state.findSurfacedByDisplayId(3)?.id).toBe("c"); // unambiguous
+    expect(surfacedIdOf(3)).toBe("c"); // unambiguous
   });
 });
 
@@ -1065,7 +1072,7 @@ describe("regression — one malformed JSON row must not disable the gate", () =
        VALUES ('bad','proposal','{}','waiting_human','atlas',?,?,'looked at this on tuesday')`,
     ).run(ts, ts);
 
-    expect(state.findSurfacedByDisplayId(displayId)?.id).toBe("good");
+    expect(surfacedIdOf(displayId)).toBe("good");
     const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
     expect(out.kind).toBe("ratified");
     expect(state.get("good")?.phase).toBe("ratified");
@@ -1265,7 +1272,7 @@ describe("regression — the two exits from `surfaced` validate identically", ()
       JSON.stringify({ display_id: true }),
       "c1",
     );
-    expect(state.findSurfacedByDisplayId(1)).toBeNull();
+    expect(state.lookupSurfacedByDisplayId(1)).toEqual({ kind: "absent" });
     expect(processGateMessage(msg("DECLINE 1 nope"), config, state).kind).toBe("stale");
     expect(processGateMessage(msg("RATIFY 1"), config, state).kind).toBe("stale");
     // Row untouched — still parked, whatever its notes say.
@@ -1453,7 +1460,7 @@ describe("regression — second adversarial pass", () => {
       ).run(`bad-${i}`, ts, ts);
     }
     db.exec("ANALYZE");
-    expect(state.findSurfacedByDisplayId(displayId)?.id).toBe("good");
+    expect(surfacedIdOf(displayId)).toBe("good");
     expect(processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state).kind).toBe(
       "ratified",
     );
@@ -1556,5 +1563,344 @@ describe("untrusted proposal text never becomes a command", () => {
     const out = processGateMessage(msg(`DECLINE ${displayId} ${"x".repeat(3_000)}`), config, state);
     if (out.kind !== "declined") throw new Error("expected declined");
     expect(out.reason.length).toBe(2_000);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. GATE HONESTY under storage failure (issue #6)
+//
+// Two CONFIRMED findings from the independent adversarial review, sharing one
+// root cause: `AtlasProposals.run` catches ANY throw, degrades permanently to
+// an empty `MemoryProposals`, and every downstream `null` then reads as
+// "absent". Fail-closed on EFFECTS always held; what did not hold was the
+// gate telling the principal the truth about what happened.
+//
+// These tests inject the actual SQLite failures rather than simulating the
+// symptom, and every one of them asserts BOTH halves: the reply text AND the
+// durable state, read straight off the raw DB.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** A plausible transient SQLite failure, of the class the review injected. */
+function ioError(): Error {
+  return Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR", errno: 10 });
+}
+
+/**
+ * Arm a one-shot failure on the next `db.query(...)` whose SQL contains
+ * `match`. Returns a disarm function. Throwing from `query` is the same shape
+ * a real driver-level failure takes at these call sites (`db.query(sql).get()`
+ * / `.all()` / `.run()`), so the state layer sees exactly what it would see
+ * from a genuine `SQLITE_IOERR`.
+ */
+function failNextQuery(match: string, err: Error = ioError()): () => void {
+  const holder = store as unknown as { db: Database };
+  const real = holder.db;
+  const original = real.query.bind(real);
+  let armed = true;
+  (real as unknown as { query: unknown }).query = (sql: string) => {
+    if (armed && sql.includes(match)) {
+      armed = false;
+      throw err;
+    }
+    return original(sql);
+  };
+  return () => {
+    (real as unknown as { query: unknown }).query = original;
+  };
+}
+
+/**
+ * Raw durable truth, on a SEPARATE read-only connection to the same file.
+ *
+ * Deliberately not the store's own handle: (a) `AtlasProposals` closes that
+ * handle when it degrades, which is precisely the scenario under test, and
+ * (b) a second connection can only observe COMMITTED data, so "the reply and
+ * the durable state agree" is asserted against real durability rather than
+ * against one connection's view of its own uncommitted work.
+ */
+function withRawDb<T>(fn: (db: Database) => T): T {
+  const db = new Database(join(dir, "state.sqlite"), { readonly: true });
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+function rawRow(id: string): { status: string; notes: string | null } | null {
+  return withRawDb(
+    (db) =>
+      db
+        .query<{ status: string; notes: string | null }, [string]>(
+          `SELECT status, notes FROM work_items WHERE id = ?`,
+        )
+        .get(id) ?? null,
+  );
+}
+
+/** Raw count of committed `work_item_ratified` events for a work item. */
+function rawRatifiedEvents(id: string): number {
+  return withRawDb(
+    (db) =>
+      db
+        .query<{ n: number }, [string]>(
+          `SELECT COUNT(*) AS n FROM events WHERE work_item_id = ? AND type = 'work_item_ratified'`,
+        )
+        .get(id)?.n ?? 0,
+  );
+}
+
+/** Does this reply claim nothing happened? The exact assertion that failed. */
+function claimsNothingChanged(reply: string): boolean {
+  return /Nothing was changed|nothing was changed/.test(reply);
+}
+
+describe("issue #6 finding 3 — a commit followed by a fallible read must never report 'nothing changed'", () => {
+  test("SQLITE_IOERR on markRatified's read-back rolls the whole ratification back", () => {
+    // WAS: markRatified committed, THEN read back outside the transaction. One
+    // injected IOERR on that read => AtlasProposals.run swallowed it, degraded,
+    // returned null, and the principal was told "Nothing was changed and the
+    // proposal is still awaiting a decision" while the DB held status
+    // 'in_flight', a $.ratification note, and a committed work_item_ratified
+    // event. Split brain on the one question the trust path exists to answer.
+    const displayId = surface("c1");
+    // The read-back's second half — the append-only event check. It is the
+    // last statement inside the transaction, i.e. exactly where the old code's
+    // post-commit read sat.
+    //
+    // Match on `type = 'work_item_ratified'`, NOT the bare event name:
+    // `hasSeenGateMessage`'s replay query lists that same name inside a
+    // `type IN (...)` clause and runs FIRST, so a looser match would degrade
+    // the store at step 2 and never reach markRatified at all — the test would
+    // pass while exercising finding 2's path instead of finding 3's.
+    const disarm = failNextQuery("type = 'work_item_ratified'");
+    const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    disarm();
+
+    // 1. The reply and durable state must AGREE. They now do, because the read
+    //    is inside the committing transaction: it failed, so the transaction
+    //    rolled back, so "nothing changed" became TRUE rather than a lie.
+    expect(out.kind).toBe("state-unavailable");
+    if (out.kind !== "state-unavailable") throw new Error("expected state-unavailable");
+    expect(claimsNothingChanged(out.reply)).toBe(true);
+
+    // 2. ...and the durable state says the same thing. Read raw.
+    const row = rawRow("c1");
+    expect(row?.status).toBe("waiting_human"); // NOT 'in_flight'
+    expect(row?.notes ?? "").not.toContain("ratification");
+    expect(rawRatifiedEvents("c1")).toBe(0);
+
+    // 3. Fail closed on effects: no certificate exists, so nothing can apply.
+    expect(requireRatification(state, "c1")).toBeNull();
+  });
+
+  test("the rolled-back ratification leaves the proposal genuinely re-ratifiable", () => {
+    // The reply says "send the verb again". That instruction must be true.
+    const displayId = surface("c1");
+    const disarm = failNextQuery("type = 'work_item_ratified'");
+    const first = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    disarm();
+    expect(first.kind).toBe("state-unavailable");
+
+    // The store degraded (run's catch-all closed its handle), so re-opening the
+    // SAME durable file stands in for the restart the operator would perform.
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("expected the state file to re-open");
+    const revived = new AtlasProposals(reopened);
+    const second = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m2" }), config, revived);
+    reopened.close();
+    expect(second.kind).toBe("ratified");
+    expect(rawRow("c1")?.status).toBe("in_flight");
+    expect(rawRatifiedEvents("c1")).toBe(1);
+  });
+
+  test("a read-back that cannot confirm the write rolls back rather than reporting success", () => {
+    // The other half of the same guarantee, and what makes the read-back more
+    // than decoration: the transaction commits ONLY if storage confirms, field
+    // for field, the record just written. A read-back that comes back empty
+    // must un-write — never be reported as success, and never leave committed
+    // rows behind a "nothing happened" reply.
+    const displayId = surface("c1");
+    const holder = store as unknown as { db: Database };
+    const real = holder.db;
+    const original = real.query.bind(real);
+    // getRow's SQL runs twice inside the transaction: #1 the precondition read
+    // (must succeed), #2 the read-back. Sabotage #2 only, by swapping in an
+    // equivalent statement that matches no row.
+    let seen = 0;
+    (real as unknown as { query: unknown }).query = (sql: string) => {
+      if (sql.includes("FROM work_items WHERE id = ?")) {
+        seen += 1;
+        if (seen === 2) {
+          return original(`SELECT id, status, payload, notes FROM work_items WHERE id = ? AND 0`);
+        }
+      }
+      return original(sql);
+    };
+    const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    (real as unknown as { query: unknown }).query = original;
+
+    expect(seen).toBeGreaterThanOrEqual(2); // the read-back really was exercised
+    expect(out.kind).toBe("state-unavailable");
+    if (out.kind !== "state-unavailable") throw new Error("expected state-unavailable");
+    expect(claimsNothingChanged(out.reply)).toBe(true);
+
+    // ...and nothing was, in fact, changed.
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+    expect(rawRatifiedEvents("c1")).toBe(0);
+    expect(requireRatification(state, "c1")).toBeNull();
+
+    // A content disagreement is NOT a storage failure and must not be
+    // misdiagnosed as one: the store stays durable, so the gate keeps working.
+    expect(state.isDurable()).toBe(true);
+    const retry = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m2" }), config, state);
+    expect(retry.kind).toBe("ratified");
+  });
+
+  test("a COMMITTED ratification whose certificate read-back fails is reported as committed", () => {
+    // The same split brain one layer up: markRatified succeeds (its read-back
+    // is now inside the transaction), and then ratify.ts does a SECOND,
+    // genuinely post-commit read to mint the certificate. If that one fails,
+    // `stateDegradedReply` would be false on all three of its claims — and its
+    // "send the verb again" would walk the principal into
+    // `nothingToRatifyReply`, a second, contradictory falsehood.
+    const displayId = surface("c1");
+    const holder = store as unknown as { db: Database };
+    const real = holder.db;
+    const original = real.query.bind(real);
+    let seen = 0;
+    (real as unknown as { query: unknown }).query = (sql: string) => {
+      // Let the in-transaction read-back through (1st), fail the certificate
+      // read (2nd) — the only post-commit read on this path.
+      if (sql.includes("type = 'work_item_ratified'")) {
+        seen += 1;
+        if (seen === 2) throw ioError();
+      }
+      return original(sql);
+    };
+    const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    (real as unknown as { query: unknown }).query = original;
+
+    expect(seen).toBe(2); // the fixture actually exercised the post-commit read
+    expect(out.kind).toBe("ratified-not-certified");
+    if (out.kind !== "ratified-not-certified") throw new Error("expected ratified-not-certified");
+
+    // 1. The reply does NOT claim nothing changed...
+    expect(claimsNothingChanged(out.reply)).toBe(false);
+    // ...it says the opposite, and tells the principal not to re-send.
+    expect(out.reply).toContain("IS recorded");
+    expect(out.reply).toContain("Do NOT send the verb again");
+    expect(out.reply).not.toContain("still awaiting a decision");
+
+    // 2. Durable state matches the reply, exactly.
+    const row = rawRow("c1");
+    expect(row?.status).toBe("in_flight");
+    expect(row?.notes ?? "").toContain("ratification");
+    expect(rawRatifiedEvents("c1")).toBe(1);
+
+    // 3. FAIL CLOSED ON EFFECTS is preserved: no certificate was minted, and
+    //    the outcome carries no field that could produce one.
+    expect(out).not.toHaveProperty("certificate");
+    expect(state.isDurable()).toBe(false);
+    expect(requireRatification(state, "c1")).toBeNull();
+  });
+});
+
+describe("issue #6 finding 2 — degraded is not absent", () => {
+  test("an events-table read failure with a live waiting_human row replies degraded, not 'nothing to ratify'", () => {
+    // WAS: hasSeenGateMessage (step 2, runs for EVERY inbound message) reads
+    // the events table. One SQLITE_IOERR there degraded the store; the next
+    // call, findSurfacedByDisplayId, then answered out of an empty memory map
+    // and the principal got "no proposal with that number is currently
+    // awaiting a decision. Nothing was changed." about a row that was sitting
+    // in waiting_human on disk — and got it for every subsequent verb, until
+    // restart.
+    const displayId = surface("c1");
+    expect(rawRow("c1")?.status).toBe("waiting_human"); // genuinely live
+
+    const disarm = failNextQuery("gate_message_id");
+    const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    disarm();
+
+    expect(out.kind).toBe("state-unavailable");
+    if (out.kind !== "state-unavailable") throw new Error("expected state-unavailable");
+    expect(out.reply).toBe(stateDegradedReply("RATIFY", displayId));
+    expect(out.reply).not.toBe(nothingToRatifyReply("RATIFY", displayId));
+    expect(out.reply).not.toContain("no proposal with that number");
+
+    // The boundary itself distinguishes the two, which is what makes the
+    // reply choice possible at all.
+    expect(state.lookupSurfacedByDisplayId(displayId).kind).toBe("unavailable");
+    expect(state.isDurable()).toBe(false);
+
+    // Fail closed on effects, and the proposal is untouched on disk.
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+    expect(rawRatifiedEvents("c1")).toBe(0);
+    expect(requireRatification(state, "c1")).toBeNull();
+  });
+
+  test("DECLINE takes the same honest branch when state is unreadable", () => {
+    const displayId = surface("c1");
+    const disarm = failNextQuery("gate_message_id");
+    const out = processGateMessage(msg(`DECLINE ${displayId} nope`, { id: "m1" }), config, state);
+    disarm();
+
+    expect(out.kind).toBe("state-unavailable");
+    if (out.kind !== "state-unavailable") throw new Error("expected state-unavailable");
+    expect(out.reply).toBe(stateDegradedReply("DECLINE", displayId));
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+  });
+
+  test("a healthy store still answers 'absent' — the degraded reply is not the new catch-all", () => {
+    // The fix must not make every miss look like a failure: that would be the
+    // opposite lie, and would hide a real outage behind routine noise.
+    surface("c1");
+    const out = processGateMessage(msg("RATIFY 4242", { id: "m1" }), config, state);
+    expect(out.kind).toBe("stale");
+    if (out.kind !== "stale") throw new Error("expected stale");
+    expect(out.reply).toBe(nothingToRatifyReply("RATIFY", 4242));
+    expect(state.lookupSurfacedByDisplayId(4242)).toEqual({ kind: "absent" });
+    expect(state.isDurable()).toBe(true);
+  });
+
+  test("degradation is observable, and does not re-open the ability to act", () => {
+    const displayId = surface("c1");
+    expect(state.degradation()).toBeNull();
+
+    const disarm = failNextQuery("gate_message_id");
+    processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
+    disarm();
+
+    const degraded = state.degradation();
+    expect(degraded).not.toBeNull();
+    expect(degraded?.storageFailures).toBe(1);
+    expect(degraded?.reason).toContain("disk I/O error");
+    expect(typeof degraded?.since).toBe("number");
+
+    // Permanent until restart, and STILL fail-closed on every subsequent verb.
+    for (const id of ["m2", "m3"]) {
+      const again = processGateMessage(msg(`RATIFY ${displayId}`, { id }), config, state);
+      expect(again.kind).toBe("state-unavailable");
+    }
+    expect(state.isDurable()).toBe(false);
+    expect(rawRow("c1")?.status).toBe("waiting_human");
+    expect(rawRatifiedEvents("c1")).toBe(0);
+  });
+
+  test("a store that never had a DB reports unavailable, not absent", () => {
+    const memOnly = new AtlasProposals(null);
+    expect(memOnly.isDurable()).toBe(false);
+    expect(memOnly.degradation()?.storageFailures).toBe(0);
+    expect(memOnly.lookupSurfacedByDisplayId(1).kind).toBe("unavailable");
+
+    memOnly.createIntake("c1", "ADD", URL, null, "why", "octocat");
+    memOnly.markValidated("c1", true);
+    memOnly.markSurfaced("c1");
+    // Even with a row in the in-memory map, the honest answer is "I cannot see
+    // durable storage" — and the gate still refuses, exactly as before.
+    expect(memOnly.lookupSurfacedByDisplayId(1).kind).toBe("unavailable");
+    const out = processGateMessage(msg("RATIFY 1", { id: "m1" }), config, memOnly);
+    expect(out.kind).toBe("state-unavailable");
+    expect(requireRatification(memOnly, "c1")).toBeNull();
   });
 });
