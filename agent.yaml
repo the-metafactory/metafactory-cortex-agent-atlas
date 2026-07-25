@@ -1,0 +1,98 @@
+# atlas — the agent.yaml fragment this pack installs.
+#
+# arc drops it at {configRoot}/agents.d/atlas.yaml (id-keyed filename, taken
+# from the `id:` below) and the persona at {configRoot}/personas/atlas.md —
+# so every path in this file is written for the INSTALLED location, not the
+# pack checkout.
+#
+# CHASSIS SLICE (W1b, the-metafactory/vision#9 §4-§6): this fragment
+# declares Atlas's installable SHAPE. `runtime.brain.run` names the daemon
+# entrypoint W2's brain waves (#2/#3/#4) will add under `brain/main.ts` — it
+# does not exist in this slice, deliberately (no brain logic, no effects, no
+# Discord/gh code here; see arc-manifest.yaml).
+#
+# Chassis lineage: copied from metafactory-cortex-agent-escort's agent.yaml
+# (runtime.mode: in-process, brain.kind: exec — its own process, no tools,
+# no Bash, no LLM tool-loop, structurally, not by configuration). The
+# compose block (hybrid voice, cortex#2257) is escort's verbatim, with ONE
+# deliberate delta: Atlas ships `compose: true`. Atlas's audience is the
+# principal's own iteration-plan channel — a trusted, non-anonymous
+# audience — where escort's anonymous-edge posture ("deterministic by
+# default") argues for `false`. Enforcement (rate window, input length cap,
+# output length cap, liveness-timer pause during the call) is HOST-SIDE,
+# owned by cortex's daemon-brain-host (cortex#2257) — nothing to declare
+# here beyond the opt-in flag.
+
+id: atlas
+displayName: "Atlas"
+
+# Persona path — resolved by cortex's loader RELATIVE TO THE FRAGMENT'S
+# DIRECTORY. arc installs the fragment at agents.d/atlas.yaml and the
+# persona at personas/atlas.md, so from agents.d/ the persona is
+# ../personas/atlas.md. The fragment is installed verbatim — arc does NOT
+# rewrite this path — so it must be valid at the installed location.
+persona: ../personas/atlas.md
+trust: []
+
+runtime:
+  mode: in-process
+  capabilities:
+    - atlas.plan.steward     # stewards the iteration plan: intake, ratification-gated updates, self-heal (brain lands in W2)
+  modelClass: frontier
+  brain:
+    kind: exec
+    run: "bun {pack}/brain/main.ts"
+    protocol: cortex-brain/v1
+    lifecycle: daemon        # long-lived: connect once, serve events
+    secrets: []              # this brain reads no secrets of its own — the
+                             # hybrid voice (compose, below) runs through the
+                             # STACK'S substrate auth, never an API key here
+    dispatch_capabilities: []
+    maxRestarts: 3
+    # Hybrid voice opt-in (cortex#2257): `true` lets this brain's `compose`
+    # effects reach the stack's model substrate (one tool-less turn, the
+    # persona file as system prompt). The pack CARRIES the hybrid
+    # capability; the DEPLOYMENT decides whether to enable it — flip this
+    # together with the brain-side voice switch once the brain lands (W2).
+    # Atlas ships this ON: its audience is the principal's own
+    # iteration-plan channel, not an anonymous edge (see header note).
+    compose: true
+
+# Durable per-instance state — declares that Atlas runs on an agent-state
+# instance (the `state` field of the agent-platform manifest shape that
+# github.com/the-metafactory/agent-state exists to satisfy; same
+# declaration as arc-manifest.yaml, which hosts' state tooling keys on). The
+# instance dir is ~/.config/cortex/agents/atlas/ (host=cortex convention),
+# scaffolded at install by scripts/scaffold-state.sh and overridable via
+# ATLAS_STATE_DIR (brain-side, once brain/state.ts lands in W2). Fail-soft:
+# no instance, no agent-state bundle, or a broken DB → Atlas runs
+# memory-only.
+state:
+  blueprint: agent-state
+  version: ">=0.1.0"
+
+# The iteration plan Atlas stewards — WHICH repo/issue is the plan body,
+# resolved stack-side at cortex config-load, never hardcoded here. Defaults
+# documented for operator convenience; an unset value fails soft the same
+# way cortex's own placeholder resolution does for presence.discord below
+# (the plan-steward capability is disabled, the rest of the stack still
+# boots).
+plan:
+  repo: __ATLAS_PLAN_REPO__      # resolve-at-install; default: the-metafactory/vision
+  issue: __ATLAS_PLAN_ISSUE__    # resolve-at-install; default: 4
+
+# Discord presence — placeholders ONLY. Every identifier below resolves at
+# cortex config-load from the daemon environment (compass#84 / L2), same
+# discipline as escort's agents.d/escort.yaml. No live token or snowflake is
+# ever stored in this file. An unset value fails SOFT: the Discord surface
+# is disabled and the rest of the stack still boots — that is cortex's own
+# placeholder-resolution behaviour, not code in this pack.
+presence:
+  discord:
+    enabled: true
+    token: __ATLAS_BOT_TOKEN__              # resolved at cortex load
+    guildId: __ATLAS_GUILD_ID__             # resolve-at-install
+    channelId: __ATLAS_CHANNEL_ID__         # the #iteration-plan channel Atlas is bound to
+    dmOwner: false                          # Atlas never claims DMs
+    contextDepth: 10
+    surfaceSubjects: []                     # no raw envelope surface

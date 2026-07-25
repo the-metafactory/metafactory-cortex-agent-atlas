@@ -1,0 +1,1329 @@
+/**
+ * Atlas persistence — DB-authoritative work-item lifecycle over an
+ * agent-state instance, for the proposal-intake state machine (W2a) and the
+ * ratification gate's transitions (W2b, issue #3; the-metafactory/vision#9
+ * §5). Pattern copied from metafactory-cortex-agent-
+ * escort's brain/state.ts (verified against it directly): SQLite is the
+ * single source of truth, read-through per call, with the SAME inverted
+ * fail-soft posture (state is memory, not authority — a missing/broken DB
+ * degrades to a transient in-memory store rather than failing boot).
+ *
+ * ── Mapping (schema is agent-state's, verbatim — no parallel schema) ───────
+ * Each proposal = ONE work_item, kind `proposal`, id = a stable key derived
+ * by the caller (proposal.ts uses the source comment's id — see there for
+ * why). The phases map onto agent-state's constrained status vocabulary (the
+ * schema CHECKs status):
+ *
+ *   intake     → pending        (work_item_created)
+ *   validated  → in_flight      (work_item_claimed + work_item_annotated
+ *                                 with the ground-truth read: issue_open)
+ *   surfaced   → waiting_human  (work_item_parked — mirrors escort's own
+ *                                 naming for exactly this shape of
+ *                                 transition: "parked, awaiting a human")
+ *   ratified   → in_flight      (work_item_ratified — W2b/#3; DISAMBIGUATED
+ *                                 from `validated` by the stored ratification
+ *                                 note, see `rowPhase`)
+ *   declined   → failed         (work_item_resolved, reason "validation" from
+ *                                 the validator, or "declined" from the gate)
+ *   applied    → done           (work_item_resolved, reason "applied" — W2c;
+ *                                 the transition exists here already because
+ *                                 it takes a RatificationCertificate and
+ *                                 nothing else, see `markApplied`)
+ *
+ * ── The two ways out of `waiting_human` (W2b, issue #3) ─────────────────────
+ * A surfaced proposal leaves `waiting_human` through EXACTLY two methods —
+ * `markRatified` and `markDeclinedByRatifier` — and nothing else in this file
+ * accepts `waiting_human` as a source status (`markDeclined`, the validator's
+ * decline, explicitly refuses it). Both are called only by ratify.ts, only
+ * after the identity gate. The state layer does not itself check identity;
+ * it makes the SHAPE of the transition narrow enough that the gate is the
+ * only place identity CAN be checked.
+ *
+ * ── Unlike escort: no orphan-sweep dance ────────────────────────────────────
+ * Escort's state.ts has a `pending` phase that waits on an ASYNC host
+ * round-trip (`create_private_thread` → `thread_created`), so a crash
+ * mid-flight can strand a row — hence its boot sweep + lazy orphan guard.
+ * This slice has no such async gap: every transition here is a single
+ * synchronous call from proposal.ts's pipeline (parse → validate → record),
+ * so there is nothing to strand and nothing to sweep. A future slice that
+ * adds an async host round-trip (e.g. posting the surfaced summary for
+ * real) would need to reintroduce that pattern — deliberately deferred, not
+ * forgotten.
+ *
+ * ── Text hygiene ─────────────────────────────────────────────────────────
+ * The why-field IS stored here (unlike escort, which stores no message text
+ * at all) — that is the explicit spec requirement (issue #2: "the free-text
+ * why is DATA: store it quoted, never interpreted"). It is stored inside the
+ * JSON `payload` column, which the agent-state dashboard renders only
+ * indirectly (id/kind/status/owner/timestamps) — never evaluated, never
+ * interpolated into a shell/SQL/HTML context anywhere in this file or its
+ * callers. Every stored string is length-capped (again, redundantly, on top
+ * of intake.ts's own caps) before it reaches SQLite.
+ */
+
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { ProposalVerb } from "./intake";
+import {
+  certificateMatchesStorage,
+  type RatificationCertificate,
+  type StoredRatification,
+} from "./ratification";
+
+// ── Schema: verbatim copy of agent-state's migrations/0001-initial.sql ─────
+// (agent-state v0.3.0 — the same copy metafactory-cortex-agent-escort's
+// brain/state.ts carries, reproduced here so this module interoperates with
+// agent-state's own scripts against a DB this module created). If agent-state
+// ships a 0002 migration, bump this module in lockstep with escort's.
+const MIGRATION_0001 = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS work_items (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  payload      TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  owner_agent  TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  notes        TEXT,
+  CHECK (status IN ('pending','in_flight','waiting_human','done','failed','cancelled'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_items_kind_status
+  ON work_items(kind, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_work_items_owner
+  ON work_items(owner_agent, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS events (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts            INTEGER NOT NULL,
+  type          TEXT NOT NULL,
+  actor         TEXT,
+  work_item_id  TEXT,
+  payload       TEXT NOT NULL,
+  FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_work_item ON events(work_item_id);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    TEXT PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
+`;
+
+const MIGRATION_VERSION = "0001";
+
+/** owner_agent + event actor for everything this brain writes. */
+const OWNER = "atlas";
+/** The one work_item kind this slice creates. */
+const KIND = "proposal";
+
+/**
+ * The event types the ratification gate writes a `gate_message_id` into — and
+ * therefore the only types `hasSeenGateMessage` will honour as a replay
+ * record. Keep this list and the gate's event names in lockstep: a gate event
+ * type missing here is a replay the gate would not notice.
+ * (These are literals, interpolated into SQL; they are compile-time constants
+ * from this file, never caller input.)
+ */
+const GATE_EVENT_TYPES = [
+  "gate_command_too_long",
+  "work_item_ratified",
+  "work_item_resolved",
+  "ratification_gate_rejected",
+  "gate_nothing_to_ratify",
+  "gate_state_unavailable",
+] as const;
+
+const MAX_FIELD_LEN = 2_000;
+const MAX_ID_LEN = 256;
+function cap(s: string, max = MAX_FIELD_LEN): string {
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/**
+ * The bounded form of an IDENTITY string (a work-item id, a platform message
+ * id). Unlike `cap`, this never merges two distinct inputs into one value:
+ * truncating an identity key silently makes two different things the same
+ * thing — two proposals collapsing onto one work item, or two messages sharing
+ * one replay key. Anything over the bound is replaced by a SHA-256 digest,
+ * which is bounded, deterministic, and injective for every input we will ever
+ * see.
+ */
+function boundedKey(s: string): string {
+  if (typeof s !== "string") return "";
+  if (s.length <= MAX_ID_LEN) return s;
+  return `sha256:${createHash("sha256").update(s, "utf8").digest("hex")}`;
+}
+
+/**
+ * The replay key for one inbound gate message: platform, author, message id.
+ *
+ * NOT the bare message id (adversarial review): id spaces are per-platform, so
+ * an unscoped key lets a message id from one platform collide with a future
+ * one from another — and because the replay check necessarily runs before
+ * identity resolution, the party who gets to write the colliding row first is
+ * an outsider, silently eating the principal's next verb. Exported so ratify.ts
+ * and this module derive the identical key from the identical inputs.
+ *
+ * LENGTH-PREFIXED, not merely delimiter-joined. An earlier version joined on
+ * U+001F and asserted in its own docstring that the delimiter "cannot occur in
+ * any of them" -- while enforcing nothing, and while identity.ts happily
+ * admits ids containing U+001F. That made ("discord", "A<US>B", "C") and
+ * ("discord", "A", "B<US>C") the SAME key. Length prefixes make the encoding
+ * injective for ANY component bytes -- the same treatment identity.ts's own
+ * map key already gets. Asserting a delimiter is safe is not the same as it
+ * being safe.
+ *
+ * Callers MUST pass RAW components. boundedKey is applied to the FINISHED
+ * string, so pre-truncating or pre-hashing a component here yields a different
+ * key than a caller who does not -- which is exactly how the two sides
+ * silently drifted apart once already.
+ */
+export function gateMessageKey(platform: string, authorId: string, messageId: string): string {
+  if (
+    typeof platform !== "string" ||
+    typeof authorId !== "string" ||
+    typeof messageId !== "string" ||
+    platform.length === 0 ||
+    authorId.length === 0 ||
+    messageId.length === 0
+  ) {
+    return "";
+  }
+  return boundedKey(
+    `${platform.length}:${platform}\x1f${authorId.length}:${authorId}\x1f${messageId.length}:${messageId}`,
+  );
+}
+
+/**
+ * `json_extract` RAISES on a row whose JSON column is malformed — and
+ * `notesToObject` deliberately TOLERATES non-JSON notes ("non-JSON operator
+ * text preserved under `text`"), so the value the JS layer is designed to
+ * survive is exactly the one that would blow up the SQL layer. A single such
+ * row (written by an operator, or by agent-state's own scripts against this
+ * shared DB) would throw, be caught by `AtlasProposals.run`'s catch-all,
+ * misdiagnosed as "the DB is broken", and silently degrade the whole store to
+ * memory-only — disabling the ratification gate until restart, while replying
+ * "nothing to ratify" to the principal.
+ *
+ * So every json_* call in this file is wrapped: invalid JSON yields NULL and
+ * matches nothing, instead of taking the process's state layer down with it.
+ * The CASE (rather than an `AND json_valid(...)` conjunct) is deliberate —
+ * SQLite does not guarantee AND short-circuit evaluation order. `json_type`
+ * raises on malformed JSON exactly as `json_extract` does, so it goes through
+ * here too: an earlier version left one bare `json_type` in the WHERE clause
+ * and relied on the neighbouring guarded terms being evaluated first — which
+ * is the very assumption the sentence above says cannot be made.
+ */
+function jsonField(column: string, path: string, fn: "json_extract" | "json_type" = "json_extract"): string {
+  return `CASE WHEN json_valid(${column}) THEN ${fn}(${column}, '${path}') END`;
+}
+
+export type ProposalPhase =
+  | "intake"
+  | "validated"
+  | "surfaced"
+  | "ratified"
+  | "declined"
+  | "applied";
+
+export interface ProposalRecord {
+  id: string;
+  phase: ProposalPhase;
+  verb: ProposalVerb;
+  url: string;
+  section: string | null;
+  why: string;
+  proposer: string;
+  /** Set once `markSurfaced` has run — the short human-facing `RATIFY <id>`. */
+  displayId: number | null;
+  /**
+   * The durable ratification, or `null`. This field IS the `ratified` phase —
+   * see `rowPhase` below: the phase is not a status flag that happens to
+   * accompany the evidence, it is READ OFF the evidence. There is no
+   * representable state in which a row claims to be ratified while the
+   * ratification record is absent.
+   */
+  ratification: StoredRatification | null;
+}
+
+interface WorkItemRow {
+  id: string;
+  status: string;
+  payload: string;
+  notes: string | null;
+}
+
+export interface AtlasStateOptions {
+  /** Instance dir holding state.sqlite (created if missing). */
+  dir: string;
+  /**
+   * Installed agent-state bundle root (for dashboard.ts regen). `null`
+   * disables dashboard regeneration entirely (tests use this).
+   */
+  bundleDir?: string | null;
+}
+
+/** `~/.config/cortex/agents/atlas` — matches arc-manifest.yaml's `owns.state`. */
+export function defaultInstanceDir(): string {
+  return join(homedir(), ".config", "cortex", "agents", "atlas");
+}
+
+/** Where `arc` installs the agent-state bundle on a cortex host. */
+export function defaultBundleDir(): string {
+  return join(homedir(), ".config", "metafactory", "pkg", "repos", "agent-state");
+}
+
+function warn(msg: string): void {
+  process.stderr.write(`atlas: state: ${msg}\n`);
+}
+
+/**
+ * agent-state's status vocabulary is CHECK-constrained to six values, and this
+ * pipeline has more phases than that — so `in_flight` and `done` are
+ * disambiguated by the presence of the stored ratification rather than by a
+ * parallel status column. That is deliberate, not a workaround: it makes the
+ * phase and its evidence the SAME fact. A row cannot read as `ratified` unless
+ * a well-formed `$.ratification` note is really there, so there is no way to
+ * "mark something ratified" without the record that authorises the effect.
+ *
+ * `done` with no ratification returns `null` (unrecognised) rather than
+ * `applied` — this pipeline never produces such a row, and a row that appeared
+ * by other means must not be treated as a legitimately applied change.
+ */
+function rowPhase(status: string, ratification: StoredRatification | null): ProposalPhase | null {
+  switch (status) {
+    case "pending":
+      return "intake";
+    case "in_flight":
+      return ratification !== null ? "ratified" : "validated";
+    case "waiting_human":
+      return "surfaced";
+    case "failed":
+      return "declined";
+    case "done":
+      return ratification !== null ? "applied" : null;
+    default:
+      // 'cancelled' is not reachable from any transition in this pack.
+      return null;
+  }
+}
+
+/**
+ * Re-validate the ratification note read back off disk. It crossed a JSON
+ * boundary, so nothing about its shape is assumed: every field must be present
+ * and of the right type, or there is NO ratification (fail closed — a
+ * half-written or hand-edited note authorises nothing).
+ */
+function parseStoredRatification(value: unknown): StoredRatification | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  const principal = o.principal;
+  const platform = o.platform;
+  const platformId = o.platform_id;
+  const messageId = o.message_id;
+  const displayId = o.display_id;
+  const ts = o.ts;
+  if (typeof principal !== "string" || principal.length === 0) return null;
+  if (typeof platform !== "string" || platform.length === 0) return null;
+  if (typeof platformId !== "string" || platformId.length === 0) return null;
+  if (typeof messageId !== "string" || messageId.length === 0) return null;
+  if (typeof displayId !== "number" || !Number.isSafeInteger(displayId) || displayId <= 0) {
+    return null;
+  }
+  if (typeof ts !== "number" || !Number.isSafeInteger(ts) || ts <= 0) return null;
+  return { principal, platform, platformId, messageId, displayId, ts };
+}
+
+function serializeRatification(r: StoredRatification): Record<string, unknown> {
+  return {
+    principal: r.principal,
+    platform: r.platform,
+    platform_id: r.platformId,
+    message_id: r.messageId,
+    display_id: r.displayId,
+    ts: r.ts,
+  };
+}
+
+/** Is this string a parseable JSON *object* (not an array, not a scalar)? */
+function isJsonObject(s: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(s);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
+function notesToObject(notes: string | null): Record<string, unknown> {
+  if (notes === null || notes.length === 0) return {};
+  try {
+    const parsed: unknown = JSON.parse(notes);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through — non-JSON operator text preserved under `text`
+  }
+  return { text: notes };
+}
+
+function rowToRecord(row: WorkItemRow): ProposalRecord | null {
+  const notesEarly = notesToObject(row.notes);
+  const ratification = parseStoredRatification(notesEarly.ratification);
+  const phase = rowPhase(row.status, ratification);
+  if (phase === null) return null;
+  let payload: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(row.payload);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const verb = payload.verb;
+  const url = payload.url;
+  const why = payload.why;
+  const proposer = payload.proposer;
+  if (
+    (verb !== "ADD" && verb !== "REMOVE") ||
+    typeof url !== "string" ||
+    typeof why !== "string" ||
+    typeof proposer !== "string"
+  ) {
+    return null;
+  }
+  const section = typeof payload.section === "string" ? payload.section : null;
+  const displayIdRaw = notesEarly.display_id;
+  const displayId =
+    typeof displayIdRaw === "number" && Number.isFinite(displayIdRaw) ? displayIdRaw : null;
+  return { id: row.id, phase, verb, url, section, why, proposer, displayId, ratification };
+}
+
+/**
+ * The raw DB layer. Methods THROW on SQLite failure — `AtlasProposals`
+ * (below) is the single owner of degradation, matching escort's split.
+ */
+export class AtlasStateStore {
+  private readonly db: Database;
+  private readonly dir: string;
+  private readonly bundleDir: string | null;
+  private dashboardWarned = false;
+
+  private constructor(db: Database, dir: string, bundleDir: string | null) {
+    this.db = db;
+    this.dir = dir;
+    this.bundleDir = bundleDir;
+  }
+
+  /** Fail-soft open: any error logs to stderr and returns `null`. */
+  static open(opts: AtlasStateOptions): AtlasStateStore | null {
+    try {
+      mkdirSync(opts.dir, { recursive: true });
+      const db = new Database(join(opts.dir, "state.sqlite"));
+      db.exec("PRAGMA foreign_keys = ON;");
+      db.exec("PRAGMA journal_mode = WAL;");
+      db.exec("PRAGMA busy_timeout = 5000;");
+      applyMigration(db);
+      warn(`open — ${join(opts.dir, "state.sqlite")}`);
+      return new AtlasStateStore(db, opts.dir, opts.bundleDir ?? null);
+    } catch (err) {
+      warn(
+        `unavailable, running memory-only: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  get(id: string): ProposalRecord | null {
+    const row = this.getRow(boundedKey(id));
+    return row ? rowToRecord(row) : null;
+  }
+
+  /**
+   * Phase `intake`: enqueue the work_item. Idempotent no-op if a row for this
+   * id already exists in ANY status — a redelivered/reprocessed comment must
+   * never create a second work item or trigger a second reply.
+   */
+  createIntake(
+    id: string,
+    verb: ProposalVerb,
+    url: string,
+    section: string | null,
+    why: string,
+    proposer: string,
+  ): void {
+    const capId = boundedKey(id);
+    if (this.getRow(capId) !== null) return; // idempotent — see file header
+    const ts = Date.now();
+    const payload = JSON.stringify({
+      verb,
+      url: cap(url, 300),
+      section: section === null ? null : cap(section, 80),
+      why: cap(why),
+      proposer: cap(proposer, 256),
+    });
+    this.db
+      .query(
+        `INSERT INTO work_items (id, kind, payload, status, owner_agent, created_at, updated_at, notes)
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL)`,
+      )
+      .run(capId, KIND, payload, OWNER, ts, ts);
+    this.appendEvent("work_item_created", capId, { kind: KIND, verb, status: "pending" }, ts);
+    this.regenDashboard();
+  }
+
+  /** Phase `validated`: pending → in_flight, annotate the ground-truth read. */
+  markValidated(id: string, issueOpen: boolean): void {
+    const capId = boundedKey(id);
+    const row = this.getRow(capId);
+    if (row === null || row.status !== "pending") return; // out of sync — leave alone
+    const ts = Date.now();
+    this.db
+      .query(`UPDATE work_items SET status = 'in_flight', owner_agent = ?, updated_at = ? WHERE id = ?`)
+      .run(OWNER, ts, capId);
+    this.appendEvent("work_item_claimed", capId, { status: "in_flight" }, ts);
+    this.annotate(capId, { issue_open: issueOpen }, ts);
+    this.regenDashboard();
+  }
+
+  /**
+   * Phase `surfaced`: in_flight → waiting_human. Assigns and returns the
+   * monotonic human-facing display id (`RATIFY <id>`) — a simple running
+   * count of proposal work_items, a scoping decision this module makes since
+   * the issue does not specify an id scheme (see the report for the callout).
+   * Does NOT take the composed summary text — callers build that from the
+   * returned id (via templates.ts) and record it with `recordSummary` below,
+   * so the id is only ever computed once.
+   *
+   * Returns `null` (rather than throwing) when the row is missing or not
+   * `in_flight` — a precondition violation is a LOGIC error, not a SQLite
+   * failure, and must never be treated as one: `AtlasProposals.run` (below)
+   * catches everything a DB-layer method throws and degrades the WHOLE store
+   * to memory-only on the assumption "the DB itself is broken". A thrown
+   * precondition check would trip that same catch-all and silently degrade
+   * durability for every other in-flight proposal too — out of proportion
+   * for what is simply "called out of order". Every other method in this
+   * class already follows this no-throw-on-precondition discipline
+   * ("out of sync — leave alone"); this one now matches.
+   *
+   * ── Surfacing happens AT MOST ONCE per work item (W2b hardening) ──────────
+   * `in_flight` is not a sufficient precondition on its own, because W2b gave
+   * `in_flight` a second meaning: `ratified`. Without the two guards below, a
+   * caller could re-park an ALREADY-RATIFIED row — which would (a) let the
+   * principal's decision be undone by a later `DECLINE` on the recycled
+   * number, and (b) hand out a display id that `nextDisplayId` (which counts
+   * rows that already HAVE an id, so it does not advance on reassignment) will
+   * hand out again, colliding two proposals onto one number and bricking both
+   * behind `findSurfacedByDisplayId`'s ambiguity guard. Found by adversarial
+   * review; both were demonstrable before these two lines existed.
+   */
+  markSurfaced(id: string): number | null {
+    const capId = boundedKey(id);
+    const row = this.getRow(capId);
+    if (row === null || row.status !== "in_flight") return null;
+    // Both guards below read `notes`. `notesToObject` deliberately tolerates
+    // non-JSON notes by wrapping them as `{ text: … }` — which would make BOTH
+    // guards read false and let a ratified row be re-parked. So unparseable
+    // notes on an in_flight row are themselves disqualifying: we cannot see
+    // what is in there, therefore we do not re-park it.
+    if (row.notes !== null && row.notes.length > 0 && !isJsonObject(row.notes)) return null;
+    const notes = notesToObject(row.notes);
+    // Never re-park a ratified row: `in_flight` also means `ratified`.
+    if (parseStoredRatification(notes.ratification) !== null) return null;
+    // Never re-issue a display id: ids are assigned once and never recycled.
+    if (notes.display_id !== undefined && notes.display_id !== null) return null;
+    const ts = Date.now();
+    const displayId = this.nextDisplayId();
+    this.db
+      .query(`UPDATE work_items SET status = 'waiting_human', updated_at = ? WHERE id = ?`)
+      .run(ts, capId);
+    this.appendEvent("work_item_parked", capId, { status: "waiting_human", display_id: displayId }, ts);
+    this.annotate(capId, { display_id: displayId }, ts);
+    this.regenDashboard();
+    return displayId;
+  }
+
+  /** Record the composed surfaced-summary text against an already-parked row. */
+  recordSummary(id: string, summaryText: string): void {
+    const capId = boundedKey(id);
+    const row = this.getRow(capId);
+    if (row === null || row.status !== "waiting_human") return;
+    this.annotate(capId, { summary: cap(summaryText) }, Date.now());
+  }
+
+  // ── W2b, the ratification gate (issue #3) ────────────────────────────────
+
+  /**
+   * Look up the ONE currently-`surfaced` proposal carrying this display id —
+   * the id a human types in `RATIFY <n>`.
+   *
+   * Two structural properties this query gives the gate for free:
+   *   - `status = 'waiting_human'` is in the WHERE clause, so a work item that
+   *     is still in `intake`/`validated`, or already `ratified`/`declined`/
+   *     `applied`, is not merely rejected later — it is NOT FOUND. The
+   *     "premature RATIFY" and "replay RATIFY" cases are therefore the same
+   *     single code path as "unknown id", with no separate branch to get wrong.
+   *   - `LIMIT 2` + a refusal on two hits: a display-id collision (which
+   *     `nextDisplayId` is designed to make impossible) would be ambiguous
+   *     about WHICH proposal a verb ratifies. Ambiguity on this path resolves
+   *     to `null`, never to a guess.
+   */
+  findSurfacedByDisplayId(displayId: number): ProposalRecord | null {
+    if (!Number.isSafeInteger(displayId) || displayId <= 0) return null;
+    const rows = this.db
+      .query<WorkItemRow, [string, number]>(
+        // The json_type guard matters: json_extract COERCES a JSON `true` to
+        // the integer 1, so a row whose display_id note is a boolean would
+        // answer to `RATIFY 1`. Requiring the stored type to actually BE an
+        // integer removes the coercion instead of hoping no one writes one.
+        `SELECT id, status, payload, notes FROM work_items
+          WHERE kind = ? AND status = 'waiting_human'
+            AND ${jsonField("notes", "$.display_id")} = ?
+            AND ${jsonField("notes", "$.display_id")} IS NOT NULL
+            AND ${jsonField("notes", "$.display_id", "json_type")} = 'integer'
+          LIMIT 2`,
+      )
+      .all(KIND, displayId);
+    if (rows.length !== 1) return null;
+    return rowToRecord(rows[0]!);
+  }
+
+  /**
+   * Has any gate decision already been recorded for this message?
+   * Replay defence at the MESSAGE level (the work-item level is covered by
+   * `findSurfacedByDisplayId`'s status filter): a redelivered ratification
+   * message must not produce a second decision or a second reply.
+   *
+   * The key is `platform \x1f author \x1f messageId`, not the bare message id
+   * (adversarial review, three findings in one):
+   *   - unscoped, a message id from ANOTHER platform's id space could collide
+   *     with a future id from the principal's, silently eating their verb —
+   *     and because the replay check runs before identity, an outsider is the
+   *     one who gets to write the colliding row;
+   *   - `boundedKey` hashes rather than truncates, so two long ids sharing a
+   *     256-char prefix are no longer one replay key;
+   *   - the `type IN (...)` filter (which can use `idx_events_type_ts`) scopes
+   *     the lookup to events THIS gate writes, so an unrelated future slice
+   *     that happens to put a `gate_message_id` in a payload cannot burn a key.
+   */
+  hasSeenGateMessage(key: string): boolean {
+    const bounded = boundedKey(key);
+    if (bounded.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type IN (${GATE_EVENT_TYPES.map((t) => `'${t}'`).join(", ")})
+            AND ${jsonField("payload", "$.gate_message_id")} = ?
+          LIMIT 1`,
+      )
+      .get(bounded);
+    return row !== null && row !== undefined;
+  }
+
+  /**
+   * Phase `ratified`: waiting_human → in_flight + the durable ratification.
+   *
+   * Wrapped in a TRANSACTION on purpose. Without it, a crash between the
+   * status update and the note write would leave a row at `in_flight` with no
+   * ratification — which `rowPhase` reads as `validated`, a phase from which
+   * `markRatified` refuses to run, permanently stranding the proposal. The
+   * transaction makes "status moved" and "evidence stored" a single fact,
+   * which is the same invariant the certificate depends on.
+   *
+   * Returns the ratification as READ BACK from storage (never the in-memory
+   * value that was just written) — so a caller can only proceed on what
+   * durably persisted. `null` on any precondition violation, per this class's
+   * no-throw-on-precondition discipline.
+   */
+  markRatified(
+    id: string,
+    ratifier: { principal: string; platform: string; platformId: string; messageId: string },
+  ): StoredRatification | null {
+    const capId = boundedKey(id);
+    const principal = cap(ratifier.principal, MAX_ID_LEN);
+    const platform = cap(ratifier.platform, 64);
+    const platformId = cap(ratifier.platformId, MAX_ID_LEN);
+    const messageId = boundedKey(ratifier.messageId);
+    // ALL THREE components RAW, exactly as ratify.ts passes them.
+    // `gateMessageKey` bounds the FINISHED string, so handing it a pre-`cap`ped
+    // platform / platform id / message id yields a different key than the
+    // caller computes, and the replay lookup silently stops matching.
+    //
+    // This was gotten half-right once already: the message id was fixed while
+    // `platform` and `platformId` were left truncated, so RATIFY drifted while
+    // DECLINE — which passes raw values — did not. Two exits from one room
+    // disagreeing about the key is exactly the asymmetry this pair of methods
+    // is supposed not to have. Derive from the PARAMETERS, never the locals.
+    const gateKey = gateMessageKey(ratifier.platform, ratifier.platformId, ratifier.messageId);
+    if (
+      principal.length === 0 ||
+      platform.length === 0 ||
+      platformId.length === 0 ||
+      messageId.length === 0 ||
+      gateKey.length === 0
+    ) {
+      return null;
+    }
+
+    // The precondition READ happens INSIDE the transaction, together with the
+    // writes it authorises. Reading first and writing after would be a
+    // check-then-act window: this brain is single-threaded, but the DB is WAL
+    // with a 5s busy timeout and agent-state ships its own scripts against the
+    // same file, so "nothing else writes here" is an assumption worth not
+    // making on the trust path.
+    const ts = Date.now();
+    const outcome = this.db.transaction((): StoredRatification | null => {
+      const row = this.getRow(capId);
+      if (row === null || row.status !== "waiting_human") return null;
+      const existingNotes = notesToObject(row.notes);
+      // A row already carrying a ratification must never be re-ratified, even
+      // if its status somehow read `waiting_human`. Belt and braces.
+      if (parseStoredRatification(existingNotes.ratification) !== null) return null;
+      const displayIdRaw = existingNotes.display_id;
+      if (
+        typeof displayIdRaw !== "number" ||
+        !Number.isSafeInteger(displayIdRaw) ||
+        displayIdRaw <= 0
+      ) {
+        return null; // surfaced without a display id is not a ratifiable state
+      }
+      const stored: StoredRatification = {
+        principal,
+        platform,
+        platformId,
+        messageId,
+        displayId: displayIdRaw,
+        ts,
+      };
+      this.db
+        .query(`UPDATE work_items SET status = 'in_flight', owner_agent = ?, updated_at = ? WHERE id = ?`)
+        .run(OWNER, ts, capId);
+      this.db
+        .query(`UPDATE work_items SET notes = ?, updated_at = ? WHERE id = ?`)
+        .run(
+          JSON.stringify({ ...existingNotes, ratification: serializeRatification(stored) }),
+          ts,
+          capId,
+        );
+      this.appendEvent(
+        "work_item_ratified",
+        capId,
+        {
+          status: "in_flight",
+          // The REPLAY key (platform-scoped), not the bare message id — this
+          // is what `hasSeenGateMessage` matches on. `message_id` inside
+          // serializeRatification below keeps the raw id for the audit trail.
+          gate_message_id: gateKey,
+          ...serializeRatification(stored),
+        },
+        ts,
+      );
+      return stored;
+    })();
+    if (outcome === null) return null;
+    this.regenDashboard();
+    // Return what STORAGE says, not `outcome` — the caller must only ever
+    // proceed on a durable read (see ratification.ts's file header).
+    return this.readRatification(capId);
+  }
+
+  /**
+   * The durable ratification for a work item, or `null`. Requires BOTH halves
+   * of the record — the `$.ratification` note AND the append-only
+   * `work_item_ratified` event — because either one alone is drift, and drift
+   * here means someone (or some bug) touched the audit trail.
+   *
+   * `in_flight` ONLY — i.e. the `ratified` phase, never `applied`. This is the
+   * difference between "a ratification exists" and "a ratification is still
+   * OUTSTANDING", and the certificate must mean the second: it is the token
+   * W2c will carry to perform a real, public, one-way plan edit and ledger
+   * post. An adversarial review showed that accepting `done` here let a fresh,
+   * fully-valid, WeakSet-blessed certificate be minted for an ALREADY-APPLIED
+   * work item — `markApplied`'s own status gate stops a second state
+   * transition, but nothing on that certificate would have told a retrying
+   * caller the effect had already happened, and it would have double-posted.
+   * Read-back for audit purposes should query the events table directly.
+   */
+  readRatification(id: string): StoredRatification | null {
+    const capId = boundedKey(id);
+    const row = this.getRow(capId);
+    if (row === null) return null;
+    if (row.status !== "in_flight") return null; // `ratified` only, never `applied`
+    const stored = parseStoredRatification(notesToObject(row.notes).ratification);
+    if (stored === null) return null;
+    const evt = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE work_item_id = ? AND type = 'work_item_ratified' LIMIT 1`,
+      )
+      .get(capId);
+    if (evt === null || evt === undefined) return null;
+    return stored;
+  }
+
+  /**
+   * Phase `declined` by the ratifier: waiting_human → failed, with the
+   * principal's own reason recorded. Distinct from `markDeclined` (which
+   * handles VALIDATION failures out of intake/validated) because the source
+   * phase and the recorded actor are different facts; collapsing them would
+   * make the audit trail lie about who declined what.
+   *
+   * Preconditions are the SAME set `markRatified` enforces, deliberately: an
+   * adversarial review found that the two transitions out of `waiting_human`
+   * had asymmetric validation, so a row that `markRatified` correctly refused
+   * (no usable display id) was still declinable. Two doors out of one room
+   * should need the same key.
+   */
+  markDeclinedByRatifier(
+    id: string,
+    decliner: { principal: string; platform: string; platformId: string; messageId: string },
+    reason: string,
+  ): boolean {
+    const capId = boundedKey(id);
+    const ts = Date.now();
+    // Precondition read inside the transaction — same reasoning as markRatified.
+    return this.db.transaction((): boolean => {
+      const row = this.getRow(capId);
+      if (row === null || row.status !== "waiting_human") return false;
+      const notes = notesToObject(row.notes);
+      if (parseStoredRatification(notes.ratification) !== null) return false;
+      const displayIdRaw = notes.display_id;
+      if (
+        typeof displayIdRaw !== "number" ||
+        !Number.isSafeInteger(displayIdRaw) ||
+        displayIdRaw <= 0
+      ) {
+        return false;
+      }
+      this.db
+        .query(`UPDATE work_items SET status = 'failed', updated_at = ? WHERE id = ?`)
+        .run(ts, capId);
+      this.appendEvent(
+        "work_item_resolved",
+        capId,
+        {
+          status: "failed",
+          reason: "declined",
+          gate_message_id: gateMessageKey(decliner.platform, decliner.platformId, decliner.messageId),
+          declined_by: cap(decliner.principal, MAX_ID_LEN),
+          declined_by_platform: cap(decliner.platform, 64),
+          declined_by_platform_id: cap(decliner.platformId, MAX_ID_LEN),
+          // The principal's free text. DATA, exactly like a proposal's why —
+          // stored, never interpreted (see this file's Text hygiene header).
+          declined_reason: cap(reason),
+        },
+        ts,
+      );
+      this.regenDashboard();
+      return true;
+    })();
+  }
+
+  /**
+   * Phase `applied`: ratified (in_flight + ratification) → done.
+   *
+   * THE INVARIANT, enforced three ways (issue #3 acceptance bullet 6):
+   *   1. Type level — the ONLY parameter identifying the work item is a
+   *      `RatificationCertificate`, which cannot be constructed outside
+   *      `ratification.ts` and is only ever minted from a durable read. There
+   *      is deliberately no `markApplied(id: string)` overload for a caller to
+   *      reach for instead.
+   *   2. Object identity — `certificateMatchesStorage` requires the
+   *      certificate to be one `ratification.ts` actually minted (a private
+   *      `WeakSet`), which is what closes the `structuredClone` /
+   *      `Object.assign` / `as unknown as` forgeries the type alone does not.
+   *   3. Storage — it then re-reads the ratification NOW and compares it
+   *      field-by-field, AND checks the ratifier is the principal this
+   *      deployment is configured for. A certificate that was valid a minute
+   *      ago cannot apply against a record that has since changed, and a
+   *      certificate naming some other ratifier cannot apply at all.
+   * Plus `status = 'in_flight'` gating, which makes a second apply a no-op,
+   * and a transaction around the whole check-then-act.
+   *
+   * `expectedRatifierPrincipalId` is required for the reason spelled out in
+   * `certificateMatchesStorage`: the certificate proves a ratification is
+   * stored, not that the right person made it. Callers pass their
+   * `RatifyIdentityConfig.ratifierPrincipalId`.
+   *
+   * The effects themselves are W2c's; this transition exists here so that
+   * W2c is BORN unable to express "apply without ratification".
+   */
+  markApplied(cert: RatificationCertificate, expectedRatifierPrincipalId: string): boolean {
+    const capId = boundedKey(cert.workItemId);
+    const ts = Date.now();
+    // The whole check-then-act inside one transaction. `markRatified` already
+    // does this; the transition that authorises the actual EFFECT has more
+    // reason to, not less.
+    return this.db.transaction((): boolean => {
+      const row = this.getRow(capId);
+      if (row === null || row.status !== "in_flight") return false;
+      if (!certificateMatchesStorage(this, cert, expectedRatifierPrincipalId)) return false;
+      this.db
+        .query(`UPDATE work_items SET status = 'done', updated_at = ? WHERE id = ?`)
+        .run(ts, capId);
+      this.appendEvent(
+        "work_item_resolved",
+        capId,
+          {
+          status: "done",
+          reason: "applied",
+          // NOT `gate_message_id`: an apply is not an inbound gate message, so
+          // it must not register as one in the replay index. The ratifying
+          // message is recorded here purely as an audit backlink.
+          ratified_message_id: cert.messageId,
+        },
+        ts,
+      );
+      this.regenDashboard();
+      return true;
+    })();
+  }
+
+  /**
+   * An append-only audit event with NO work item attached — how a rejected
+   * gate attempt (self-ratify, unmapped author, wrong principal) is recorded.
+   * `work_item_id` is NULL, which the FK permits.
+   *
+   * Volume note: this is a write triggered by inbound messages, so callers
+   * MUST gate it (ratify.ts logs only verb-SHAPED attempts, never ordinary
+   * chat) or an unbounded log-growth vector opens up. Every string is capped
+   * here regardless — this row can contain attacker-influenced text.
+   */
+  recordGateEvent(type: string, payload: Record<string, unknown>): void {
+    const safe: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(payload)) {
+      safe[cap(k, 64)] = typeof v === "string" ? cap(v, 512) : v;
+    }
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(Date.now(), cap(type, 64), OWNER, JSON.stringify(safe));
+  }
+
+  /**
+   * Phase `declined`: (pending|in_flight) → failed. `failedCheck` is the one
+   * named reason the templated reply quotes (issue #2 item 4); the work
+   * item's stored `reason` is always the literal `"validation"`.
+   *
+   * NOTE the source-phase guard below excludes `waiting_human`: a SURFACED
+   * proposal can only be declined through `markDeclinedByRatifier`, i.e. only
+   * by the gate. Validation cannot retroactively kill something already put in
+   * front of the principal. It also refuses any row carrying a ratification —
+   * `in_flight` covers both `validated` and `ratified`, and a validation
+   * decline must never be able to touch a ratified record.
+   */
+  markDeclined(id: string, failedCheck: string): void {
+    const capId = boundedKey(id);
+    const row = this.getRow(capId);
+    if (row === null) return;
+    if (row.status !== "pending" && row.status !== "in_flight") return; // never re-resolve a terminal row
+    if (parseStoredRatification(notesToObject(row.notes).ratification) !== null) return;
+    const ts = Date.now();
+    this.db
+      .query(`UPDATE work_items SET status = 'failed', updated_at = ? WHERE id = ?`)
+      .run(ts, capId);
+    this.appendEvent(
+      "work_item_resolved",
+      capId,
+      { status: "failed", reason: "validation", failed_check: cap(failedCheck, 200) },
+      ts,
+    );
+    this.regenDashboard();
+  }
+
+  close(): void {
+    try {
+      this.db.close();
+    } catch {
+      // fail-soft to the end
+    }
+  }
+
+  // ── internals ────────────────────────────────────────────────────────────
+
+  /**
+   * Counts only work_items that have ALREADY been assigned a display id
+   * (i.e. previously surfaced proposals), not the total row count — total
+   * row count would double-count: two proposals created before either is
+   * surfaced would both read the same "count so far" and collide on the
+   * same RATIFY id. Counting assigned ids instead makes each call read a
+   * value one higher than the last successful assignment, guaranteeing a
+   * gapless, collision-free 1, 2, 3, … sequence (single sequential brain
+   * process — no concurrent writers to this table).
+   */
+  private nextDisplayId(): number {
+    const row = this.db
+      .query<{ n: number }, [string]>(
+        `SELECT COUNT(*) AS n FROM work_items
+          WHERE kind = ? AND notes IS NOT NULL
+            AND ${jsonField("notes", "$.display_id")} IS NOT NULL`,
+      )
+      .get(KIND);
+    return (row?.n ?? 0) + 1;
+  }
+
+  private getRow(id: string): WorkItemRow | null {
+    return (
+      this.db
+        .query<WorkItemRow, [string]>(
+          `SELECT id, status, payload, notes FROM work_items WHERE id = ?`,
+        )
+        .get(id) ?? null
+    );
+  }
+
+  private appendEvent(type: string, workItemId: string, payload: unknown, ts: number): void {
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, ?, ?)`)
+      .run(ts, type, OWNER, workItemId, JSON.stringify(payload));
+  }
+
+  /** agent-state's annotate: shallow JSON merge into notes + its own event. */
+  private annotate(id: string, patch: Record<string, unknown>, ts: number): void {
+    const row = this.getRow(id);
+    if (row === null) return;
+    const base = notesToObject(row.notes);
+    this.db
+      .query(`UPDATE work_items SET notes = ?, updated_at = ? WHERE id = ?`)
+      .run(JSON.stringify({ ...base, ...patch }), ts, id);
+    this.appendEvent("work_item_annotated", id, { keys: Object.keys(patch) }, ts);
+  }
+
+  /**
+   * Best-effort `dashboard.md` regen via agent-state's own documented
+   * workflow, exactly mirroring escort's fire-and-forget subprocess call.
+   */
+  private regenDashboard(): void {
+    if (this.bundleDir === null) return;
+    try {
+      const script = join(this.bundleDir, "skill", "scripts", "dashboard.ts");
+      if (!existsSync(script)) {
+        if (!this.dashboardWarned) {
+          this.dashboardWarned = true;
+          warn(`dashboard regen skipped — agent-state bundle not found at ${this.bundleDir}`);
+        }
+        return;
+      }
+      const proc = Bun.spawn(["bun", script, "regen"], {
+        env: { ...process.env, MF_INSTANCE_DIR: this.dir },
+        stdout: "ignore",
+        stderr: "ignore",
+        stdin: "ignore",
+      });
+      void proc.exited
+        .then((code) => {
+          if (code !== 0) warn(`dashboard regen exited ${code}`);
+        })
+        .catch(() => {});
+    } catch (err) {
+      warn(`dashboard regen failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+/**
+ * The degraded mode: a transient in-process store with the same surface as
+ * the DB layer, used only while the DB is unavailable.
+ */
+class MemoryProposals {
+  private readonly byId = new Map<string, ProposalRecord>();
+  private nextDisplayIdCounter = 1;
+
+  get(id: string): ProposalRecord | null {
+    const r = this.byId.get(id);
+    return r ? { ...r } : null;
+  }
+
+  createIntake(
+    id: string,
+    verb: ProposalVerb,
+    url: string,
+    section: string | null,
+    why: string,
+    proposer: string,
+  ): void {
+    if (this.byId.has(id)) return;
+    this.byId.set(id, {
+      id,
+      phase: "intake",
+      verb,
+      url,
+      section,
+      why,
+      proposer,
+      displayId: null,
+      ratification: null,
+    });
+  }
+
+  markValidated(id: string): void {
+    const r = this.byId.get(id);
+    if (r === undefined || r.phase !== "intake") return;
+    r.phase = "validated";
+  }
+
+  markSurfaced(id: string): number | null {
+    const r = this.byId.get(id);
+    if (r === undefined || r.phase !== "validated") return null;
+    const displayId = this.nextDisplayIdCounter++;
+    r.phase = "surfaced";
+    r.displayId = displayId;
+    return displayId;
+  }
+
+  recordSummary(_id: string, _summaryText: string): void {
+    // Memory mode keeps no notes/summary text — degraded durability only,
+    // matching the phase/id fields, which ARE kept (see get()).
+  }
+
+  markDeclined(id: string): void {
+    const r = this.byId.get(id);
+    if (r === undefined) return;
+    if (r.phase !== "intake" && r.phase !== "validated") return;
+    r.phase = "declined";
+  }
+
+  // ── The ratification gate in degraded mode: FAIL CLOSED ──────────────────
+  //
+  // This is a deliberate inversion of this file's fail-SOFT posture, and the
+  // one place the inversion is correct. Everywhere else, "state is memory, not
+  // authority" means a broken DB degrades gracefully rather than blocking
+  // Atlas. But a ratification is not memory — it is the AUDIT RECEIPT that
+  // authorises a public, irreversible-ish effect on someone else's plan
+  // (constitution rules 1 and 4). Recording it somewhere that evaporates on
+  // restart, and then acting on it, would mean an effect landed with no
+  // surviving evidence of who authorised it.
+  //
+  // So in degraded mode the gate does not transition and mints nothing. The
+  // proposal stays `surfaced`, the principal gets a templated "state is
+  // degraded, ratification not recorded" reply, and the SAME verb works again
+  // once the DB is back. Fail-closed AND recoverable — the item is not lost,
+  // it is simply not actioned on an audit trail that does not exist.
+
+  findSurfacedByDisplayId(displayId: number): ProposalRecord | null {
+    for (const r of this.byId.values()) {
+      if (r.phase === "surfaced" && r.displayId === displayId) return { ...r };
+    }
+    return null;
+  }
+
+  /** No durable event log in degraded mode — nothing has been "seen". */
+  hasSeenGateMessage(): boolean {
+    return false;
+  }
+
+  /** Always `null`: no durable ratification is possible here. See the block comment above. */
+  markRatified(): StoredRatification | null {
+    return null;
+  }
+
+  /** Always `null`: no certificate can be minted from a store that does not persist. */
+  readRatification(): StoredRatification | null {
+    return null;
+  }
+
+  /** Always `false`: a decline is a recorded decision too, and this store records nothing durable. */
+  markDeclinedByRatifier(): boolean {
+    return false;
+  }
+
+  /** Always `false`: unreachable in practice (no certificate can exist for a memory row). */
+  markApplied(): boolean {
+    return false;
+  }
+
+  recordGateEvent(): void {
+    // Audit events are durable-or-nothing; degraded mode drops them rather
+    // than pretending. The caller's stderr warning from `AtlasProposals.run`
+    // is the operator-visible signal that the store degraded.
+  }
+}
+
+/**
+ * What callers actually hold: DB-authoritative reads/writes with the
+ * inverted fail-soft (state is memory, not authority) — identical posture to
+ * escort's EscortSessions.
+ */
+export class AtlasProposals {
+  private db: AtlasStateStore | null;
+  private memory: MemoryProposals | null;
+
+  constructor(db: AtlasStateStore | null) {
+    this.db = db;
+    this.memory = db === null ? new MemoryProposals() : null;
+  }
+
+  get(id: string): ProposalRecord | null {
+    return this.run(
+      (db) => db.get(id),
+      (m) => m.get(id),
+    );
+  }
+
+  createIntake(
+    id: string,
+    verb: ProposalVerb,
+    url: string,
+    section: string | null,
+    why: string,
+    proposer: string,
+  ): void {
+    this.run(
+      (db) => db.createIntake(id, verb, url, section, why, proposer),
+      (m) => m.createIntake(id, verb, url, section, why, proposer),
+    );
+  }
+
+  markValidated(id: string, issueOpen: boolean): void {
+    this.run(
+      (db) => db.markValidated(id, issueOpen),
+      (m) => m.markValidated(id),
+    );
+  }
+
+  markSurfaced(id: string): number | null {
+    return this.run(
+      (db) => db.markSurfaced(id),
+      (m) => m.markSurfaced(id),
+    );
+  }
+
+  recordSummary(id: string, summaryText: string): void {
+    this.run(
+      (db) => db.recordSummary(id, summaryText),
+      (m) => m.recordSummary(id, summaryText),
+    );
+  }
+
+  markDeclined(id: string, failedCheck: string): void {
+    this.run(
+      (db) => db.markDeclined(id, failedCheck),
+      (m) => m.markDeclined(id),
+    );
+  }
+
+  // ── W2b, the ratification gate (issue #3) ────────────────────────────────
+
+  findSurfacedByDisplayId(displayId: number): ProposalRecord | null {
+    return this.run(
+      (db) => db.findSurfacedByDisplayId(displayId),
+      (m) => m.findSurfacedByDisplayId(displayId),
+    );
+  }
+
+  hasSeenGateMessage(messageId: string): boolean {
+    return this.run(
+      (db) => db.hasSeenGateMessage(messageId),
+      (m) => m.hasSeenGateMessage(),
+    );
+  }
+
+  markRatified(
+    id: string,
+    ratifier: { principal: string; platform: string; platformId: string; messageId: string },
+  ): StoredRatification | null {
+    return this.run(
+      (db) => db.markRatified(id, ratifier),
+      (m) => m.markRatified(),
+    );
+  }
+
+  /** Satisfies `RatificationReader` — the port `requireRatification` reads through. */
+  readRatification(id: string): StoredRatification | null {
+    return this.run(
+      (db) => db.readRatification(id),
+      (m) => m.readRatification(),
+    );
+  }
+
+  markDeclinedByRatifier(
+    id: string,
+    decliner: { principal: string; platform: string; platformId: string; messageId: string },
+    reason: string,
+  ): boolean {
+    return this.run(
+      (db) => db.markDeclinedByRatifier(id, decliner, reason),
+      (m) => m.markDeclinedByRatifier(),
+    );
+  }
+
+  /** See `AtlasStateStore.markApplied` — the certificate-only apply transition. */
+  markApplied(cert: RatificationCertificate, expectedRatifierPrincipalId: string): boolean {
+    return this.run(
+      (db) => db.markApplied(cert, expectedRatifierPrincipalId),
+      (m) => m.markApplied(),
+    );
+  }
+
+  recordGateEvent(type: string, payload: Record<string, unknown>): void {
+    this.run(
+      (db) => db.recordGateEvent(type, payload),
+      (m) => m.recordGateEvent(),
+    );
+  }
+
+  close(): void {
+    this.db?.close();
+  }
+
+  private run<T>(dbFn: (db: AtlasStateStore) => T, memFn: (m: MemoryProposals) => T): T {
+    if (this.db !== null) {
+      try {
+        return dbFn(this.db);
+      } catch (err) {
+        warn(
+          `read/write failed — degrading to memory-only proposals until restart: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        this.db.close();
+        this.db = null;
+        this.memory = new MemoryProposals();
+      }
+    }
+    return memFn(this.memory as MemoryProposals);
+  }
+}
+
+/**
+ * Resolve instance + bundle dirs from the environment and open the store.
+ *   ATLAS_STATE_DIR        → instance dir (default ~/.config/cortex/agents/atlas)
+ *   ATLAS_AGENT_STATE_DIR  → agent-state bundle root (default arc install path)
+ * Never throws; `null` = run memory-only.
+ */
+export function openAtlasStateFromEnv(): AtlasStateStore | null {
+  const dirEnv = process.env.ATLAS_STATE_DIR;
+  const bundleEnv = process.env.ATLAS_AGENT_STATE_DIR;
+  return AtlasStateStore.open({
+    dir: dirEnv !== undefined && dirEnv.length > 0 ? dirEnv : defaultInstanceDir(),
+    bundleDir: bundleEnv !== undefined && bundleEnv.length > 0 ? bundleEnv : defaultBundleDir(),
+  });
+}
+
+function applyMigration(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version    TEXT PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    );
+  `);
+  const existing = db
+    .query<{ version: string }, [string]>(`SELECT version FROM schema_migrations WHERE version = ?`)
+    .get(MIGRATION_VERSION);
+  if (existing) return;
+  db.transaction(() => {
+    db.exec(MIGRATION_0001);
+    db.query(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`).run(
+      MIGRATION_VERSION,
+      Date.now(),
+    );
+  })();
+}

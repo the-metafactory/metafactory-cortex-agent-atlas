@@ -1,0 +1,83 @@
+# arc-manifest.yaml — metafactory-cortex-agent-atlas
+#
+# CHASSIS SLICE (W1b of the-metafactory/vision#9 epic). This is the
+# installable shape ONLY — no brain logic, no effects, no Discord/gh code.
+# Pattern copied from metafactory-cortex-agent-escort @ v0.5.0 (the canonical
+# sample of a cortex agent bundle with a closed effect universe); Atlas
+# reuses its manifest idiom verbatim where the shape carries over.
+#
+# `arc install metafactory-cortex-agent-atlas` drops the agent fragment +
+# persona into the cortex host's agents.d/ + personas/ dirs, then runs the
+# lifecycle postinstall scripts below.
+# See: https://github.com/the-metafactory/arc
+
+schema: arc/v1
+name: "metafactory-cortex-agent-atlas"
+version: "0.1.0"
+type: agent
+tier: community
+license: "MIT"
+description: "Atlas — the Factory's product-manager agent (plan steward). Cortex agent bundle: ADD/REMOVE intake with a principal RATIFY gate, map+ledger atomic updates, self-healing reconcile, doc changes by PR only. Spec: the-metafactory/vision#9"
+authors:
+  - "the-metafactory"
+repository: "the-metafactory/metafactory-cortex-agent-atlas"
+
+targets:
+  - cortex
+
+# Brain secrets: NONE — Atlas's brain reads no secrets of its own
+# (agent.yaml runtime.brain.secrets: []). The Discord presence identifiers
+# and plan-repo/issue coordinates (__ATLAS_*__ placeholders in agent.yaml)
+# resolve at cortex config-load from the daemon environment; they are
+# stack-side, never this pack's. See CONSTITUTION in persona.md — Atlas
+# never merges and never self-ratifies, so this chassis carries no gh write
+# credential either (that lands, scoped, with the W2c effects slice).
+
+# Instance state (OPTIONAL) — the memory module.
+#
+# Declaring this block opts Atlas into the metafactory memory module: the
+# agent-state bundle (github.com/the-metafactory/agent-state) scaffolds a
+# per-instance home at ~/.config/cortex/agents/atlas/ with a work queue
+# (work_items), an append-only diary (events), a dashboard, and weekly
+# retros. Declared from day one (not deferred) so `owns.state` below has a
+# real tree to name and `arc purge` is clean from the first install — see
+# cortex#2338 for the parallel purge-declaration effort on cortex itself.
+# Fail-soft: without the bundle or instance dir Atlas runs memory-only.
+# Field shape per forge/design/agent-platform.md §state.
+state:
+  blueprint: agent-state
+  version: ">=0.1.0"
+
+lifecycle:
+  postinstall:
+    # Step 1 — the running cortex daemon learns the freshly dropped fragment.
+    - scripts/signal-cortex-reload.sh
+    # NO issue-nats-creds.sh step, deliberately: Atlas is an IN-PROCESS
+    # agent (agent.yaml runtime.mode: in-process) — it rides the stack's
+    # single signing identity and is not bus-sovereign, so there is no
+    # per-agent NATS credential to mint. Same posture as escort.
+    # Step 2 — scaffold the optional instance state (soft-skips if the
+    # agent-state bundle isn't installed; Atlas runs stateless without it).
+    - scripts/scaffold-state.sh
+
+# depends_on.packages — the arc AUTO-INSTALL contract (cortex#2028): arc
+# clones + installs each {name, repo} on `arc install atlas`. cortex is
+# declared here WITH a `repo:` field (luna-stack arc-manifest.yaml shape)
+# so a bare `arc install metafactory-cortex-agent-atlas` on a host with no
+# cortex yet still resolves the host it installs into.
+depends_on:
+  packages:
+    - name: cortex
+      repo: "https://github.com/the-metafactory/cortex"
+
+# owns — the purge-scope declaration (arc#359 / arc#360), declared from day
+# one so `arc purge metafactory-cortex-agent-atlas` is clean the first time
+# it is ever run, not retrofitted later. `state` (not `userData`): the
+# agent-state instance dir is RUNTIME-GENERATED (state.sqlite, dashboard.md,
+# events) — apt /var, not apt /home — so a purge is expected to reclaim it.
+# Scoped to exactly Atlas's own instance dir under the cortex agents/
+# convention; no shared tree (e.g. ~/.config/cortex/agents.d/ itself, which
+# holds every installed agent's fragment) is named here.
+owns:
+  state:
+    - "~/.config/cortex/agents/atlas"

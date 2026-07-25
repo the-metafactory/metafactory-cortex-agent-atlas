@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# pre-push confidentiality gate.
+#
+# WHY THIS EXISTS: CI cannot protect a public repo from this class of leak. The
+# gate workflow runs *after* `git push` completes — but for a public repo the
+# push IS the exposure event, and force-pushing the mistake away does not
+# remove it (dangling commits stay fetchable by SHA until GC). This hook is the
+# only control that runs BEFORE content leaves the machine.
+#
+# Installed by: git config core.hooksPath .githooks
+# Scanner: compass/tools/gate-local.ts (tier-1+2 shape detection; no denylist
+# secret needed for the shape patterns that catch live platform ids).
+#
+# Fails CLOSED: if the scanner cannot be found or cannot run, the push is
+# refused rather than silently permitted. An unavailable gate is not an open
+# gate.
+set -euo pipefail
+
+COMPASS_GATE="${COMPASS_GATE:-$HOME/Developer/compass/tools/gate-local.ts}"
+
+if [ ! -f "$COMPASS_GATE" ]; then
+  echo "pre-push: BLOCKED — confidentiality scanner not found at $COMPASS_GATE" >&2
+  echo "pre-push: set COMPASS_GATE to its path, or install compass." >&2
+  echo "pre-push: refusing to push unscanned content to a public remote." >&2
+  exit 1
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "pre-push: BLOCKED — bun not found; cannot run the confidentiality scanner." >&2
+  exit 1
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "pre-push: scanning working tree for confidentiality findings…" >&2
+if ! bun "$COMPASS_GATE" "$REPO_ROOT" --no-denylist; then
+  echo "" >&2
+  echo "pre-push: BLOCKED — confidentiality findings above." >&2
+  echo "pre-push: live platform ids, real names, and secrets must never reach a" >&2
+  echo "pre-push: public remote. Force-pushing a fix afterwards does NOT undo it." >&2
+  exit 1
+fi
+
+echo "pre-push: clean." >&2
