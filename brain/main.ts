@@ -88,7 +88,12 @@ const instanceDir = store?.instanceDir ?? null;
 const encoder = new TextEncoder();
 const outQueue: Uint8Array[] = [];
 let outOffset = 0;
-let sockRef: { write(data: Uint8Array): number } | null = null;
+// Widened to carry `end()` as well as `write()` so the shutdown path never has
+// to reach for the `const socket = await Bun.connect(…)` binding: a socket
+// callback can fire before that await settles, and touching the binding from
+// there is a temporal-dead-zone ReferenceError inside the one path that must
+// not throw.
+let sockRef: { write(data: Uint8Array): number; end(): void } | null = null;
 
 function flushOut(): void {
   if (sockRef === null) return;
@@ -147,7 +152,7 @@ process.stderr.write(
   })}\n`,
 );
 
-// ── 5. The socket ───────────────────────────────────────────────────────────
+// ── 5. The runtime, and the socket env it needs ─────────────────────────────
 const socketPath = process.env.CORTEX_BRAIN_SOCKET;
 const socketToken = process.env.CORTEX_BRAIN_SOCKET_TOKEN;
 if (
@@ -181,6 +186,146 @@ onTransition = () => {
 const decoder = new JsonlDecoder();
 let shuttingDown = false;
 
+// ── 6. Shutdown — defined BEFORE the connect, deliberately ──────────────────
+//
+// A socket callback can fire while the top-level `await Bun.connect(…)` is
+// still suspended, i.e. before any `const` declared after it has initialised.
+// `close`/`error` reach for the drain, so the drain and its constants must be
+// fully initialised by then — a temporal-dead-zone ReferenceError inside the
+// one path that must not throw would take the daemon down without a log, which
+// is the crash-loop shape this file's header is written against.
+
+
+/**
+ * The FLOOR on how long in-flight work is given to settle, whatever deadline
+ * the host names.
+ *
+ * A `shutdown` carrying `deadline_ms: 100` arriving mid-apply used to mean
+ * exactly one thing: exit at 100ms with `applyRatified` still inside its
+ * `gh issue edit`. The orphaned child then completed the edit anyway, so the
+ * plan body moved, no ledger entry was posted, and no apply record landed —
+ * the map ahead of both the ledger and Atlas's own memory (atlas#21). One
+ * `gh issue view` + one `gh issue edit` is a network round trip; a deadline
+ * smaller than that is a deadline that cannot be met, and honouring it to the
+ * millisecond buys nothing an operator wants.
+ *
+ * So the host's deadline governs when Atlas STOPS TAKING WORK and when it says
+ * it is overrunning — not when it is willing to abandon a transition. The floor
+ * is bounded rather than open-ended because cortex escalates
+ * deadline → SIGTERM → (+5s) SIGKILL: floor + flush budget must fit inside that
+ * last window, since being SIGKILLed mid-write is strictly worse than a
+ * deliberate, logged abandon.
+ */
+const DRAIN_FLOOR_MS = 3_500;
+
+/** How long the outbound queue may take to leave after the drain. */
+const FLUSH_BUDGET_MS = 1_000;
+
+/** SIGTERM/SIGINT get the same floor; see `DRAIN_FLOOR_MS` for the 5s budget. */
+const SIGNAL_DRAIN_MS = DRAIN_FLOOR_MS;
+
+/** Resolves `false` after `ms`; races against a drain that resolves `true`. */
+function expiresAfter(ms: number): Promise<false> {
+  return new Promise<false>((r) => {
+    setTimeout(() => {
+      r(false);
+    }, Math.max(0, ms));
+  });
+}
+
+/**
+ * The host's drain signal (or a signal from the OS, or the loss of the socket).
+ *
+ * ── The store is closed ONLY when the drain actually won ───────────────────
+ * `state.close()` used to run unconditionally on the way out, whether the drain
+ * had finished or the deadline had simply expired underneath it. That is the
+ * one call that can turn "this transition was abandoned" into "this transition
+ * threw halfway through": an in-flight `markApplied` resuming against a closed
+ * handle fails as an exception inside the runtime's queue rather than as work
+ * that never got to run. Closing is a courtesy to a finished process, so it is
+ * done only when there is nothing left that could still want the handle.
+ *
+ * ── What happens to work that is STILL in flight at the cap ────────────────
+ * It is abandoned, loudly and on purpose, and the store is left untouched.
+ * SQLite's own transaction atomicity is then the guarantee: an uncommitted
+ * transaction rolls back when the file is next opened, so durable state is
+ * always a whole number of transitions behind reality — never a torn one. The
+ * plan body may be AHEAD of that state (a `gh` child outlives this process and
+ * completes its edit), which is ordinary drift with a named owner:
+ * `reconcile.ts`'s detector (c) finds a plan body revised outside Atlas, and
+ * `runtime.start()` runs a reconcile pass on wake. Recoverable drift, announced
+ * in stderr at the moment it is created, is the deliberate choice here — the
+ * alternative, ignoring the host's stop indefinitely, ends in SIGKILL with no
+ * log at all.
+ */
+async function drainAndExit(
+  deadlineMs: number,
+  opts: { exitCode?: number } = {},
+): Promise<void> {
+  if (shuttingDown) return; // a drain is already running; it owns the exit
+  shuttingDown = true;
+  runtime.stop();
+
+  const hostDeadline = Math.max(0, deadlineMs);
+  const floor = Math.max(hostDeadline, DRAIN_FLOOR_MS);
+  let settled = await Promise.race([
+    runtime.drained().then(() => true as const),
+    expiresAfter(hostDeadline),
+  ]);
+  if (!settled && floor > hostDeadline) {
+    process.stderr.write(
+      `atlas: drain deadline (${hostDeadline}ms) expired with a transition still in ` +
+        `flight — holding the store open for up to ${floor - hostDeadline}ms more rather ` +
+        `than exiting mid-apply\n`,
+    );
+    settled = await Promise.race([
+      runtime.drained().then(() => true as const),
+      expiresAfter(floor - hostDeadline),
+    ]);
+  }
+
+  // Flush whatever WAS decided before the queue emptied or the cap hit: a
+  // `post` or a `result` already produced must not be lost on the way out.
+  const flushStart = Date.now();
+  while (outQueue.length > 0 && Date.now() - flushStart < FLUSH_BUDGET_MS) {
+    flushOut();
+    await Bun.sleep(10);
+  }
+
+  if (settled) {
+    try {
+      state.close();
+    } catch {
+      /* a failed DB close must not block exit */
+    }
+  } else {
+    process.stderr.write(
+      "atlas: ABANDONING an in-flight transition at the drain cap — the durable store is " +
+        "left UNTOUCHED so its last transaction rolls back whole rather than closing under " +
+        "a half-written one. The plan body may now be AHEAD of Atlas's state; the reconcile " +
+        "pass on next wake is the repair path\n",
+    );
+  }
+
+  try {
+    sockRef?.end();
+  } catch {
+    /* the host may already be gone */
+  }
+  process.exit(opts.exitCode ?? 0);
+}
+
+// Armed BEFORE the connect too: a SIGTERM arriving while `Bun.connect` is still
+// suspended would otherwise hit Bun's default handler and kill the process with
+// the store open and no drain — the same shape as everything above.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    process.stderr.write(`atlas: ${signal} — draining\n`);
+    void drainAndExit(SIGNAL_DRAIN_MS);
+  });
+}
+
+// ── 7. The socket ───────────────────────────────────────────────────────────
 const socket = await Bun.connect({
   unix: socketPath,
   socket: {
@@ -212,17 +357,22 @@ const socket = await Bun.connect({
       flushOut();
     },
     close() {
-      // A daemon brain without its host has nothing to do. Exit non-zero when
-      // this was NOT an orderly shutdown, so the host's restart budget sees a
-      // crash for what it is.
-      process.stderr.write("atlas: socket closed by host — exiting\n");
-      shutdownLocals();
-      process.exit(shuttingDown ? 0 : 1);
+      // A daemon brain without its host has nothing to do — but "nothing to do"
+      // is not the same as "nothing in flight". Losing the socket mid-apply used
+      // to close the durable store and exit with NO drain at all (atlas#21),
+      // which is the same half-applied split as the deadline path and reached by
+      // a route the host does not even choose. So this gets the SAME bounded
+      // drain the protocol `shutdown` gets; it simply has nowhere left to flush
+      // to afterwards. Exit non-zero when this was NOT an orderly shutdown, so
+      // the host's restart budget sees a crash for what it is.
+      process.stderr.write("atlas: socket closed by host — draining, then exiting\n");
+      void drainAndExit(SIGNAL_DRAIN_MS, { exitCode: shuttingDown ? 0 : 1 });
     },
     error(_s, err) {
-      process.stderr.write(`atlas: socket error: ${err.message}\n`);
-      shutdownLocals();
-      process.exit(1);
+      // Same reasoning as `close`: a transport error is not a licence to tear
+      // down a transaction that is mid-write.
+      process.stderr.write(`atlas: socket error: ${err.message} — draining, then exiting\n`);
+      void drainAndExit(SIGNAL_DRAIN_MS, { exitCode: 1 });
     },
   },
 });
@@ -235,59 +385,3 @@ process.stderr.write("atlas: connected\n");
 // post, and a pass that ran before there was anywhere to write would refuse for
 // the wrong reason.
 runtime.start();
-
-// ── 6. Shutdown ─────────────────────────────────────────────────────────────
-
-/** Stop timers and close the state DB. Idempotent; never throws. */
-function shutdownLocals(): void {
-  try {
-    runtime.stop();
-  } catch {
-    /* a failed timer teardown must not block exit */
-  }
-  try {
-    state.close();
-  } catch {
-    /* a failed DB close must not block exit */
-  }
-}
-
-/**
- * The host's drain signal (or a signal from the OS). In-flight work is given
- * until `deadlineMs` to settle — an orphaned transition is exactly the drift
- * `reconcile.ts` then has to repair, so finishing one is worth waiting for —
- * and the outbound queue is then flushed before the socket closes, so a `post`
- * or a `result` already decided is not lost on the way out.
- */
-async function drainAndExit(deadlineMs: number): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  runtime.stop();
-  const deadline = new Promise<void>((r) => {
-    setTimeout(r, Math.max(0, deadlineMs));
-  });
-  await Promise.race([runtime.drained(), deadline]);
-  const flushStart = Date.now();
-  while (outQueue.length > 0 && Date.now() - flushStart < 1_000) {
-    flushOut();
-    await Bun.sleep(10);
-  }
-  try {
-    state.close();
-  } catch {
-    /* see shutdownLocals */
-  }
-  socket.end();
-  process.exit(0);
-}
-
-// SIGTERM/SIGINT get the same orderly drain the protocol's `shutdown` gets.
-// cortex escalates deadline → SIGTERM → (+5s) SIGKILL, so 4s leaves room to
-// finish and flush inside the window the host actually allows.
-const SIGNAL_DRAIN_MS = 4_000;
-for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.on(signal, () => {
-    process.stderr.write(`atlas: ${signal} — draining\n`);
-    void drainAndExit(SIGNAL_DRAIN_MS);
-  });
-}

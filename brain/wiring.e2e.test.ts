@@ -30,10 +30,22 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// Read back through Atlas's OWN store, not raw SQL: "durable state is coherent"
+// is a claim about what the next boot will see, and the next boot reads it
+// through exactly this class.
+import { AtlasStateStore, type ProposalRecord } from "./state";
 
 const PACK_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const MAIN = join(PACK_ROOT, "brain", "main.ts");
@@ -107,9 +119,28 @@ function buildBrainEnv(opts: {
   return env;
 }
 
+/**
+ * Make `gh issue edit` SLOW, and announce the moment it starts.
+ *
+ * This is what makes a shutdown test non-vacuous. `applyRatified` is a chain of
+ * network calls (read body → write body → read receipt → post ledger → record),
+ * and "in flight" means the signal arrives while the process is inside one of
+ * them. A stall on the WRITE puts the signal in the worst place in the chain:
+ * after the plan issue has been handed an edit and before Atlas has recorded a
+ * single thing about it.
+ */
+interface EditStall {
+  /** Touched the instant `issue edit` begins, so a test can wait for it. */
+  readonly marker: string;
+  /** How long the edit takes. `sh`'s `sleep` accepts fractions on macOS/Linux. */
+  readonly seconds: number;
+}
+
 /** A `gh` shim: enough canned truth for one ADD → RATIFY round trip. */
-function writeGhShim(binDir: string, statePath: string): void {
+function writeGhShim(binDir: string, statePath: string, stall: EditStall | null = null): void {
   mkdirSync(binDir, { recursive: true });
+  const stallPreamble =
+    stall === null ? "" : `    : > "${stall.marker}"\n    sleep ${stall.seconds}\n`;
   const script = `#!/bin/sh
 # Fake gh for the ignition suite. Reads/writes a single JSON-free body file so
 # an 'issue edit' is observable by the test.
@@ -121,7 +152,7 @@ case "$1 $2" in
     exit 0
     ;;
   "issue edit")
-    cat > "$STATE"
+${stallPreamble}    cat > "$STATE"
     exit 0
     ;;
 esac
@@ -303,6 +334,17 @@ class FakeCortexHost {
     this.proc?.kill(sig);
   }
 
+  /** The host goes away without asking: the brain's `close` path, not `shutdown`. */
+  dropConnection(): void {
+    try {
+      this.conn?.end();
+    } catch {
+      /* already gone */
+    }
+    this.server?.stop(true);
+    this.conn = null;
+  }
+
   async stop(): Promise<void> {
     try {
       this.proc?.kill("SIGKILL");
@@ -333,10 +375,13 @@ function armedHostEnv(): Record<string, string> {
   };
 }
 
-async function boot(hostEnv: Record<string, string>): Promise<FakeCortexHost> {
+async function boot(
+  hostEnv: Record<string, string>,
+  opts: { editStall?: EditStall } = {},
+): Promise<FakeCortexHost> {
   const socketPath = join(dir, "brain.sock");
   const binDir = join(dir, "bin");
-  writeGhShim(binDir, planFile);
+  writeGhShim(binDir, planFile, opts.editStall ?? null);
   mkdirSync(join(dir, "home"), { recursive: true });
   mkdirSync(join(dir, "scratch"), { recursive: true });
   mkdirSync(join(dir, "state"), { recursive: true });
@@ -443,6 +488,38 @@ describe("the daemon starts and stays up", () => {
     expect(h.postsFor("t-unarmed")).toEqual([]);
   });
 
+  test("a gate no message can REACH is UNARMED — verdict prefix, not a sub-clause", async () => {
+    // atlas#20. Identity loads and state is durable, so the old arming
+    // condition (`identityOk && stateDurable`) printed GATE ARMED — while
+    // `serveTask` short-circuited every message to `no-effect-layer` before
+    // intake or the gate ever saw it. ARMED is read as the promise that
+    // RATIFY/DECLINE will NOT be ignored, because the UNARMED branch says so
+    // explicitly; printing it here was epic #5's silently-dead gate.
+    //
+    // The assertion is deliberately on the VERDICT PREFIX. The suite already
+    // drove this exact configuration and asserted only `effects: NONE`, which
+    // is how the bug got through review — exercised, and asserted around.
+    const env = armedHostEnv();
+    delete env.ATLAS_CHANNEL_ID;
+    const h = await boot(env);
+    h.hello();
+    await h.waitFor(() => h.stderrText().includes("connected"), 5_000, "never connected");
+
+    const verdict = h.stderr.find((l) => l.includes("GATE ARMED") || l.includes("GATE UNARMED"));
+    expect(verdict).toBeDefined();
+    expect(verdict).toContain("GATE UNARMED");
+    expect(verdict).not.toContain("GATE ARMED");
+    expect(verdict).toContain("unreachable:missing-channel-id");
+    expect(verdict).toContain("IGNORED");
+
+    // …and the line's promise is the runtime's behaviour: the principal's
+    // RATIFY is discarded, exactly as UNARMED says it will be.
+    h.task("t-unreachable", "RATIFY 1", PRINCIPAL_PLATFORM_ID);
+    const result = await h.awaitResult("t-unreachable");
+    expect(result.summary).toBe("no-effect-layer");
+    expect(h.postsFor("t-unreachable")).toEqual([]);
+  }, 20_000);
+
   test("an unknown event type is dropped, not fatal", async () => {
     const h = await boot(armedHostEnv());
     h.hello();
@@ -512,14 +589,104 @@ describe("shutdown", () => {
     expect(await h.exited()).toBe(0);
   }, 15_000);
 
-  test("SIGTERM drains and exits 0 — an in-flight transition is not orphaned", async () => {
-    const h = await boot(armedHostEnv());
+  /**
+   * Drive an ADD → RATIFY up to the moment `gh issue edit` is running, and
+   * return with the apply GENUINELY in flight.
+   *
+   * The old test at this spot awaited the result BEFORE signalling, so the task
+   * was fully settled and nothing was in flight — it proved SIGTERM → exit 0,
+   * which is half its own name (atlas#21). Waiting on the shim's marker file is
+   * what makes the difference: it is written by `gh` itself, from inside the
+   * write, so its existence is proof the process is mid-effect.
+   */
+  async function ratifyInFlight(stallSeconds: number): Promise<FakeCortexHost> {
+    const marker = join(dir, "edit-started");
+    const h = await boot(armedHostEnv(), { editStall: { marker, seconds: stallSeconds } });
     h.hello();
-    h.task("t-drain", `ADD: ${NEW_URL} — [Backend] why`, PROPOSER_PLATFORM_ID);
-    await h.awaitResult("t-drain");
+    h.task("t-add", `ADD: ${NEW_URL} — [Backend] why`, PROPOSER_PLATFORM_ID);
+    await h.awaitResult("t-add");
+    // Deliberately NOT awaited: this is the task we interrupt.
+    h.task("t-ratify", "RATIFY 1", PRINCIPAL_PLATFORM_ID);
+    await h.waitFor(() => existsSync(marker), 10_000, "the plan edit never started");
+    return h;
+  }
+
+  /** Read Atlas's durable state the way the next boot would. */
+  function durableRecord(id: string): ProposalRecord | null {
+    const store = AtlasStateStore.open({ dir: join(dir, "state") });
+    expect(store).not.toBeNull();
+    try {
+      return store!.get(id);
+    } finally {
+      store!.close();
+    }
+  }
+
+  test("shutdown DURING an in-flight apply waits for it — map, ledger and memory all move", async () => {
+    // The demonstrated failure (atlas#21): `deadline_ms: 100` against a stalled
+    // `gh issue edit` exited 0 mid-`applyRatified`. The orphaned child finished
+    // the edit, so the plan body moved, no ➕ ledger entry was ever posted, and
+    // no apply record landed — the map ahead of both the ledger and Atlas's own
+    // memory, through the shutdown path instead of the one the atomic pair
+    // guards.
+    const h = await ratifyInFlight(1.5);
+    h.send({ v: 1, type: "shutdown", deadline_ms: 50 });
+    expect(await h.exited()).toBe(0);
+
+    // (a) the map moved…
+    expect(readFileSync(planFile, "utf8")).toContain(NEW_URL);
+    // (b) …the ledger entry left, on the task that was in flight…
+    const ledger = h.postsFor("t-ratify").filter((t) => t.startsWith("➕"));
+    expect(ledger).toHaveLength(1);
+    // (c) …and Atlas remembers BOTH. A record parked in `ratified` with no
+    // applied receipt is the split this test exists to forbid.
+    const rec = durableRecord("t-add");
+    expect(rec?.phase).toBe("posted");
+    expect(rec?.applied).not.toBeNull();
+    expect(rec?.posted).not.toBeNull();
+    // The deadline was 50ms and the edit took ~1.5s: Atlas said out loud that
+    // it was overrunning rather than doing it quietly.
+    expect(h.stderrText()).toContain("expired with a transition still in flight");
+  }, 30_000);
+
+  test("SIGTERM during an in-flight apply drains it too", async () => {
+    const h = await ratifyInFlight(1.5);
     h.signal("SIGTERM");
     expect(await h.exited()).toBe(0);
-  }, 20_000);
+    expect(readFileSync(planFile, "utf8")).toContain(NEW_URL);
+    expect(h.postsFor("t-ratify").filter((t) => t.startsWith("➕"))).toHaveLength(1);
+    expect(durableRecord("t-add")?.phase).toBe("posted");
+  }, 30_000);
+
+  test("past the drain cap the transition is abandoned WHOLE, never half-recorded", async () => {
+    // The deliberate decision at the cap, pinned so it cannot drift into
+    // something quieter: Atlas gives up, says so, and leaves the store alone.
+    // Durable state is then a whole number of transitions behind reality —
+    // still `ratified`, no applied receipt, nothing torn — which is ordinary
+    // drift with a named owner (reconcile's "plan body revised outside Atlas").
+    const h = await ratifyInFlight(9);
+    h.send({ v: 1, type: "shutdown", deadline_ms: 50 });
+    expect(await h.exited()).toBe(0);
+    expect(h.stderrText()).toContain("ABANDONING an in-flight transition");
+
+    const rec = durableRecord("t-add");
+    expect(rec?.phase).toBe("ratified");
+    expect(rec?.applied).toBeNull();
+    expect(rec?.posted).toBeNull();
+    // And no ledger entry was minted for a change Atlas never recorded.
+    expect(h.postsFor("t-ratify").filter((t) => t.startsWith("➕"))).toEqual([]);
+  }, 40_000);
+
+  test("losing the socket mid-apply drains before exiting, and exits non-zero", async () => {
+    // `close()` used to call `state.close()` and exit with NO drain at all —
+    // the same half-applied split as the deadline path, reached by a route the
+    // host does not even choose.
+    const h = await ratifyInFlight(1.5);
+    h.dropConnection();
+    expect(await h.exited()).toBe(1); // not an orderly shutdown; the host should see that
+    expect(h.stderrText()).toContain("socket closed by host — draining");
+    expect(durableRecord("t-add")?.phase).toBe("posted");
+  }, 30_000);
 });
 
 // ── The direct-run guard ────────────────────────────────────────────────────

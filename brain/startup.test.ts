@@ -101,8 +101,59 @@ describe("the verdict", () => {
     const env = armedEnv();
     delete env.ATLAS_CHANNEL_ID;
     const line = buildStartupLine(facts({}, env));
+    // The VERDICT PREFIX first — this configuration used to print GATE ARMED
+    // while `runtime.ts` short-circuited every message to `no-effect-layer`
+    // (atlas#20). Asserting only the `effects:` sub-clause is what let that
+    // through review, so the prefix is pinned here before anything else.
+    expect(line).toContain("GATE UNARMED");
+    expect(line).not.toContain("GATE ARMED");
     expect(line).toContain("effects: NONE (missing-channel-id)");
     expect(line).toContain("Atlas admits no message and can edit nothing");
+  });
+
+  test("no effect target ⇒ UNARMED, naming unreachability as the reason", () => {
+    // Identity is loaded and state is durable — the two things that used to be
+    // the whole arming condition. The gate is still unreachable, so ARMED would
+    // be the line promising something `serveTask` refuses before intake.
+    const env = armedEnv();
+    delete env.ATLAS_CHANNEL_ID;
+    const line = buildStartupLine(facts({ stateDurable: true }, env));
+    expect(line.startsWith("atlas: GATE UNARMED (")).toBe(true);
+    expect(line).toContain("unreachable:missing-channel-id");
+    expect(line).toContain("IGNORED");
+    expect(line).toContain("the gate never sees it");
+  });
+
+  test("every blocking reason is named at once, not one reboot at a time", () => {
+    const env = armedEnv();
+    delete env.ATLAS_SELF_PLATFORM_IDS;
+    delete env.ATLAS_CHANNEL_ID;
+    const line = buildStartupLine(facts({ selfIdCount: 0, stateDurable: false }, env));
+    expect(line).toContain("GATE UNARMED");
+    expect(line).toContain("no-usable-self-platform-ids");
+    expect(line).toContain("state-degraded");
+    expect(line).toContain("unreachable:missing-channel-id");
+  });
+
+  test("ARMED is printed only when identity, storage AND reachability all hold", () => {
+    // The mutation guard for the arming condition: drop any ONE of the three
+    // and the verdict must flip. A test that only asserts the happy line lets a
+    // widened condition through.
+    expect(buildStartupLine(facts())).toContain("GATE ARMED");
+
+    const noIdentity = armedEnv();
+    delete noIdentity.ATLAS_SELF_PLATFORM_IDS;
+    const noEffects = armedEnv();
+    delete noEffects.ATLAS_CHANNEL_ID;
+
+    for (const line of [
+      buildStartupLine(facts({ selfIdCount: 0 }, noIdentity)),
+      buildStartupLine(facts({ stateDurable: false })),
+      buildStartupLine(facts({}, noEffects)),
+    ]) {
+      expect(line).not.toContain("GATE ARMED");
+      expect(line).toContain("GATE UNARMED");
+    }
   });
 
   test("the two standing wiring limits are restated every boot", () => {

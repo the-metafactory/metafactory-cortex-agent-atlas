@@ -67,33 +67,79 @@ export interface StartupFacts {
 }
 
 /**
- * The one line. ARMED requires BOTH a loaded identity config AND durable state
- * — a gate that cannot durably record its own decision mints no certificate and
- * therefore authorises no effect (`state.ts`'s degraded path refuses every
- * RATIFY/DECLINE), so calling that "armed" would be the line lying.
+ * The one line.
+ *
+ * ── ARMED means "a RATIFY typed by the principal will be honoured" ─────────
+ * Nothing weaker. The verdict's contract is ASYMMETRIC and that asymmetry is
+ * load-bearing: the UNARMED branch says out loud that every RATIFY/DECLINE will
+ * be IGNORED, so an operator reads ARMED as the promise that they will not be.
+ * The line therefore may not print ARMED unless all THREE prerequisites of that
+ * promise hold:
+ *
+ *   identity     — `ratify.ts` refuses every verb without a loaded config.
+ *   storage      — a gate that cannot durably record its own decision mints no
+ *                  certificate and so authorises no effect (`state.ts`'s
+ *                  degraded path refuses every RATIFY/DECLINE).
+ *   reachability — with no effect target, `runtime.ts`'s `serveTask`
+ *                  short-circuits to `no-effect-layer` BEFORE intake and before
+ *                  the gate: `processGateMessage` is never called at all.
+ *
+ * Reachability is the newest of the three and by far the most deceptive
+ * (atlas#20). Identity and storage both fail INSIDE the gate, which answers the
+ * principal; an unreachable gate discards the message in silence. Printing
+ * ARMED over that was epic #5's silently-dead gate wearing the badge this line
+ * exists to withhold.
+ *
+ * The three are reported as ONE verdict rather than three claims deliberately:
+ * a reader who has to assemble "armed" out of three sub-clauses scattered along
+ * the line is exactly the reader who assembles it wrong. The clauses are still
+ * all there (`effects: …`, `state=…`) for the operator who needs the detail —
+ * but the prefix answers the question on its own, and every blocking reason is
+ * named in it so one reboot surfaces all of them rather than one at a time.
  */
 export function buildStartupLine(facts: StartupFacts): string {
   const parts: string[] = [];
 
   const identityOk = facts.identity.kind === "ok";
-  const armed = identityOk && facts.stateDurable;
+  const effectsOk = facts.effects.kind === "ok";
 
-  if (armed) {
+  // Every reason the gate is not armed, in the order an operator fixes them.
+  const blockers: string[] = [];
+  const details: string[] = [];
+  if (!identityOk) {
+    blockers.push(facts.identity.kind === "refused" ? facts.identity.reason : "identity-unknown");
+    if (facts.identity.kind === "refused" && facts.identity.detail.length > 0) {
+      details.push(facts.identity.detail);
+    }
+  }
+  if (!facts.stateDurable) {
+    blockers.push("state-degraded");
+    details.push(
+      "Durable state did not open, so no ratification can be recorded or certified.",
+    );
+  }
+  if (!effectsOk) {
+    // `unreachable:` and not a bare effects reason: the cost here is not that
+    // Atlas cannot ACT (the `effects:` clause below already says that), it is
+    // that the message never reaches the gate to be judged in the first place.
+    blockers.push(
+      `unreachable:${facts.effects.kind === "refused" ? facts.effects.reason : "unknown"}`,
+    );
+    details.push(
+      "There is no effect target, so a message is refused before intake and the gate " +
+        "never sees it.",
+    );
+  }
+
+  if (blockers.length === 0) {
     parts.push(
       `atlas: GATE ARMED — ratifier principal ${maskId(facts.ratifierPrincipal)} ` +
         `(${facts.ratifierIdCount} platform id(s); ${facts.selfIdCount} self id(s))`,
     );
-  } else if (!identityOk) {
-    const refusal = facts.identity.kind === "refused" ? facts.identity.reason : "unknown";
-    const detail = facts.identity.kind === "refused" ? facts.identity.detail : "";
-    parts.push(
-      `atlas: GATE UNARMED (${refusal}) — every RATIFY/DECLINE will be IGNORED. ${detail}`,
-    );
   } else {
     parts.push(
-      "atlas: GATE UNARMED (state-degraded) — the identity config loaded, but durable state " +
-        "did not open, so no ratification can be recorded or certified and every " +
-        "RATIFY/DECLINE will be refused",
+      `atlas: GATE UNARMED (${blockers.join(", ")}) — every RATIFY/DECLINE will be ` +
+        `IGNORED. ${details.join(" ")}`.trimEnd(),
     );
   }
 
