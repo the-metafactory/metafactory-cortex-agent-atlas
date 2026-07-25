@@ -1,0 +1,67 @@
+# CI — tests + typecheck.
+#
+# WHY THIS EXISTS: until now this repo's only workflow was the confidentiality
+# gate, so a green check meant "no secrets leaked" and nothing more. Tests and
+# types were verified by hand on each PR and reported in the review — which is
+# trust, not a gate. A contributor pushing a broken test would have seen green.
+#
+# That is the same failure shape this repo has hit repeatedly: a control that
+# looks active but is inert. A checkmark nobody can rely on is worse than a
+# missing one, because it stops people looking.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # All branches, not just those targeting main — slices here stack on each
+    # other (a wiring PR based on an unmerged reconcile PR), and those stacked
+    # PRs need gating too.
+    branches: ['**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - run: bun install --frozen-lockfile
+
+      # The suite includes an e2e that spawns `brain/main.ts` as a real
+      # subprocess over a real unix socket. It needs no network and no cortex
+      # host — the host side is a faithful double built from cortex's source —
+      # so it runs here unmodified.
+      - name: Tests
+        run: bun test
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - run: bun install --frozen-lockfile
+
+      # Load-bearing beyond ordinary type safety: several of this repo's
+      # guarantees are enforced at the type level rather than at runtime —
+      # `markApplied(cert, cert.ratifierPrincipalId)` is a compile error by
+      # design, and the no-merge property is partly a closed union ending in a
+      # `never` arm. Those regression tests only fire if this job runs.
+      - name: Typecheck
+        run: bun run typecheck
