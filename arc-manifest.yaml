@@ -25,13 +25,85 @@ repository: "the-metafactory/metafactory-cortex-agent-atlas"
 targets:
   - cortex
 
-# Brain secrets: NONE — Atlas's brain reads no secrets of its own
-# (agent.yaml runtime.brain.secrets: []). The Discord presence identifiers
-# and plan-repo/issue coordinates (__ATLAS_*__ placeholders in agent.yaml)
-# resolve at cortex config-load from the daemon environment; they are
-# stack-side, never this pack's. See CONSTITUTION in persona.md — Atlas
-# never merges and never self-ratifies, so this chassis carries no gh write
-# credential either (that lands, scoped, with the W2c effects slice).
+# Brain secrets: no API key, no token, no credential of its own — the hybrid
+# voice runs through the STACK'S substrate auth (agent.yaml
+# runtime.brain.secrets: []). See CONSTITUTION in persona.md — Atlas never
+# merges and never self-ratifies, so this pack carries no gh write credential
+# either; it uses whatever `gh` the host is already authenticated as.
+#
+# It does, however, READ eleven environment variables — eight of them
+# load-bearing, three of them gating constitution rule 3. They are declared in
+# `capabilities.secrets` below and in agent.yaml's `plan:`, `gate:` and
+# `watch:` blocks, with an operator table in README.md § Configuration.
+#
+# NOTE, because the text here previously said otherwise: only the DISCORD
+# PRESENCE identifiers are resolved by cortex at config-load. cortex's
+# `__ENV__` resolution is scoped to surface fields
+# (src/common/config/resolve-env-placeholders.ts — ENV_PLACEHOLDER_PATTERN +
+# DISCORD_ID_FIELDS). The plan/gate/watch placeholders are this pack's
+# declaration convention; the brain reads those names from its OWN process
+# env, and cortex spawns a brain with a MINIMAL env (PATH/HOME/LANG/TMPDIR +
+# `runtime.brain.secrets` only — src/brain/exec-brain-runner.ts `buildEnv`).
+# Declaring the contract is this slice; wiring it through
+# `runtime.brain.secrets` belongs with the daemon entrypoint (epic #5).
+
+# Capability surface — rendered by `arc install` / `arc info`, so an operator
+# sees what the bundle needs BEFORE consenting. Declared honestly: every
+# subprocess and host below is one this pack's code actually reaches.
+capabilities:
+  filesystem:
+    read:
+      # Instance state (state.sqlite + events). Override: ATLAS_STATE_DIR.
+      - "~/.config/cortex/agents/atlas"
+      # The agent-state bundle — the dashboard-regen script only.
+      # Override: ATLAS_AGENT_STATE_DIR.
+      - "~/.config/metafactory/pkg/repos/agent-state"
+      # The plan working checkout, when ATLAS_PLAN_CHECKOUT is set. Unset ⇒
+      # never touched, and doc-change PRs are disabled.
+      - "$ATLAS_PLAN_CHECKOUT"
+    write:
+      - "~/.config/cortex/agents/atlas"
+      - "$ATLAS_PLAN_CHECKOUT"
+  network:
+    - host: api.github.com
+      reason: "gh reads the plan body and the state of issues the plan links to, and writes the ratified plan edit, the ledger receipt comment, and the doc-change PR"
+    - host: github.com
+      reason: "git push of the doc-change branch from ATLAS_PLAN_CHECKOUT — never to the base branch, and the gh adapter has no merge verb"
+  bash:
+    allowed: true
+    # Not a shell: every invocation is an argv array to Bun.spawn, and the
+    # write path is prefix-allow-listed in brain/effects/gh.ts. Listed here at
+    # the granularity that allow-list actually enforces.
+    restricted_to:
+      - "gh api"            # read-only; GET-shaped, -X/--method refused (brain/gh.ts)
+      - "gh issue view"
+      - "gh issue comment"
+      - "gh issue edit"
+      - "gh pr create"      # there is deliberately NO `gh pr merge`
+      - "git push"
+      - "bun <agent-state>/skill/scripts/dashboard.ts regen"
+  # Environment variables the brain reads. Not credentials — ids, coordinates
+  # and cadence — but arc's `secrets` list is the installer-visible env
+  # declaration surface ("env vars or secret keys the package reads"), and
+  # these appearing NOWHERE an installer or operator can see them is precisely
+  # the defect this block closes.
+  secrets:
+    # REQUIRED — the ratification gate. Any one missing ⇒ gate NOT ARMED, and
+    # every RATIFY/DECLINE is ignored with stderr as the only signal.
+    - ATLAS_RATIFIER_PRINCIPAL
+    - ATLAS_RATIFIER_PLATFORM_IDS
+    - ATLAS_SELF_PLATFORM_IDS      # constitution rule 3's subject; a STALE value weakens it silently
+    # REQUIRED — the effect universe. Any one missing/malformed ⇒ no plan
+    # edit, no ledger post, no PR.
+    - ATLAS_PLAN_REPO
+    - ATLAS_PLAN_ISSUE
+    - ATLAS_CHANNEL_ID
+    # OPTIONAL — defaulted.
+    - ATLAS_PLAN_BASE_BRANCH       # default `main`; malformed refuses the WHOLE effect config
+    - ATLAS_PLAN_CHECKOUT          # unset ⇒ doc-change PRs disabled (fail closed)
+    - ATLAS_WATCH_INTERVAL_MS      # default 900000 ms, clamped to [60000, 86400000]
+    - ATLAS_STATE_DIR              # default ~/.config/cortex/agents/atlas
+    - ATLAS_AGENT_STATE_DIR        # default ~/.config/metafactory/pkg/repos/agent-state
 
 # Instance state (OPTIONAL) — the memory module.
 #

@@ -124,15 +124,125 @@ state:
   blueprint: agent-state
   version: ">=0.1.0"
 
-# The iteration plan Atlas stewards — WHICH repo/issue is the plan body,
-# resolved stack-side at cortex config-load, never hardcoded here. Defaults
-# documented for operator convenience; an unset value fails soft the same
-# way cortex's own placeholder resolution does for presence.discord below
-# (the plan-steward capability is disabled, the rest of the stack still
-# boots).
+# ── THE ENV CONTRACT ────────────────────────────────────────────────────────
+#
+# Everything from here down to `presence:` names an environment variable
+# Atlas's brain reads at load. Until this block existed, all of them lived
+# ONLY in docstrings — so a deployment could satisfy every visible field and
+# still get a gate that refuses the principal in silence (identity.ts's
+# `gate-unconfigured` returns before any audit or reply path is reached).
+# Fail-closed for effects, fail-open for detectability: the point of writing
+# them down here is the second half.
+#
+# ── What the `__ATLAS_*__` form does and does NOT do ────────────────────────
+# The placeholder form is this pack's DECLARATION convention — the same one
+# the `plan:` block has always used. It is NOT, in these blocks, a cortex
+# resolution site, and that distinction is load-bearing:
+#
+#   - cortex resolves `__ENV__` placeholders in SURFACE fields only — the
+#     presence token plus guildId/agentChannelId/logChannelId/worklogChannelId
+#     (cortex src/common/config/resolve-env-placeholders.ts,
+#     ENV_PLACEHOLDER_PATTERN + DISCORD_ID_FIELDS). `presence.discord` below
+#     is a real resolution site. `plan:`, `gate:` and `watch:` are not.
+#   - the brain is spawned with a MINIMAL env — PATH, HOME, LANG, TMPDIR,
+#     the socket vars, and NOTHING else except the names listed in
+#     `runtime.brain.secrets` (cortex src/brain/exec-brain-runner.ts
+#     `buildEnv`, called from daemon-brain-host.ts). The `hello` handshake
+#     carries persona + agent id only; there is no config channel.
+#
+# CONSEQUENCE, stated plainly so nobody has to rediscover it: exporting these
+# in the cortex daemon's environment is necessary but NOT sufficient. Each
+# name must ALSO appear in `runtime.brain.secrets` above for the brain
+# process to see it. That wiring belongs with the daemon entrypoint
+# (`brain/main.ts`) and its armed/unarmed startup line, which this pack does
+# not yet have — epic #5. This block declares the contract; it does not claim
+# the contract is already wired.
+#
+# ── ATLAS_CHANNEL_ID has TWO independent consumers ──────────────────────────
+# cortex resolves `__ATLAS_CHANNEL_ID__` in `presence.discord.channelId`
+# below (that is a real surface field). That resolution binds the SURFACE.
+# It does not populate `process.env.ATLAS_CHANNEL_ID` inside the brain, which
+# is where effects/config.ts reads it to decide where a ledger post goes. One
+# name, two consumers, two separate wirings.
+
+# The iteration plan Atlas stewards — WHICH repo/issue is the plan body, and
+# where a doc-change PR is built from. Read by brain/effects/config.ts
+# (`loadEffectsConfig`) and brain/gh.ts (`resolvePlanCoordinatesFromEnv`).
+#
+# `repo` and `issue` have NO code default. An unset or malformed value is a
+# named refusal (`missing-plan-repo`, `malformed-plan-repo`,
+# `missing-plan-issue`) that collapses the whole effect config to null: Atlas
+# still intakes, surfaces and ratifies, but cannot edit the plan, post to the
+# ledger, or open a PR. The values below are the INTENDED deployment values,
+# not fallbacks the code supplies.
 plan:
-  repo: __ATLAS_PLAN_REPO__      # resolve-at-install; default: the-metafactory/vision
-  issue: __ATLAS_PLAN_ISSUE__    # resolve-at-install; default: 4
+  repo: __ATLAS_PLAN_REPO__      # REQUIRED. owner/repo. Intended: the-metafactory/vision
+  issue: __ATLAS_PLAN_ISSUE__    # REQUIRED. positive integer. Intended: 4
+  # OPTIONAL. Base branch for doc-change PRs (J6); Atlas never pushes to it
+  # directly. Unset ⇒ `main`. A value that is not a plain branch name is
+  # `malformed-base-branch` — which refuses the ENTIRE effect config, not just
+  # this field, so a typo here disables the ledger too.
+  baseBranch: __ATLAS_PLAN_BASE_BRANCH__
+  # OPTIONAL. Local working checkout of the plan repo, for the doc-change PR
+  # path. Unset ⇒ null ⇒ branch pushes and PR creation are DISABLED (fail
+  # closed: an unset checkout is "Atlas cannot do doc changes here", never
+  # "Atlas guesses a directory"). Every other effect still works.
+  checkout: __ATLAS_PLAN_CHECKOUT__
+
+# The RATIFICATION GATE's identity configuration — the single boundary
+# between arbitrary public input and real effects on a public plan. Read by
+# brain/identity.ts (`loadIdentityConfig`). All three are REQUIRED and none
+# has a default: any one missing, blank, or yielding no usable `platform:id`
+# pair is a named refusal, and a refused config means the gate is NOT ARMED —
+# every RATIFY/DECLINE is ignored, with a single stderr line as the only
+# signal. This is the block a deployment most easily forgets.
+gate:
+  # The principal id whose word ratifies. MUST match a `policy.principals[].id`
+  # in the cortex config. Missing ⇒ `missing-ratifier-principal`. Named but
+  # present in no map entry ⇒ `ratifier-principal-unmapped` (a gate nobody
+  # could satisfy).
+  ratifierPrincipal: __ATLAS_RATIFIER_PRINCIPAL__
+  # That principal's AUTHENTICATED platform ids, as `platform:id` pairs,
+  # comma- or whitespace-separated (e.g. `discord:<snowflake>`). Compared with
+  # `===`; never normalised, never coerced. Yielding no usable pair ⇒
+  # `no-usable-ratifier-platform-ids`.
+  ratifierPlatformIds: __ATLAS_RATIFIER_PLATFORM_IDS__
+  # Atlas's OWN platform ids — the subject of constitution rule 3 ("Atlas can
+  # never ratify Atlas"). Same `platform:id` form. Unset is a HARD failure
+  # (`no-usable-self-platform-ids`), not an empty set: a deployment that has
+  # not told Atlas which identity is its own may not run a gate whose third
+  # rule is "Atlas's own messages can never satisfy it".
+  #
+  # ⚠️ THIS VALUE MUST BE ATLAS'S *CURRENT* IDS. See brain/ratify.ts's header
+  # for the exact three-way split; the short form, which does not overstate it:
+  #
+  #   ENFORCED (structural) — an id listed in BOTH this field and
+  #     ratifierPlatformIds above REFUSES the config at load
+  #     (`self-and-ratifier-platform-ids-overlap`). Not order-dependent, not
+  #     configurable-around: the config does not load at all.
+  #   ENFORCED (ordering, defence in depth) — the self-block runs before the
+  #     principal-map and before the parser, and is re-checked a second time
+  #     in `authorizeRatifierAction` before any transition is authorised.
+  #   NOT ENFORCED, and not enforceable from config — a STALE value. If this
+  #     names an id Atlas no longer posts under while its CURRENT id is a
+  #     legitimate, non-overlapping entry in ratifierPlatformIds, nothing
+  #     static can see it: the config never states Atlas's true current id, so
+  #     there is no disagreement to detect. Rule 3 is then silently weaker
+  #     than it reads. Closing that needs a start-up assertion that the id the
+  #     surface is authenticated as is in this set — a wiring-time check on a
+  #     wiring site (brain/main.ts) this pack does not yet have.
+  #
+  # So: rotate the bot token, re-invite Atlas, or change its application, and
+  # UPDATE THIS FIELD in the same change. A stale entry produces no error.
+  selfPlatformIds: __ATLAS_SELF_PLATFORM_IDS__
+
+# The completion watcher's poll cadence. Read by brain/watch.ts
+# (`resolvePollIntervalMs`). OPTIONAL: unset, non-numeric, or non-positive ⇒
+# 900000 (15 minutes). Any accepted value is CLAMPED to [60000, 86400000] —
+# below a minute is a hammer, above a day is not a watcher — so an
+# out-of-range number is silently corrected rather than refused.
+watch:
+  intervalMs: __ATLAS_WATCH_INTERVAL_MS__
 
 # Discord presence — placeholders ONLY. Every identifier below resolves at
 # cortex config-load from the daemon environment (compass#84 / L2), same
