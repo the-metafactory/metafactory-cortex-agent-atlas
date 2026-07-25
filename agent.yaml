@@ -44,9 +44,62 @@ runtime:
     run: "bun {pack}/brain/main.ts"
     protocol: cortex-brain/v1
     lifecycle: daemon        # long-lived: connect once, serve events
-    secrets: []              # this brain reads no secrets of its own — the
-                             # hybrid voice (compose, below) runs through the
-                             # STACK'S substrate auth, never an API key here
+    # ── `secrets` is cortex's ONLY env passthrough ──────────────────────────
+    #
+    # Atlas holds no CREDENTIAL of its own — no bot token, no API key; the
+    # hybrid voice (compose, below) runs through the STACK'S substrate auth,
+    # and every write leaves through the host effect protocol. Nothing below
+    # is a secret in that sense.
+    #
+    # But `runtime.brain.secrets` is not only a credential list: it is the one
+    # mechanism by which ANY environment variable reaches an exec brain.
+    # cortex spawns the brain with a deliberately minimal env — PATH, HOME,
+    # LANG, TMPDIR, the socket vars, and nothing else (cortex
+    # `src/brain/exec-brain-runner.ts` `buildEnv`, called from
+    # `daemon-brain-host.ts`). The names listed here are read out of the
+    # CORTEX DAEMON'S OWN environment by `collectBrainSecrets`
+    # (`src/runner/brain-consumer-boot.ts`) and injected verbatim; a declared
+    # name that is unset in the daemon env is simply absent (cortex logs it).
+    #
+    # So this list is exactly the env contract `brain/effects/config.ts`,
+    # `brain/identity.ts`, `brain/state.ts`, `brain/watch.ts` and
+    # `brain/reconcile.ts` read. WITHOUT IT, every one of them resolves to
+    # nothing and Atlas boots with a permanently dead ratification gate — the
+    # failure epic #5 names. `brain/main.ts` states the resulting ARMED /
+    # UNARMED verdict in one line at startup, and `brain/wiring.e2e.test.ts`
+    # reads this very list back out of this file, filters an env through
+    # cortex's own `buildEnv` algorithm, and asserts a real `bun
+    # brain/main.ts` comes up ARMED — so a name deleted here fails the suite
+    # rather than the deployment.
+    #
+    # Nothing here collides with cortex's RUNNER_OWNED_ENV_KEYS
+    # (PATH/HOME/LANG/TMPDIR), which the runner throws on.
+    #
+    # An operator who would rather not put Atlas's config into the cortex
+    # daemon's environment has a second, pack-owned route:
+    # `~/.config/metafactory/atlas/.env` (see `brain/env.ts`). It fills only
+    # keys that are ABSENT — anything injected here always wins.
+    secrets:
+      # The ratification gate. All three REQUIRED; any one missing ⇒ UNARMED.
+      - ATLAS_RATIFIER_PRINCIPAL
+      - ATLAS_RATIFIER_PLATFORM_IDS
+      - ATLAS_SELF_PLATFORM_IDS
+      # The effect universe: one repo + issue, one channel. REQUIRED; missing
+      # ⇒ Atlas still intakes/surfaces/ratifies but can perform NO effect.
+      - ATLAS_PLAN_REPO
+      - ATLAS_PLAN_ISSUE
+      - ATLAS_CHANNEL_ID
+      # Optional effect knobs. Unset ⇒ `main` / doc-change PRs disabled.
+      - ATLAS_PLAN_BASE_BRANCH
+      - ATLAS_PLAN_CHECKOUT
+      # Optional cadences. Unset ⇒ 900000 / 21600000, both clamped.
+      - ATLAS_WATCH_INTERVAL_MS
+      - ATLAS_RECONCILE_INTERVAL_MS
+      # Optional durable-state locations. Unset ⇒ the documented defaults.
+      - ATLAS_STATE_DIR
+      - ATLAS_AGENT_STATE_DIR
+      # Optional pointer at the pack-owned overlay file described above.
+      - ATLAS_ENV_FILE
     dispatch_capabilities: []
     maxRestarts: 3
     # Hybrid voice opt-in (cortex#2257): `true` lets this brain's `compose`
