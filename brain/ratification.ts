@@ -167,17 +167,37 @@ export function certificateMatchesStorage(
   cert: RatificationCertificate,
   expectedRatifier: ConfiguredRatifier,
 ): boolean {
-  if (!MINTED.has(cert)) return false;
-  if (!isConfiguredRatifier(expectedRatifier)) return false;
-  const expectedRatifierPrincipalId = expectedRatifier.principalId;
-  if (
-    typeof expectedRatifierPrincipalId !== "string" ||
-    expectedRatifierPrincipalId.length === 0 ||
-    cert.ratifierPrincipalId !== expectedRatifierPrincipalId
-  ) {
-    return false;
-  }
-  const stored = reader.readRatification(cert.workItemId);
+  // The cheap, storage-free checks run FIRST and in this order on purpose: a
+  // forged certificate must not be able to make this function touch the store
+  // at all (a store read is the expensive, throwing, degradation-triggering
+  // part of this call).
+  if (!certificateIsOurs(cert, expectedRatifier)) return false;
+  return certificateMatchesRecord(cert, reader.readRatification(cert.workItemId), expectedRatifier);
+}
+
+/**
+ * `certificateMatchesStorage`, but against a ratification record the CALLER
+ * already holds rather than one read through the port.
+ *
+ * Why this exists (W2c, issue #1): `readRatification` deliberately answers only
+ * for the `ratified` phase — "a ratification is still OUTSTANDING" — so it goes
+ * quiet the moment `markApplied` lands. The `applied → posted` transition needs
+ * to re-verify the very same certificate AFTER that point, against the
+ * ratification note still stored on the applied row. It gets every check this
+ * module offers except the port read it cannot use: the WeakSet identity check,
+ * the configured-ratifier check, and the field-for-field comparison.
+ *
+ * It is NOT a weaker door into `applied`: it authorises no state transition of
+ * its own beyond recording a receipt for an effect that has already happened,
+ * and the effect that matters — the plan edit — went through
+ * `certificateMatchesStorage` twice before it occurred.
+ */
+export function certificateMatchesRecord(
+  cert: RatificationCertificate,
+  stored: StoredRatification | null,
+  expectedRatifier: ConfiguredRatifier,
+): boolean {
+  if (!certificateIsOurs(cert, expectedRatifier)) return false;
   if (stored === null) return false;
   return (
     stored.principal === cert.ratifierPrincipalId &&
@@ -186,6 +206,24 @@ export function certificateMatchesStorage(
     stored.messageId === cert.messageId &&
     stored.displayId === cert.displayId &&
     stored.ts === cert.ratifiedAt
+  );
+}
+
+/**
+ * Module-private: is this a certificate THIS module minted, and does it name
+ * the ratifier the CONFIGURATION expects? Neither question involves storage.
+ */
+function certificateIsOurs(
+  cert: RatificationCertificate,
+  expectedRatifier: ConfiguredRatifier,
+): boolean {
+  if (!MINTED.has(cert)) return false;
+  if (!isConfiguredRatifier(expectedRatifier)) return false;
+  const expectedRatifierPrincipalId = expectedRatifier.principalId;
+  return (
+    typeof expectedRatifierPrincipalId === "string" &&
+    expectedRatifierPrincipalId.length > 0 &&
+    cert.ratifierPrincipalId === expectedRatifierPrincipalId
   );
 }
 

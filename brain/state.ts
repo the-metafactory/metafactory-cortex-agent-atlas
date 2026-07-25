@@ -29,6 +29,14 @@
  *                                 the transition exists here already because
  *                                 it takes a RatificationCertificate and
  *                                 nothing else, see `markApplied`)
+ *   posted     → done           (work_item_posted — W2c/#1; DISAMBIGUATED from
+ *                                 `applied` by the stored `$.posted` receipt,
+ *                                 exactly as `ratified` is disambiguated from
+ *                                 `validated`. `applied` therefore names the
+ *                                 real, expected, recoverable state "the map
+ *                                 changed but the ledger did not", which is
+ *                                 what a failed ledger post PARKS in and what
+ *                                 W3a's reconcile loop goes looking for.)
  *
  * ── The two ways out of `waiting_human` (W2b, issue #3) ─────────────────────
  * A surfaced proposal leaves `waiting_human` through EXACTLY two methods —
@@ -81,6 +89,7 @@ import { join } from "node:path";
 import { isGateAuthority, type ConfiguredRatifier, type GateAuthority } from "./identity";
 import type { ProposalVerb } from "./intake";
 import {
+  certificateMatchesRecord,
   certificateMatchesStorage,
   type RatificationCertificate,
   type StoredRatification,
@@ -247,7 +256,15 @@ export type ProposalPhase =
   | "surfaced"
   | "ratified"
   | "declined"
-  | "applied";
+  | "applied"
+  /**
+   * The plan body was edited AND the ledger entry landed (W2c, issue #1). Like
+   * `ratified`, this phase is READ OFF ITS EVIDENCE — the stored `$.posted`
+   * receipt — not off a flag that happens to accompany it. `applied` therefore
+   * means precisely "the map changed and the ledger has not caught up", which
+   * is exactly the population W3a's reconcile loop must find.
+   */
+  | "posted";
 
 export interface ProposalRecord {
   id: string;
@@ -267,6 +284,26 @@ export interface ProposalRecord {
    * ratification record is absent.
    */
   ratification: StoredRatification | null;
+  /** The plan-body edit's receipt, once `applied`. `null` before that (W2c). */
+  applied: AppliedReceipt | null;
+  /** The ledger post's receipt, once `posted`. `null` before that (W2c). */
+  posted: PostedReceipt | null;
+}
+
+/** The receipt for half (a) of the atomic pair: the plan body was edited. */
+export interface AppliedReceipt {
+  /** GitHub's `updatedAt` for the plan issue after the edit — the body revision. */
+  readonly revision: string;
+  readonly ts: number;
+}
+
+/** The receipt for half (b): the ledger entry landed. */
+export interface PostedReceipt {
+  /** The platform message id of the ledger post. */
+  readonly messageId: string;
+  /** The channel it landed in — recorded so an audit can prove WHERE, not just that. */
+  readonly channelId: string;
+  readonly ts: number;
 }
 
 interface WorkItemRow {
@@ -313,7 +350,11 @@ function warn(msg: string): void {
  * `applied` — this pipeline never produces such a row, and a row that appeared
  * by other means must not be treated as a legitimately applied change.
  */
-function rowPhase(status: string, ratification: StoredRatification | null): ProposalPhase | null {
+function rowPhase(
+  status: string,
+  ratification: StoredRatification | null,
+  posted: PostedReceipt | null,
+): ProposalPhase | null {
   switch (status) {
     case "pending":
       return "intake";
@@ -324,7 +365,12 @@ function rowPhase(status: string, ratification: StoredRatification | null): Prop
     case "failed":
       return "declined";
     case "done":
-      return ratification !== null ? "applied" : null;
+      // Same rule as `ratified` above, one step further along: the phase is the
+      // evidence. A `done` row with a ratification is `applied`; add the ledger
+      // post's receipt and it is `posted`. A `done` row with neither is not a
+      // row this pipeline produced, and is reported as unrecognised.
+      if (ratification === null) return null;
+      return posted !== null ? "posted" : "applied";
     default:
       // 'cancelled' is not reachable from any transition in this pack.
       return null;
@@ -355,6 +401,34 @@ function parseStoredRatification(value: unknown): StoredRatification | null {
   }
   if (typeof ts !== "number" || !Number.isSafeInteger(ts) || ts <= 0) return null;
   return { principal, platform, platformId, messageId, displayId, ts };
+}
+
+/**
+ * Re-validate an `$.applied` receipt read back off disk. Same discipline as
+ * `parseStoredRatification`: it crossed a JSON boundary, so nothing about its
+ * shape is assumed and a malformed receipt is NO receipt.
+ */
+function parseAppliedReceipt(value: unknown): AppliedReceipt | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  const revision = o.revision;
+  const ts = o.ts;
+  if (typeof revision !== "string" || revision.length === 0) return null;
+  if (typeof ts !== "number" || !Number.isSafeInteger(ts) || ts <= 0) return null;
+  return { revision, ts };
+}
+
+/** Re-validate a `$.posted` receipt read back off disk. See above. */
+function parsePostedReceipt(value: unknown): PostedReceipt | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  const messageId = o.message_id;
+  const channelId = o.channel_id;
+  const ts = o.ts;
+  if (typeof messageId !== "string" || messageId.length === 0) return null;
+  if (typeof channelId !== "string" || channelId.length === 0) return null;
+  if (typeof ts !== "number" || !Number.isSafeInteger(ts) || ts <= 0) return null;
+  return { messageId, channelId, ts };
 }
 
 /**
@@ -419,7 +493,9 @@ function notesToObject(notes: string | null): Record<string, unknown> {
 function rowToRecord(row: WorkItemRow): ProposalRecord | null {
   const notesEarly = notesToObject(row.notes);
   const ratification = parseStoredRatification(notesEarly.ratification);
-  const phase = rowPhase(row.status, ratification);
+  const applied = parseAppliedReceipt(notesEarly.applied);
+  const posted = parsePostedReceipt(notesEarly.posted);
+  const phase = rowPhase(row.status, ratification, posted);
   if (phase === null) return null;
   let payload: Record<string, unknown>;
   try {
@@ -445,7 +521,19 @@ function rowToRecord(row: WorkItemRow): ProposalRecord | null {
   const displayIdRaw = notesEarly.display_id;
   const displayId =
     typeof displayIdRaw === "number" && Number.isFinite(displayIdRaw) ? displayIdRaw : null;
-  return { id: row.id, phase, verb, url, section, why, proposer, displayId, ratification };
+  return {
+    id: row.id,
+    phase,
+    verb,
+    url,
+    section,
+    why,
+    proposer,
+    displayId,
+    ratification,
+    applied,
+    posted,
+  };
 }
 
 /**
@@ -983,7 +1071,20 @@ export class AtlasStateStore {
    * The effects themselves are W2c's; this transition exists here so that
    * W2c is BORN unable to express "apply without ratification".
    */
-  markApplied(cert: RatificationCertificate, expectedRatifier: ConfiguredRatifier): boolean {
+  markApplied(
+    cert: RatificationCertificate,
+    expectedRatifier: ConfiguredRatifier,
+    /**
+     * The plan-body revision this apply produced (W2c). Positional with a
+     * `null` default rather than an optional property, so existing callers are
+     * untouched and `exactOptionalPropertyTypes` has nothing to complain about.
+     * A receipt is not required for the TRANSITION to be legitimate — the
+     * certificate is what authorises it — but an apply that records no
+     * revision is an apply W3a's reconcile cannot check against the map, so
+     * every real caller passes one.
+     */
+    receipt: AppliedReceipt | null = null,
+  ): boolean {
     const capId = boundedKey(cert.workItemId);
     const ts = Date.now();
     // The whole check-then-act inside one transaction. `markRatified` already
@@ -996,6 +1097,19 @@ export class AtlasStateStore {
       this.db
         .query(`UPDATE work_items SET status = 'done', updated_at = ? WHERE id = ?`)
         .run(ts, capId);
+      if (receipt !== null) {
+        const notes = notesToObject(row.notes);
+        this.db
+          .query(`UPDATE work_items SET notes = ?, updated_at = ? WHERE id = ?`)
+          .run(
+            JSON.stringify({
+              ...notes,
+              applied: { revision: cap(receipt.revision, 128), ts },
+            }),
+            ts,
+            capId,
+          );
+      }
       this.appendEvent(
         "work_item_resolved",
         capId,
@@ -1006,12 +1120,128 @@ export class AtlasStateStore {
           // it must not register as one in the replay index. The ratifying
           // message is recorded here purely as an audit backlink.
           ratified_message_id: cert.messageId,
+          plan_revision: receipt === null ? null : cap(receipt.revision, 128),
         },
         ts,
       );
       this.regenDashboard();
       return true;
     })();
+  }
+
+  /**
+   * Phase `posted`: applied (done + ratification) → done + the ledger receipt.
+   *
+   * The second half of J3's atomic pair, recorded AFTER the fact — this method
+   * causes no effect, it records that one already happened, so that the
+   * "applied but never posted" population (the one W3a's reconcile loop exists
+   * to find and the one issue #1 requires an apply to PARK in) is a state Atlas
+   * can actually see rather than infer.
+   *
+   * It is still guarded, and guarded the same way everything on this path is
+   * (issue #7's lesson: an unguarded public transition is a transition, however
+   * innocuous it looks). It takes ONLY a certificate — no work-item-id
+   * overload — plus the CONFIGURED ratifier, and re-verifies both against the
+   * ratification note still stored on the applied row via
+   * `certificateMatchesRecord`. `certificateMatchesStorage` cannot be used
+   * here: `readRatification` deliberately answers for `in_flight` only, so it
+   * goes quiet the moment `markApplied` lands.
+   *
+   * Returns `false` — never throws, never overwrites — when the row is not
+   * `done`, when the certificate does not match, or when a posted receipt is
+   * ALREADY recorded. Constitution rule 4: a ledger receipt is written once and
+   * never edited; a correction is a new post, not a rewritten one.
+   */
+  markPosted(
+    cert: RatificationCertificate,
+    expectedRatifier: ConfiguredRatifier,
+    receipt: PostedReceipt,
+  ): boolean {
+    if (
+      receipt === null ||
+      typeof receipt !== "object" ||
+      typeof receipt.messageId !== "string" ||
+      receipt.messageId.length === 0 ||
+      typeof receipt.channelId !== "string" ||
+      receipt.channelId.length === 0
+    ) {
+      return false;
+    }
+    const capId = boundedKey(cert.workItemId);
+    const ts = Date.now();
+    return this.db.transaction((): boolean => {
+      const row = this.getRow(capId);
+      if (row === null || row.status !== "done") return false;
+      const notes = notesToObject(row.notes);
+      if (parsePostedReceipt(notes.posted) !== null) return false; // never rewritten
+      const stored = parseStoredRatification(notes.ratification);
+      if (!certificateMatchesRecord(cert, stored, expectedRatifier)) return false;
+      this.db
+        .query(`UPDATE work_items SET notes = ?, updated_at = ? WHERE id = ?`)
+        .run(
+          JSON.stringify({
+            ...notes,
+            posted: {
+              message_id: cap(receipt.messageId, MAX_ID_LEN),
+              channel_id: cap(receipt.channelId, MAX_ID_LEN),
+              ts,
+            },
+          }),
+          ts,
+          capId,
+        );
+      this.appendEvent(
+        "work_item_posted",
+        capId,
+        {
+          status: "done",
+          message_id: cap(receipt.messageId, MAX_ID_LEN),
+          channel_id: cap(receipt.channelId, MAX_ID_LEN),
+        },
+        ts,
+      );
+      this.regenDashboard();
+      return true;
+    })();
+  }
+
+  // ── W2c, the completion watcher (issue #1, J4) ───────────────────────────
+
+  /**
+   * Has a ✅ for this issue URL already gone out?
+   *
+   * DURABLE by design: an in-process set would re-announce every closed plan
+   * item after a restart, and the ledger's whole value is that it can be
+   * trusted backwards. The event type is deliberately NOT one of
+   * `GATE_EVENT_TYPES`, so a completion record can never burn a gate replay
+   * key — the same separation the gate's own type filter exists to enforce.
+   */
+  hasAnnouncedCompletion(issueUrl: string): boolean {
+    const key = boundedKey(cap(issueUrl, 300));
+    if (key.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type = 'completion_announced'
+            AND ${jsonField("payload", "$.issue_url")} = ?
+          LIMIT 1`,
+      )
+      .get(key);
+    return row !== null && row !== undefined;
+  }
+
+  /** Record that a ✅ carrying this issue URL landed. Append-only; never updated. */
+  recordCompletionAnnounced(issueUrl: string, messageId: string): void {
+    const key = boundedKey(cap(issueUrl, 300));
+    if (key.length === 0) return;
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(
+        Date.now(),
+        "completion_announced",
+        OWNER,
+        JSON.stringify({ issue_url: key, message_id: cap(messageId, MAX_ID_LEN) }),
+      );
   }
 
   /**
@@ -1187,6 +1417,8 @@ class MemoryProposals {
       proposer,
       displayId: null,
       ratification: null,
+      applied: null,
+      posted: null,
     });
   }
 
@@ -1265,6 +1497,28 @@ class MemoryProposals {
   /** Always `false`: unreachable in practice (no certificate can exist for a memory row). */
   markApplied(): boolean {
     return false;
+  }
+
+  /** Always `false`: a receipt this store cannot keep is a receipt it must not claim. */
+  markPosted(): boolean {
+    return false;
+  }
+
+  /**
+   * Always `true` — and note which way round that is. This method answers "may
+   * I skip announcing?", so the FAIL-CLOSED answer is "yes, treat it as already
+   * announced". `false` would authorise a ✅ post whose announcement this store
+   * cannot record, and the next pass would post it again, and the next: an
+   * effect loop driven by the absence of durability. (`watch.ts` also refuses
+   * to run at all while the store is degraded; this is the second lock.)
+   */
+  hasAnnouncedCompletion(): boolean {
+    return true;
+  }
+
+  /** Nothing durable to record — see `recordGateEvent` above. */
+  recordCompletionAnnounced(): void {
+    // deliberately empty; degraded mode records nothing.
   }
 
   recordGateEvent(): void {
@@ -1465,10 +1719,42 @@ export class AtlasProposals {
   }
 
   /** See `AtlasStateStore.markApplied` — the certificate-only apply transition. */
-  markApplied(cert: RatificationCertificate, expectedRatifier: ConfiguredRatifier): boolean {
+  markApplied(
+    cert: RatificationCertificate,
+    expectedRatifier: ConfiguredRatifier,
+    receipt: AppliedReceipt | null = null,
+  ): boolean {
     return this.run(
-      (db) => db.markApplied(cert, expectedRatifier),
+      (db) => db.markApplied(cert, expectedRatifier, receipt),
       (m) => m.markApplied(),
+    );
+  }
+
+  /** See `AtlasStateStore.markPosted` — the certificate-only ledger-receipt transition. */
+  markPosted(
+    cert: RatificationCertificate,
+    expectedRatifier: ConfiguredRatifier,
+    receipt: PostedReceipt,
+  ): boolean {
+    return this.run(
+      (db) => db.markPosted(cert, expectedRatifier, receipt),
+      (m) => m.markPosted(),
+    );
+  }
+
+  /** See `AtlasStateStore.hasAnnouncedCompletion`. Degraded mode answers `true` (fail closed). */
+  hasAnnouncedCompletion(issueUrl: string): boolean {
+    return this.run(
+      (db) => db.hasAnnouncedCompletion(issueUrl),
+      (m) => m.hasAnnouncedCompletion(),
+    );
+  }
+
+  /** See `AtlasStateStore.recordCompletionAnnounced`. */
+  recordCompletionAnnounced(issueUrl: string, messageId: string): void {
+    this.run(
+      (db) => db.recordCompletionAnnounced(issueUrl, messageId),
+      (m) => m.recordCompletionAnnounced(),
     );
   }
 
