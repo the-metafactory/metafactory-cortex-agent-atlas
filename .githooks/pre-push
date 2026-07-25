@@ -16,7 +16,13 @@
 # gate.
 set -euo pipefail
 
-COMPASS_GATE="${COMPASS_GATE:-$HOME/Developer/compass/tools/gate-local.ts}"
+# Stable main-tracking worktree FIRST. A working checkout can sit on any
+# branch, and the scanner's behaviour must not depend on which one — a stale
+# branch there produced false BLOCKs from an older placeholder rule, on a test
+# whose own purpose was that same protection (compass#147).
+_default_gate="$HOME/.config/metafactory/compass-main/tools/gate-local.ts"
+[ -f "$_default_gate" ] || _default_gate="$HOME/Developer/compass/tools/gate-local.ts"
+COMPASS_GATE="${COMPASS_GATE:-$_default_gate}"
 
 if [ ! -f "$COMPASS_GATE" ]; then
   echo "pre-push: BLOCKED — confidentiality scanner not found at $COMPASS_GATE" >&2
