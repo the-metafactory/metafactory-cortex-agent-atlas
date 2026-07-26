@@ -370,7 +370,32 @@ presence:
     enabled: true
     token: __ATLAS_BOT_TOKEN__              # resolved at cortex load
     guildId: __ATLAS_GUILD_ID__             # resolve-at-install
-    channelId: __ATLAS_CHANNEL_ID__         # the #iteration-plan channel Atlas is bound to
+    # THE FIELD NAME IS `agentChannelId`, not `channelId`. cortex's
+    # `DiscordPresenceSchema` (src/common/types/cortex-config.ts) has no
+    # `channelId` member at all — zod drops the unknown key — and
+    # `agentChannelId` is also the only spelling cortex's placeholder resolver
+    # recognises (`resolve-env-placeholders.ts` DISCORD_ID_FIELDS = token,
+    # guildId, agentChannelId, logChannelId). So under the old spelling
+    # `__ATLAS_CHANNEL_ID__` was never resolved and this agent was never bound
+    # to #iteration-plan. Same env var, same intent, the field cortex reads —
+    # matching escort's own agents.d fragment.
+    #
+    # WHAT THE OLD SPELLING ACTUALLY DID depends on cortex's zod, and both
+    # outcomes are broken — measured, not assumed:
+    #   - zod 4.3.6 (what cortex declares AND has installed today): the schema
+    #     PASSES. `agentChannelId: z.coerce.string().min(1)` coerces the absent
+    #     value to the literal string "undefined", so the surface came up bound
+    #     to a channel named "undefined" — silently.
+    #   - zod 4.4.3 (inside cortex's own `^4.3.6` range, so one `bun install`
+    #     away): the object-level optionality check runs first and it FAILS
+    #     with `invalid_type / expected nonoptional`, i.e. a loud config-load
+    #     error instead.
+    # Silent misbinding today, hard failure after a routine dependency bump.
+    #
+    # It is ALSO the thread parent: cortex derives `create_private_thread`'s
+    # channel from exactly this field (cortex#2206), so anything that wants a
+    # thread needs this fixed first.
+    agentChannelId: __ATLAS_CHANNEL_ID__    # the #iteration-plan channel Atlas is bound to
     dmOwner: false                          # Atlas never claims DMs
     contextDepth: 10
     surfaceSubjects: []                     # no raw envelope surface
