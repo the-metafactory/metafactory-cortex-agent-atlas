@@ -32,7 +32,19 @@ const PLAN_BODY = [
   "",
 ].join("\n");
 
-const ENV_BASE = { ATLAS_PLAN_REPO: "acme/widgets", ATLAS_PLAN_ISSUE: "4" };
+// `ATLAS_ENV_FILE` is pinned to a path that cannot exist so NO test in this
+// file can read the principal's real overlay (`~/.config/metafactory/atlas/.env`).
+// Without it these tests inherit whatever the developer's own deployment
+// configures: on a machine with Atlas actually installed, the "--live without a
+// resolvable plan" case silently RESOLVED a plan from the real file and stopped
+// asserting anything. CI never saw it — there is no such file there — so the
+// suite was green everywhere except the one place it mattered.
+const ISOLATED_ENV_FILE = join(tmpdir(), "atlas-status-cli-no-such-overlay.env");
+const ENV_BASE = {
+  ATLAS_PLAN_REPO: "acme/widgets",
+  ATLAS_PLAN_ISSUE: "4",
+  ATLAS_ENV_FILE: ISOLATED_ENV_FILE,
+};
 
 function seededDir(): { dir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "atlas-status-cli-test-"));
@@ -154,7 +166,7 @@ describe("--live — divergence via an injected fake reader, never a network cal
   test("--live without a resolvable plan repo/issue refuses rather than silently skipping the check", async () => {
     const { dir, cleanup } = seededDir();
     try {
-      const result = await runAtlasStatus(["--live"], { ATLAS_STATE_DIR: dir }, Date.now());
+      const result = await runAtlasStatus(["--live"], { ATLAS_STATE_DIR: dir, ATLAS_ENV_FILE: ISOLATED_ENV_FILE }, Date.now());
       expect(result.exitCode).not.toBe(0);
       expect(result.output).toContain("--live requires");
     } finally {
