@@ -98,6 +98,7 @@ capabilities:
     - ATLAS_PLAN_REPO
     - ATLAS_PLAN_ISSUE
     - ATLAS_CHANNEL_ID
+    - ATLAS_TRUSTED_ADAPTER_INSTANCES  # atlas#24 — the second admission check; missing ⇒ Atlas admits no message
     # OPTIONAL — defaulted.
     - ATLAS_PLAN_BASE_BRANCH       # default `main`; malformed refuses the WHOLE effect config
     - ATLAS_PLAN_CHECKOUT          # unset ⇒ doc-change PRs disabled (fail closed)

@@ -44,17 +44,75 @@ export const V = 1 as const;
 // ── Cortex → brain events ───────────────────────────────────────────────────
 
 /**
- * Where a task originated. HOST-AUTHORITATIVE in every field: `user` is the
- * platform-AUTHENTICATED author id (cortex's `buildBrainTaskPayload` sets it
- * from `InboundMessage.authorId`), and `channel` is the parent channel id (a
- * threaded message carries the thread separately in `thread`). Atlas's whole
- * trust root is `surface` + `user` — see `ratify.ts`'s file header.
+ * Where a task originated. This block is the CANONICAL statement of what each
+ * field actually is — atlas#22, atlas#24 and atlas#25 all found a prior
+ * version of it overstating that, and all three now point HERE rather than
+ * asserting their own paraphrase. Two things changed from the original claim
+ * ("HOST-AUTHORITATIVE in every field") and both matter to how this brain
+ * treats `source`.
+ *
+ * ── `channel` is NOT a parent channel id (atlas#22) ─────────────────────────
+ * The original comment claimed "a threaded message carries the thread
+ * separately in `thread`", implying `channel` stays the parent. That is false
+ * for the shipped adapter: `metafactory-cortex-adapter-discord/src/index.ts`
+ * sets `channelId: channel.id` where `channel = message.channel` — for a
+ * message posted IN A THREAD, `channel.id` is the THREAD's own snowflake, and
+ * cortex passes it straight through as `source.channel`
+ * (`buildBrainTaskPayload`/`deriveTaskSource` set `thread` to the SAME value).
+ * So today there is NO parent-channel signal on the wire at all: `channel` and
+ * `thread` are the same id whenever the message came from a thread, and a
+ * consumer that needs "is this the bound channel OR a thread under it" cannot
+ * answer that from this event — it would need a reliable parent signal the
+ * adapter does not currently send. This repo's own admission check
+ * (`runtime.ts`) treats `channel` as an opaque, exact-match id for that reason:
+ * it admits the ONE configured channel and nothing a thread under it, which is
+ * a real behavioural consequence of the fact stated here, not a choice made
+ * assuming otherwise.
+ *
+ * ── "HOST-AUTHORITATIVE" describes cortex's INTENT, not a wire guarantee
+ *    (atlas#24) ──────────────────────────────────────────────────────────────
+ * On the path this protocol was DESIGNED around — a real inbound surface
+ * message — every field here does come from authenticated platform data:
+ * cortex's `dispatchInboundToBrain` builds the task from an `InboundMessage`
+ * (`user` ← `authorId`, `surface` ← `platform`, `channel`/`thread` ← the
+ * adapter's own ids, `adapter_instance` ← the live adapter connection's own
+ * `instanceId`), and publishes it onto the `brain.>` subject family this
+ * brain's `task` events arrive on.
+ *
+ * But nothing downstream of that publish re-checks WHERE a `task` event on
+ * that subject actually came from. Verified directly against cortex: the
+ * consumer that turns a bus envelope into this exact shape
+ * (`deriveTaskSource`, `src/bus/brain-consumer.ts`) reads
+ * `payload.response_routing`/`payload.user` VERBATIM off whatever envelope it
+ * is handed, with no check on who published it, and the daemon's own bus
+ * credential for that subject is minted with no narrower `pub` scope
+ * (cortex's `network-make-live-adapters.ts` → arc's `nats add-bot`, no
+ * `--pub`/`--sub`) — nor does any account-level default restrict a second bot
+ * under the same agents account. So a `task` event carrying this shape is, on
+ * the wire, exactly as trustworthy as "some bus-authenticated publisher chose
+ * to send it" — no more.
+ *
+ * Consequence for THIS brain: `surface`/`channel`/`user` are treated as
+ * ADMITTED-BY-CONFIG, never as self-authenticating — see `runtime.ts`'s
+ * `serveTask` (channel admission) and `effects/config.ts` (the
+ * `trustedAdapterInstances` check on `adapter_instance`, atlas#24). Neither
+ * check is cryptographic; both are the deployment saying, in config, which
+ * channel and which adapter connection it will act on. The open question
+ * neither check can close — whether NATS subject permissions restrict who can
+ * publish onto `brain.>` at all — is a bus/deployment question outside this
+ * repo, recorded rather than assumed (see atlas#24's disposition).
  */
 export interface TaskSource {
   surface: string;
   channel: string;
   thread: string;
   user: string;
+  /**
+   * Set by cortex only on a genuine live-surface task (the real adapter
+   * connection's own `instanceId`) — absent is normal for anything else that
+   * could reach this subject. NOT independently authenticated on the wire (see
+   * above): this brain's own admission check is what gives it meaning.
+   */
   adapter_instance?: string;
 }
 
