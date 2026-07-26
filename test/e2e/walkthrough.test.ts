@@ -598,7 +598,16 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
         throw new Error(
           `the first reconcile after a clean live run found drift (${first.kind}):\n    ${detail}\n` +
             `  revisions Atlas recorded: ${observed}\n` +
-            `  revision GitHub reports now: ${live?.revisedAt ?? "(unreadable)"}`,
+            `  revision GitHub reports now: ${live?.revisedAt ?? "(unreadable)"}\n` +
+            `\n` +
+            `  KNOWN DEFECT — atlas#26. This currently FAILS, and the failure is the finding.\n` +
+            `  Drift is keyed on GitHub's issue \`updatedAt\`, which advances on comments and\n` +
+            `  cross-references, not only on body edits. The whole walkthrough makes exactly\n` +
+            `  TWO body edits (the seed, and Atlas's one ratified apply — asserted exactly in\n` +
+            `  DoD 3+4), so a longer list of "revisions recorded" than that is the bug\n` +
+            `  reproducing, not a flake. The unit suite cannot catch it: the fake plan writer\n` +
+            `  bumps revisedAt only on write (brain/test-support.ts), which is precisely the\n` +
+            `  property GitHub lacks. Remove this note when atlas#26 lands.`,
         );
       }
       expect(second.kind).toBe("clean");
