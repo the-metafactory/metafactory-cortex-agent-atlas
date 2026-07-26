@@ -347,6 +347,32 @@ describe("admission is config-pinned", () => {
     expect(runtime.stats.notAdmitted).toBe(1);
   });
 
+  // atlas#24 M3 (adversarial review) — `runtime.ts`'s admission check must
+  // fail closed on an empty adapter instance ON ITS OWN, not because
+  // `effects/config.ts` happens to never let `trustedAdapterInstances`
+  // contain `""`. This test breaks that invariant DELIBERATELY — a hand-built
+  // `EffectsConfig` (bypassing `makeEffectsConfig` entirely, the way a config
+  // bug or a future refactor could) whose trusted set explicitly contains the
+  // empty string — and proves the runtime still refuses a task with no
+  // `adapter_instance`. If `runtime.ts` ever regresses to relying solely on
+  // `trustedAdapterInstances.has(adapterInstance)`, this is the test that
+  // catches it, independent of whatever `effects/config.ts` does or doesn't
+  // guarantee.
+  test("an empty adapter_instance is refused even if the trusted set contains '' (M3)", async () => {
+    const brokenLayer: EffectLayer = {
+      ...layer,
+      effects: { ...effects, trustedAdapterInstances: new Set(["", ADAPTER_INSTANCE_ID]) },
+    };
+    const runtime = makeRuntime({ effectLayer: brokenLayer });
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    sent.length = 0;
+    await serve(runtime, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, CHANNEL_ID, null));
+    expect(posts()).toHaveLength(0);
+    expect(repo.body).not.toContain(NEW_URL);
+    expect(runtime.stats.ratified).toBe(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+  });
+
   test("with no effect layer nothing is admitted and nothing is recorded", async () => {
     const runtime = makeRuntime({ effectLayer: null });
     await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));

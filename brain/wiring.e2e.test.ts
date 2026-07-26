@@ -438,28 +438,36 @@ afterEach(async () => {
 
 // ── The declaration itself ──────────────────────────────────────────────────
 
+/**
+ * Exactly the names read by effects/config.ts, identity.ts, state.ts,
+ * watch.ts, reconcile.ts and env.ts. Without the `agent.yaml` declaration,
+ * cortex's minimal env means every one of them is undefined in the brain
+ * process — and without a README mention, an operator provisioning from the
+ * docs has no way to know a name exists at all (atlas#24 B2: this happened
+ * for `ATLAS_TRUSTED_ADAPTER_INSTANCES`, which shipped in code and in
+ * `agent.yaml` but not in the operator-facing README).
+ */
+const REQUIRED_ENV_NAMES = [
+  "ATLAS_RATIFIER_PRINCIPAL",
+  "ATLAS_RATIFIER_PLATFORM_IDS",
+  "ATLAS_SELF_PLATFORM_IDS",
+  "ATLAS_PLAN_REPO",
+  "ATLAS_PLAN_ISSUE",
+  "ATLAS_CHANNEL_ID",
+  "ATLAS_TRUSTED_ADAPTER_INSTANCES",
+  "ATLAS_PLAN_BASE_BRANCH",
+  "ATLAS_PLAN_CHECKOUT",
+  "ATLAS_WATCH_INTERVAL_MS",
+  "ATLAS_RECONCILE_INTERVAL_MS",
+  "ATLAS_STATE_DIR",
+  "ATLAS_AGENT_STATE_DIR",
+  "ATLAS_ENV_FILE",
+];
+
 describe("agent.yaml declares the env contract", () => {
   test("every name the brain reads is declared under runtime.brain.secrets", () => {
     const declared = new Set(declaredSecrets());
-    // Exactly the names read by effects/config.ts, identity.ts, state.ts,
-    // watch.ts, reconcile.ts and env.ts. Without the declaration, cortex's
-    // minimal env means every one of them is undefined in the brain process.
-    for (const required of [
-      "ATLAS_RATIFIER_PRINCIPAL",
-      "ATLAS_RATIFIER_PLATFORM_IDS",
-      "ATLAS_SELF_PLATFORM_IDS",
-      "ATLAS_PLAN_REPO",
-      "ATLAS_PLAN_ISSUE",
-      "ATLAS_CHANNEL_ID",
-      "ATLAS_TRUSTED_ADAPTER_INSTANCES",
-      "ATLAS_PLAN_BASE_BRANCH",
-      "ATLAS_PLAN_CHECKOUT",
-      "ATLAS_WATCH_INTERVAL_MS",
-      "ATLAS_RECONCILE_INTERVAL_MS",
-      "ATLAS_STATE_DIR",
-      "ATLAS_AGENT_STATE_DIR",
-      "ATLAS_ENV_FILE",
-    ]) {
+    for (const required of REQUIRED_ENV_NAMES) {
       expect(declared).toContain(required);
     }
   });
@@ -469,6 +477,30 @@ describe("agent.yaml declares the env contract", () => {
     // boot rather than at first use.
     for (const name of declaredSecrets()) {
       expect(RUNNER_OWNED_ENV_KEYS.has(name.toUpperCase())).toBe(false);
+    }
+  });
+});
+
+describe("README declares the env contract too (atlas#24 B2)", () => {
+  // Pins the OPERATOR-facing doc against the same list `agent.yaml`'s
+  // declaration is checked against above, so a name added to the code and to
+  // `agent.yaml` without also touching README fails HERE instead of shipping
+  // deaf a second time. Every REQUIRED name (the ratification gate and the
+  // effect universe) must be mentioned; the optional/defaulted ones are
+  // documented too today but are not load-bearing for this guard.
+  test("every REQUIRED env var name is mentioned in README.md", () => {
+    const readme = readFileSync(join(PACK_ROOT, "README.md"), "utf8");
+    const REQUIRED_FOR_README = [
+      "ATLAS_RATIFIER_PRINCIPAL",
+      "ATLAS_RATIFIER_PLATFORM_IDS",
+      "ATLAS_SELF_PLATFORM_IDS",
+      "ATLAS_PLAN_REPO",
+      "ATLAS_PLAN_ISSUE",
+      "ATLAS_CHANNEL_ID",
+      "ATLAS_TRUSTED_ADAPTER_INSTANCES",
+    ];
+    for (const name of REQUIRED_FOR_README) {
+      expect(readme).toContain(name);
     }
   });
 });

@@ -55,10 +55,10 @@ describe("loadEffectsConfig", () => {
   });
 
   describe("trustedAdapterInstances (atlas#24)", () => {
-    test("accepts multiple comma/whitespace-separated ids", () => {
+    test("accepts multiple COMMA-separated ids, trimmed", () => {
       const loaded = loadEffectsConfig({
         ...OK,
-        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:one, discord:two\tdiscord:three",
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:one, discord:two , discord:three",
       });
       if (loaded.kind !== "ok") throw new Error(`expected ok, got ${loaded.reason}`);
       expect(loaded.config.trustedAdapterInstances.has("discord:one")).toBe(true);
@@ -80,6 +80,71 @@ describe("loadEffectsConfig", () => {
       expect(refusalFor({ ...OK, ATLAS_TRUSTED_ADAPTER_INSTANCES: " , , " })).toBe(
         "missing-adapter-instances",
       );
+    });
+
+    // atlas#24 M4 — an adversarial review found that splitting on whitespace
+    // AS WELL AS commas silently WIDENED the trusted set: a copy-paste error
+    // that put a stray space or tab inside one intended id turned it into TWO
+    // trusted ids, neither of which the operator wrote. Comma is now the ONLY
+    // separator, so a value like this stays ONE token and is refused as
+    // malformed — it never matches anything, but it also never silently
+    // widens the set into believing it configured two instances.
+    test("whitespace alone (no comma) does NOT split — stays one token, refused as malformed", () => {
+      const reason = refusalFor({
+        ...OK,
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:one\tdiscord:two",
+      });
+      expect(reason).toBe("malformed-adapter-instance");
+    });
+
+    test("a space inside one entry is refused, not silently accepted or split", () => {
+      const reason = refusalFor({
+        ...OK,
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:my guild",
+      });
+      expect(reason).toBe("malformed-adapter-instance");
+    });
+
+    test("an over-long token is refused (length bound, same posture as CHANNEL_ID_RE)", () => {
+      const reason = refusalFor({
+        ...OK,
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: `discord:${"x".repeat(200)}`,
+      });
+      expect(reason).toBe("malformed-adapter-instance");
+    });
+
+    test("a token starting with a non-alphanumeric character is refused (atlas#24 N1)", () => {
+      // The installer-placeholder shape (`__NAME__`) always starts with `_`,
+      // so requiring the first character be alphanumeric structurally excludes
+      // it — see the dedicated placeholder test below for the literal case.
+      expect(refusalFor({ ...OK, ATLAS_TRUSTED_ADAPTER_INSTANCES: "_leading-underscore" })).toBe(
+        "malformed-adapter-instance",
+      );
+    });
+
+    test("an unresolved installer placeholder is refused, not treated as a trusted id (atlas#24 N1)", () => {
+      // `__ATLAS_TRUSTED_ADAPTER_INSTANCES__` is what agent.yaml ships. Before
+      // this guard it would parse as one (weird-looking but non-blank) token
+      // and be ACCEPTED — a deployment that never resolved the placeholder
+      // would boot GATE ARMED and reject 100% of live traffic, silently.
+      expect(
+        refusalFor({
+          ...OK,
+          ATLAS_TRUSTED_ADAPTER_INSTANCES: "__ATLAS_TRUSTED_ADAPTER_INSTANCES__",
+        }),
+      ).toBe("malformed-adapter-instance");
+    });
+
+    test("a mix of one valid and one malformed token refuses the WHOLE config", () => {
+      // Not "keep the good one and drop the bad one" — a partially-malformed
+      // value is exactly the shape of an operator's typo, and admitting
+      // whatever parsed cleanly would silently narrow (or on a different typo,
+      // widen) the trusted set from what they intended.
+      const reason = refusalFor({
+        ...OK,
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:good-one,discord:bad one",
+      });
+      expect(reason).toBe("malformed-adapter-instance");
     });
   });
 

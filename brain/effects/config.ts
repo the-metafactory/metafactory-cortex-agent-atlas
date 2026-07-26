@@ -52,21 +52,71 @@
  * `runtime.ts`'s `serveTask` refuses (config-pinned admission, same disposition
  * as a wrong channel) any task whose `source.adapter_instance` is absent or is
  * not a MEMBER of this set — compared with `===`, never normalised, exactly
- * like `channelId`. A deployment sets it to the same value cortex's own
- * `PlatformAdapter.instanceId` resolves to for Atlas's bound surface
- * (`{platform}:{demuxKey}`, e.g. `discord:<guildId>` — see cortex's
- * `src/adapters/registry.ts`), copied here independently rather than derived
- * from cortex's internal formula, so a future change to that formula fails
- * LOUD (a live message no longer admits) rather than silently trusting the
- * wrong instance.
+ * like `channelId`.
  *
- * This is defence in depth, not a cryptographic guarantee: `adapter_instance`
- * is a deployment-known identifier, not a secret, so this check closes the
- * "trivially forged/replayed envelope" gap (the wire's own e2e fixture used to
- * omit the field entirely and still be admitted) without claiming to close the
- * deeper one — an attacker who can ALSO discover the exact instance id AND get
- * a credential onto the bus's agents account. That deeper gap is a NATS
- * subject-permission / account-isolation question for arc/cortex, out of this
+ * ── There is NOT one formula for the expected value — there are THREE
+ *    (found in adversarial review, atlas#24 B1) ─────────────────────────────
+ * `cortex.PlatformAdapter.instanceId` resolves differently depending on the
+ * cortex TOPOLOGY Atlas is deployed under, verified against cortex directly:
+ *
+ *   1. Per-stack (regular, non-gateway) boot — `src/runner/surface-adapter-
+ *      boot.ts`: `instance.instanceId ?? \`${agent.name}-discord-${guildId}\``.
+ *      For Atlas that is `atlas-discord-<guildId>`. `src/cortex.ts`'s boot
+ *      assertion (gatewayAdapterInstanceCollisions) THROWS if a per-stack
+ *      adapter's instanceId collides with the gateway's own `{platform}:
+ *      {demuxKey}` form — so on THIS topology, the `discord:<guildId>` form
+ *      below is not just wrong, it is a shape cortex itself forbids here.
+ *   2. Gateway, one bot token shared across multiple guilds — cortex's
+ *      Discord adapter's token-grouping (`groupDiscordBindingsByToken`):
+ *      `discord:token:<sha256(token, stack)[0:12]>`. A 48-bit digest of a
+ *      SECRET (the bot token) — this is the one form that is genuinely hard
+ *      to derive from public information, and the one to prefer if the
+ *      topology offers it.
+ *   3. Gateway, exactly one guild per bot token — same grouping function's
+ *      single-guild fallback: `discord:<guildId>`.
+ *
+ * A deployment must know which of the three applies — guessing wrong is
+ * SILENT (see `runtime.ts`'s header and `startup.ts`: the trusted set now
+ * appears in the ARMED line specifically so a mismatch is a visible, not a
+ * per-message-stderr, fact). The reliable way to determine it: read the real
+ * `adapter_instance` off ONE genuine live inbound task (a log line, or a
+ * temporary debug tap) rather than computing the formula by hand — this pack
+ * does not know, and cannot know from its own config, which topology the
+ * deployment runs under.
+ *
+ * ── What this control ACTUALLY buys, stated precisely (M1, atlas#24) ───────
+ * `deriveTaskSource` (cortex `src/bus/brain-consumer.ts`) reads
+ * `adapter_instance` out of the SAME attacker-controlled
+ * `payload.response_routing` it reads `channel` from — so this is NOT a
+ * secret-based control for shapes 1 and 3 above: shape 3's guild id is
+ * visible to every member of the guild, and a forger who already had to know
+ * `ATLAS_CHANNEL_ID` (a snowflake in that SAME guild) gains almost nothing by
+ * also needing the guild id — same visibility, same guild. Shape 1's
+ * `atlas-discord-<guildId>` is even less protected: the agent name is public
+ * (this repo is public). Only shape 2's token digest is a real secret (it is
+ * keyed on the bot token, which the forger does not have).
+ *
+ * So: for shapes 1 and 3, what this buys is real but modest — it kills the
+ * LAZY replay (the omit-the-field shape an actual adversarial review found
+ * admitted), it kills accidental cross-wiring between two adapter instances
+ * that both happen to reach this brain, and it forces a forger who DOES know
+ * the guild to be deliberate about including a plausible value rather than
+ * getting in for free. It does NOT stop someone who already knows which
+ * guild Atlas is bound to. Where the topology offers shape 2, prefer it: that
+ * is the one case where this check is close to a real secret, not merely a
+ * config-pinned admission fact like `channelId`.
+ *
+ * `runtime.ts`'s `serveTask` does not depend on this file dropping blank
+ * tokens to stay fail-closed — it separately refuses an empty
+ * `source.adapter_instance` outright (atlas#24 M3), so a trust-path guarantee
+ * never rests on an invariant recorded only here.
+ *
+ * This closes the "trivially forged/replayed envelope" gap (the wire's own
+ * e2e fixture used to omit the field entirely and still be admitted) without
+ * claiming to close the deeper one — an attacker who can ALSO get a
+ * credential onto the bus's agents account. That deeper gap is a NATS
+ * subject-permission / account-isolation question for arc/cortex (filed
+ * upstream as arc#378 / cortex#2465), out of this
  * repo's reach; it is recorded, not silently assumed away (see the PR/issue
  * this shipped with).
  */
@@ -94,22 +144,51 @@ const CHANNEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
 
 /**
- * `platform:instance` ids, comma- or whitespace-separated — the same
- * separator convention `identity.ts`'s `parsePlatformActors` uses. Unlike
- * that parser this one does NOT require a colon: an adapter-instance id's
- * internal shape is cortex's business (`{platform}:{demuxKey}` today), not
- * this repo's, so a token is kept verbatim as long as it is non-blank and
- * carries no leading/trailing whitespace of its own. Blank tokens are
- * dropped, not counted as usable — a stray comma must never widen the set.
+ * An adapter-instance id is an OPAQUE, bounded identifier — the same posture
+ * as `CHANNEL_ID_RE` above, deliberately as strict: this is a SIBLING
+ * trust-boundary field (atlas#24), not a looser one. Must start with an
+ * alphanumeric — which structurally excludes the installer-placeholder shape
+ * `__NAME__` (always starts with `_`, atlas#24 N1) — then only
+ * `[A-Za-z0-9._:-]`, up to 128 chars: headroom over every real cortex shape
+ * (`discord:token:<12 hex>`, `atlas-discord-<snowflake>`, `discord:<guildId>`
+ * — see the header note on the three topologies) without being unbounded.
  */
-function parseAdapterInstances(raw: string | undefined): ReadonlySet<string> {
-  if (typeof raw !== "string" || raw.length === 0) return new Set();
+const ADAPTER_INSTANCE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * `platform:instance` ids, COMMA-separated only (atlas#24 M4 — deliberately
+ * NOT whitespace too, unlike `identity.ts`'s `parsePlatformActors`). An
+ * adversarial review found that splitting on whitespace as well meant an
+ * operator's copy-paste error — a stray space or tab inside what they meant
+ * as ONE id — silently WIDENED the trusted set into two tokens, neither of
+ * which is the id they intended. Comma-only splitting means a value with
+ * internal whitespace stays exactly ONE token, which then simply fails
+ * `ADAPTER_INSTANCE_RE` below (real cortex ids never contain whitespace)
+ * instead of being silently split into something that admits more than the
+ * operator wrote.
+ *
+ * Blank tokens (an empty entry from `",,"` or a whitespace-only value) are
+ * DROPPED, not counted as usable — a stray comma must never widen the set,
+ * and `makeEffectsConfig` refuses `missing-adapter-instances` if dropping them
+ * leaves nothing at all. A non-blank token that fails `ADAPTER_INSTANCE_RE`
+ * refuses the WHOLE config (`malformed-adapter-instance`) instead of being
+ * silently dropped (which would fail closed by accident) or silently kept
+ * (which could fail closed OR open depending on luck) — same rigor
+ * `CHANNEL_ID_RE` already applies to the sibling field.
+ */
+function parseAdapterInstances(
+  raw: string | undefined,
+): { kind: "ok"; instances: ReadonlySet<string> } | { kind: "malformed"; token: string } {
   const out = new Set<string>();
-  for (const token of raw.split(/[,\s]+/)) {
-    if (token.length === 0) continue;
-    out.add(token);
+  if (typeof raw === "string" && raw.length > 0) {
+    for (const rawToken of raw.split(",")) {
+      const token = rawToken.trim();
+      if (token.length === 0) continue;
+      if (!ADAPTER_INSTANCE_RE.test(token)) return { kind: "malformed", token };
+      out.add(token);
+    }
   }
-  return out;
+  return { kind: "ok", instances: out };
 }
 
 export interface EffectsConfig {
@@ -151,7 +230,9 @@ export type EffectsConfigRefusal =
   /** `ATLAS_PLAN_BASE_BRANCH` is not a plain branch name. */
   | "malformed-base-branch"
   /** `ATLAS_TRUSTED_ADAPTER_INSTANCES` missing, blank, or yields no usable id (atlas#24). */
-  | "missing-adapter-instances";
+  | "missing-adapter-instances"
+  /** A non-blank `ATLAS_TRUSTED_ADAPTER_INSTANCES` token fails `ADAPTER_INSTANCE_RE` (atlas#24 M4/N1). */
+  | "malformed-adapter-instance";
 
 export type EffectsConfigLoad =
   | { kind: "ok"; config: EffectsConfig }
@@ -212,9 +293,20 @@ export function makeEffectsConfig(input: {
 
   // atlas#24 — required, same posture as channelId: no default that would
   // silently admit every adapter instance.
-  const trustedAdapterInstances = parseAdapterInstances(
+  const adapterInstancesParsed = parseAdapterInstances(
     typeof input.adapterInstances === "string" ? input.adapterInstances : "",
   );
+  if (adapterInstancesParsed.kind === "malformed") {
+    return {
+      kind: "refused",
+      reason: "malformed-adapter-instance",
+      // The VALUE is echoed for the same reason `malformed-plan-repo` echoes
+      // its value: this came from the operator's own environment, not from a
+      // proposal, so a typo needs to be visible to debug.
+      detail: `adapter instance id ${JSON.stringify(adapterInstancesParsed.token)} is not a valid identifier`,
+    };
+  }
+  const trustedAdapterInstances = adapterInstancesParsed.instances;
   if (trustedAdapterInstances.size === 0) {
     return {
       kind: "refused",

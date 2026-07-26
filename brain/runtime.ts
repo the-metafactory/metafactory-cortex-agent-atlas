@@ -302,7 +302,7 @@ export class AtlasRuntime {
       this.stats.notAdmitted += 1;
       this.log("warn", "task from a channel Atlas is not bound to — ignored, nothing recorded");
       disposition = "not-admitted";
-    } else if (!layer.effects.trustedAdapterInstances.has(adapterInstance)) {
+    } else if (
       // Second config-pinned admission check (atlas#24). SAME disposition as
       // the channel check and SAME silence, deliberately: a distinguishable
       // response would tell a forger which of the two checks it failed, and
@@ -310,6 +310,17 @@ export class AtlasRuntime {
       // distinction an outsider is owed. An empty `adapterInstance` (the field
       // omitted entirely — the bus-forged shape) never matches a non-empty
       // configured set, so absence refuses exactly like a wrong value.
+      //
+      // The `adapterInstance.length === 0` half is written OUT explicitly
+      // (atlas#24 M3, adversarial review) rather than left to fall out of
+      // `trustedAdapterInstances` never containing `""`. `effects/config.ts`
+      // drops blank tokens today, but THIS check is the trust-path boundary —
+      // it must fail closed on its own, not by trusting an invariant recorded
+      // only in a docstring one file away. Delete `effects/config.ts`'s
+      // blank-token guard entirely and this line alone still refuses an
+      // absent adapter instance.
+      adapterInstance.length === 0 || !layer.effects.trustedAdapterInstances.has(adapterInstance)
+    ) {
       this.stats.notAdmitted += 1;
       this.log(
         "warn",

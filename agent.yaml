@@ -251,20 +251,52 @@ gate:
 # brain's inbound subject actually came from cortex's real inbound-surface
 # path (see brain/protocol.ts's `TaskSource` header for the full trail). A
 # GENUINE live-surface task always also carries `adapter_instance`, set by
-# cortex from the real adapter connection's own id; a forged/replayed envelope
-# generally will not, and even if it does, would have to guess this value.
+# cortex from the real adapter connection's own id.
+#
+# WHAT THIS ACTUALLY BUYS (stated precisely — an earlier draft overclaimed
+# this, adversarial review M1): `adapter_instance` rides the SAME
+# attacker-controlled payload `channel` does, so for two of the three shapes
+# below it is a deployment-known value, not a secret — a forger who already
+# knew `ATLAS_CHANNEL_ID` (a snowflake in the SAME guild) is not meaningfully
+# slowed down by ALSO needing that guild's id. What it genuinely stops: the
+# LAZY replay (an envelope that omits the field, which an adversarial review
+# found admitted), accidental cross-wiring between two adapter instances, and
+# a forger who has NOT bothered to work out a plausible value. It does not
+# stop a deliberate forger who already knows the guild. Prefer the
+# token-digest shape below where the topology offers it — that one is a real
+# secret.
+#
 # REQUIRED; missing ⇒ Atlas admits NO message — same "cannot act" posture as
 # a missing `plan:`/`channelId`, not an optional hardening flag a deployment
 # can leave off.
 adapterTrust:
-  # Adapter-instance id(s) Atlas accepts a task from, comma- or
-  # whitespace-separated. Compared with `===`; never normalised. Set this to
-  # the SAME value cortex resolves for Atlas's bound surface —
-  # `{platform}:{demuxKey}`, e.g. `discord:<guildId>` (cortex's
-  # `src/adapters/registry.ts`) — copied here independently rather than
-  # derived from cortex's internal formula, so a mismatch fails LOUD (a live
-  # message stops being admitted) instead of silently trusting the wrong
-  # instance. Yielding no usable id ⇒ `missing-adapter-instances`.
+  # Adapter-instance id(s) Atlas accepts a task from, COMMA-separated ONLY
+  # (not whitespace — a stray space inside one id must stay one malformed
+  # token, refused, rather than silently splitting into two trusted ids;
+  # atlas#24 M4). Compared with `===`; never normalised.
+  #
+  # cortex resolves `PlatformAdapter.instanceId` THREE different ways
+  # depending on deployment topology (verified against cortex directly — full
+  # citations in brain/effects/config.ts's header):
+  #   1. Per-stack (regular, non-gateway) boot — `atlas-discord-<guildId>`.
+  #      cortex's own boot assertion FORBIDS the gateway form (below) here.
+  #   2. Gateway, one bot token shared across multiple guilds —
+  #      `discord:token:<sha256(token, stack)[0:12]>` — a real secret.
+  #   3. Gateway, exactly one guild per bot token — `discord:<guildId>`.
+  #
+  # DO NOT GUESS which applies. Read the real `adapter_instance` off one
+  # genuine live inbound task and copy it verbatim — this pack cannot know,
+  # from its own config, which topology a deployment runs under, and a wrong
+  # value is SILENT at the per-message level (refused exactly like a wrong
+  # channel). The `adapterInstances=<count>` field in the boot line is the one
+  # visible cross-check: it shows how many ids are configured (never the
+  # values), so "0" or "not what I expected" is at least noticeable there.
+  #
+  # Yielding no usable id ⇒ `missing-adapter-instances`; a non-blank token
+  # that isn't a plausible identifier (contains whitespace, is over-long, or
+  # is the unresolved `__ATLAS_TRUSTED_ADAPTER_INSTANCES__` placeholder below)
+  # ⇒ `malformed-adapter-instance`, refusing the WHOLE value rather than
+  # silently keeping only the well-formed entries.
   trustedInstances: __ATLAS_TRUSTED_ADAPTER_INSTANCES__
 
 # The completion watcher's poll cadence. Read by brain/watch.ts
