@@ -18,8 +18,12 @@ type: agent
 tier: community
 license: "MIT"
 description: "Atlas — the Factory's product-manager agent (plan steward). Cortex agent bundle: ADD/REMOVE intake with a principal RATIFY gate, map+ledger atomic updates, self-healing reconcile, doc changes by PR only. Spec: the-metafactory/vision#9"
-authors:
-  - "the-metafactory"
+author:
+  name: "the-metafactory"
+  github: "the-metafactory"
+# BARE form — the sigil ("@") is added by the publish path, never stored here.
+# Writing "@metafactory" would double it to "@@metafactory" (arc#369/#370).
+namespace: "metafactory"
 repository: "the-metafactory/metafactory-cortex-agent-atlas"
 
 targets:
@@ -31,7 +35,7 @@ targets:
 # merges and never self-ratifies, so this pack carries no gh write credential
 # either; it uses whatever `gh` the host is already authenticated as.
 #
-# It does, however, READ eleven environment variables — eight of them
+# It does, however, READ thirteen environment variables — eight of them
 # load-bearing, three of them gating constitution rule 3. They are declared in
 # `capabilities.secrets` below and in agent.yaml's `plan:`, `gate:` and
 # `watch:` blocks, with an operator table in README.md § Configuration.
@@ -55,12 +59,25 @@ capabilities:
     read:
       # Instance state (state.sqlite + events). Override: ATLAS_STATE_DIR.
       - "~/.config/cortex/agents/atlas"
-      # The agent-state bundle — the dashboard-regen script only.
+      # The agent-state bundle — the dashboard-regen script only. Resolved
+      # existence-gated (arc's canonical install path first, the pre-arc#287
+      # legacy tree only as a fallback if it's the one that actually exists —
+      # see brain/state.ts's `defaultBundleDir()`, atlas#15/#19). Both listed
+      # honestly since either may be the real read path on a given host.
       # Override: ATLAS_AGENT_STATE_DIR.
+      - "~/.local/share/metafactory/arc/repos/agent-state"
       - "~/.config/metafactory/pkg/repos/agent-state"
       # The plan working checkout, when ATLAS_PLAN_CHECKOUT is set. Unset ⇒
       # never touched, and doc-change PRs are disabled.
       - "$ATLAS_PLAN_CHECKOUT"
+      # The principal-owned env-file overlay (brain/env.ts `principalConfigDir()`
+      # + `resolveEnvFilePath()`) — fills the minimal exec-brain env with the
+      # gate/effect config above, ABSENT KEYS ONLY. `$ATLAS_ENV_FILE` overrides
+      # the path explicitly; found missing from this block during atlas#19's
+      # capability-honesty pass (declared in agent.yaml's `runtime.brain.secrets`
+      # and README's Configuration table, but silently absent here).
+      - "~/.config/metafactory/atlas/.env"
+      - "$ATLAS_ENV_FILE"
     write:
       - "~/.config/cortex/agents/atlas"
       - "$ATLAS_PLAN_CHECKOUT"
@@ -102,8 +119,10 @@ capabilities:
     - ATLAS_PLAN_BASE_BRANCH       # default `main`; malformed refuses the WHOLE effect config
     - ATLAS_PLAN_CHECKOUT          # unset ⇒ doc-change PRs disabled (fail closed)
     - ATLAS_WATCH_INTERVAL_MS      # default 900000 ms, clamped to [60000, 86400000]
+    - ATLAS_RECONCILE_INTERVAL_MS  # default 21600000 ms, clamped (brain/reconcile.ts) — found missing from this block, atlas#19 honesty pass
     - ATLAS_STATE_DIR              # default ~/.config/cortex/agents/atlas
-    - ATLAS_AGENT_STATE_DIR        # default ~/.config/metafactory/pkg/repos/agent-state
+    - ATLAS_AGENT_STATE_DIR        # default arc's install path, existence-gated legacy fallback (see filesystem.read above)
+    - ATLAS_ENV_FILE               # explicit override for the env-file overlay path (see filesystem.read above) — found missing from this block, atlas#19 honesty pass
 
 # Instance state (OPTIONAL) — the memory module.
 #
@@ -150,6 +169,18 @@ depends_on:
 # Scoped to exactly Atlas's own instance dir under the cortex agents/
 # convention; no shared tree (e.g. ~/.config/cortex/agents.d/ itself, which
 # holds every installed agent's fragment) is named here.
+#
+# CONFIRMED (atlas#19), not the pre-XDG-split legacy path: cortex's
+# `~/.config/metafactory/cortex` config-dir move (cortex#1869) is scoped to
+# config FILES only — per-agent instance state is resolved separately by
+# cortex's `resolveInstanceDir()` (src/common/agents/agent-state-scaffold.ts),
+# which builds `~/.config/<host>/agents/<id>` with `host` hardcoded to the
+# literal `"cortex"` at every call site, never `metafactory/cortex`. So this
+# flat path already agrees byte-for-byte with brain/state.ts's
+# `defaultInstanceDir()` and with where a current cortex actually scaffolds
+# and reads Atlas's state — verified empirically: `~/.config/metafactory/
+# cortex` has no `agents/` subdirectory on a live host, while
+# `~/.config/cortex/agents/` holds every installed agent's real instance dir.
 owns:
   state:
     - "~/.config/cortex/agents/atlas"

@@ -130,8 +130,10 @@ One repo, one issue, one channel. All three come from configuration, never from 
 | `ATLAS_PLAN_BASE_BRANCH` | Base branch for doc-change PRs. Atlas never pushes to it directly. | Defaults to `main`. A value that is not a plain branch name is `malformed-base-branch`, which refuses the **entire** effect config — a typo here disables the ledger too. |
 | `ATLAS_PLAN_CHECKOUT` | A local working checkout of the plan repo, used to build doc-change PR branches. | Doc-change PRs are **disabled** — fail closed: an unset checkout means "Atlas cannot do doc changes here", never "Atlas guesses a directory". Every other effect still works. |
 | `ATLAS_WATCH_INTERVAL_MS` | Completion-watcher poll cadence, in milliseconds. | Defaults to `900000` (15 minutes). Any accepted value is clamped to `[60000, 86400000]`, so an out-of-range number is corrected rather than refused. |
+| `ATLAS_RECONCILE_INTERVAL_MS` | Self-healing reconcile-loop poll cadence, in milliseconds. | Defaults to `21600000` (6 hours). Clamped to `[60000, 604800000]` (1 minute to 7 days); an out-of-range number is corrected rather than refused. |
 | `ATLAS_STATE_DIR` | Instance-state directory (`state.sqlite`, events). | Defaults to `~/.config/cortex/agents/atlas`. |
 | `ATLAS_AGENT_STATE_DIR` | The agent-state bundle root — used only to regenerate `dashboard.md`. | Defaults to the arc install path. A missing bundle skips dashboard regen once, with a warning. |
+| `ATLAS_ENV_FILE` | Explicit path to the env-file overlay (see "Configuration reaches the brain..." above). | Defaults to `~/.config/metafactory/atlas/.env`, then `<pack>/.env`. An explicit path that does not exist is NOT silently replaced by a fallback. |
 
 ### `ATLAS_SELF_PLATFORM_IDS` must list Atlas's **current** ids
 

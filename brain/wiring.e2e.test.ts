@@ -91,6 +91,34 @@ function declaredSecrets(): string[] {
 }
 
 /**
+ * The names `arc-manifest.yaml` declares under `capabilities.secrets` — the
+ * installer-visible surface an operator reviews BEFORE consenting to install
+ * (atlas#19: "capability honesty matters more than usual"). Same shape as
+ * {@link declaredSecrets} one indent level shallower (2-space `secrets:` under
+ * `capabilities:`, 4-space list items) — arc-manifest.yaml's own YAML, so a
+ * name silently added to agent.yaml's `runtime.brain.secrets` without a
+ * matching manifest declaration is caught here rather than shipping as an
+ * under-declared capability.
+ */
+function manifestDeclaredSecrets(): string[] {
+  const yaml = readFileSync(join(PACK_ROOT, "arc-manifest.yaml"), "utf8");
+  const lines = yaml.split("\n");
+  const start = lines.findIndex((l) => /^\s{2}secrets:\s*$/.test(l));
+  if (start < 0) return [];
+  const out: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    const m = /^\s{4}-\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:#.*)?$/.exec(line);
+    if (m !== null) {
+      out.push(m[1]!);
+      continue;
+    }
+    if (line.trim().length === 0 || line.trim().startsWith("#")) continue;
+    break; // dedented out of the list
+  }
+  return out;
+}
+
+/**
  * cortex's `collectBrainSecrets` + `buildEnv`, faithfully: the brain sees the
  * four runner-owned keys, the socket vars, and NOTHING except the DECLARED
  * names that are present in the host's own environment.
@@ -447,6 +475,33 @@ describe("agent.yaml declares the env contract", () => {
     // boot rather than at first use.
     for (const name of declaredSecrets()) {
       expect(RUNNER_OWNED_ENV_KEYS.has(name.toUpperCase())).toBe(false);
+    }
+  });
+
+  test("arc-manifest.yaml's capabilities.secrets agrees with agent.yaml's runtime.brain.secrets (atlas#19)", () => {
+    // The installer-visible declaration (arc-manifest.yaml) must name EVERY
+    // env var the brain actually reaches for at runtime (agent.yaml's
+    // runtime.brain.secrets, itself proven complete by the test above) — an
+    // operator reviewing capabilities before consenting to install must see
+    // the whole surface, not a subset. Caught two real gaps during atlas#19's
+    // honesty pass: ATLAS_RECONCILE_INTERVAL_MS and ATLAS_ENV_FILE were
+    // declared in agent.yaml (and documented in README) but silently absent
+    // from arc-manifest.yaml's capabilities.secrets.
+    const manifestDeclared = new Set(manifestDeclaredSecrets());
+    for (const name of declaredSecrets()) {
+      expect(manifestDeclared).toContain(name);
+    }
+  });
+
+  test("every declared name is operator-documented in README.md (atlas#19)", () => {
+    // Same class of gap, third file: agent.yaml and arc-manifest.yaml can
+    // agree with each other and STILL leave an operator with no idea what a
+    // name does or defaults to if README's Configuration tables never mention
+    // it. Caught the same two names undocumented here as in the manifest
+    // check above — this closes the third of the three files, not just two.
+    const readme = readFileSync(join(PACK_ROOT, "README.md"), "utf8");
+    for (const name of declaredSecrets()) {
+      expect(readme).toContain(`\`${name}\``);
     }
   });
 });
