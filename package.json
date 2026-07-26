@@ -8,7 +8,8 @@
   "repository": "github:the-metafactory/metafactory-cortex-agent-atlas",
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "shadow": "ATLAS_SHADOW=1 bun test test/e2e/walkthrough.test.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",
