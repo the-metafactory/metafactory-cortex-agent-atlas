@@ -90,6 +90,7 @@
  * this reason (see `messageRecordsPlanChange`).
  */
 
+import { isHashedPlanRevision, planBodyRevision } from "./plan-revision";
 import { sanitizeForDisplay } from "./templates";
 import { extractLinkedIssueUrls } from "./watch";
 import { messageRecordsPlanChange, type DiscordLedger, type LedgerMessage, type LedgerReader } from "./effects/discord";
@@ -234,7 +235,13 @@ export async function reconcilePlan(
       detail: "could not read the plan body; reconcile did nothing",
     };
   }
-  const revision = snapshot.revisedAt;
+  // atlas#26: identify the revision by the BODY, not by GitHub's `updatedAt`
+  // (`snapshot.revisedAt`) — that field advances on comments, label changes,
+  // and cross-references from other issues/PRs, not only on body edits. Two
+  // reads of an unchanged body always hash the same, so this is what makes
+  // detector (c) below mean "this body differs from the one last accounted
+  // for" rather than "something, anything, happened on this issue".
+  const revision = planBodyRevision(snapshot.body);
 
   const firstPass = !deps.state.hasReconciled();
   const lastLedger = deps.state.lastLedgerEntryTs();
@@ -329,7 +336,25 @@ export async function reconcilePlan(
 
   // ── 3(c). A plan-body revision with no matching ➕/➖ event ────────────────
   if (!firstPass && typeof revision === "string" && revision.length > 0) {
-    if (!deps.state.observedPlanRevisions().has(revision)) {
+    const observed = deps.state.observedPlanRevisions();
+    // atlas#26 MIGRATION: before this fix, every recorded revision was a
+    // GitHub `updatedAt` ISO timestamp; after it, every NEW one is a
+    // `sha256:`-prefixed body hash (`isHashedPlanRevision`). The two schemes
+    // can never agree by coincidence, so on a deployment that already had
+    // reconcile history, the very first pass after the fix lands would find
+    // `observed` full of legacy timestamps and the live (hashed) revision
+    // absent from it — reporting drift for every plan that has EVER been
+    // reconciled before, which is the bug this fix exists to kill, amplified.
+    //
+    // The signal: has a hashed revision EVER been recorded? If not, this pass
+    // cannot yet tell "no baseline" from "wrong-scheme baseline" apart from
+    // "genuine edit" — so, exactly like `firstPass` above establishes a
+    // baseline instead of reporting on one, this pass re-baselines instead of
+    // reporting: it says nothing here, and `recordReconcilePass` below (run
+    // unconditionally, drift or not) writes the current hashed revision down,
+    // which is what lets the very next pass resume real detection.
+    const migrating = ![...observed].some(isHashedPlanRevision);
+    if (!migrating && !observed.has(revision)) {
       const key = `plan-revised:${revision}`;
       if (deps.state.hasReconcileCatchUp(key)) {
         suppress();

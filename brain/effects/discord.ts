@@ -121,7 +121,7 @@ export interface PlanChangeEntry {
   readonly why: string;
   /** The human-facing proposal number, so the post is referenceable in one word. */
   readonly displayId: number;
-  /** The plan body's revision receipt (GitHub `updatedAt` after the edit). */
+  /** The plan body's revision receipt — a body hash, see `plan-revision.ts` (atlas#26). */
   readonly revision: string;
 }
 

@@ -106,6 +106,9 @@ export class FakePlanRepo {
     }
     if (argv[1] === "issue" && argv[2] === "comment") {
       this.comments.push(inv.stdin ?? "");
+      // Real GitHub bumps `updatedAt` on ANY issue activity, not only body
+      // edits (atlas#26) — a comment lands here without touching `this.body`.
+      this.touchWithoutBodyChange();
       return { ok: true, stdout: "", stderr: "" };
     }
     if (argv[1] === "pr" && argv[2] === "create") {
@@ -114,6 +117,20 @@ export class FakePlanRepo {
     }
     return { ok: false, stdout: "", stderr: "unrecognised" };
   };
+
+  /**
+   * Simulate `updatedAt` advancing WITHOUT a body change — a comment landing,
+   * a label/assignee change, a cross-reference from another issue or PR. This
+   * is the property atlas#26's fake used to lack entirely: the old fake only
+   * ever bumped `revisedAt` inside the write path (`issue edit`, above),
+   * which is precisely the property real GitHub does NOT have, and which is
+   * why the unit suite could not catch the bug. Public so a test can call it
+   * directly, independent of `commentOnPlan`.
+   */
+  touchWithoutBodyChange(): void {
+    this.revisions += 1;
+    this.revisedAt = `2026-07-26T00:00:0${this.revisions}Z`;
+  }
 }
 
 function argvRepo(argv: readonly string[]): string {
