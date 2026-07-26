@@ -106,12 +106,14 @@ import type { EffectsConfig } from "./effects/config";
 import type { DiscordLedger } from "./effects/discord";
 import type { PlanWriter } from "./effects/gh";
 import type { LinkedIssueReader, ReadOnlyGh } from "./gh";
+import { isHelpRequest } from "./help";
 import { isConfiguredPrincipal, type RatifyIdentityConfig } from "./identity";
 import { processComment } from "./proposal";
 import type { BrainEffect, BrainEvent, TaskEvent } from "./protocol";
 import { processGateMessage } from "./ratify";
 import { reconcilePlan } from "./reconcile";
 import type { AtlasProposals } from "./state";
+import { helpText } from "./templates";
 import type { HostLedgerTransport } from "./transport";
 import { pollCompletions } from "./watch";
 
@@ -172,6 +174,29 @@ export interface AtlasRuntimeDeps {
  */
 const DEFAULT_THREAD_WAIT_MS = 10_000;
 
+/**
+ * The per-channel HELP cooldown (atlas#45). HELP is outsider-paced — every
+ * sender the admission check already lets through may trigger it, with no
+ * identity check of its own (see `templates.ts`'s `helpText` header) — and
+ * its reply is the byte-IDENTICAL template every single time, so a repeat
+ * request within the window buys the requester nothing a first one didn't
+ * already give them. The cooldown exists purely to bound how often that
+ * identical text can be re-posted into one channel/thread — same family as
+ * atlas#8's dashboard-spawn debounce, and just as cheap: the text never
+ * varies, so coalescing repeats loses no information.
+ *
+ * 60 seconds. Long enough that a burst of confused people all asking at once
+ * collapses to one reply instead of N; short enough that a SECOND, genuinely
+ * new "how do I use this" moment a minute later still gets answered rather
+ * than silently swallowed. Keyed on the task's own `source.channel` — the
+ * bound channel or an owned thread, whichever this task carries — not
+ * globally and not per-author: per-channel because that is the actual spam
+ * surface (one room getting flooded with identical text), and not per-author
+ * because the reply carries no author-specific fact that a repeat sender
+ * could be denied differently from anyone else.
+ */
+const HELP_COOLDOWN_MS = 60_000;
+
 /** What one served task did. Recorded for the `result` summary and for tests. */
 export type TaskDisposition =
   | "not-admitted"
@@ -182,7 +207,9 @@ export type TaskDisposition =
   | "gate-ratified"
   | "gate-declined"
   | "gate-replied"
-  | "gate-ignored";
+  | "gate-ignored"
+  | "help-served"
+  | "help-cooldown";
 
 /**
  * The answer to one `create_private_thread` request. Never throws.
@@ -270,7 +297,19 @@ export class AtlasRuntime {
     effectRejections: 0,
     /** Threads the host opened for Atlas AND Atlas durably recorded owning. */
     threadsOpened: 0,
+    /** HELP replies actually sent — see `HELP_COOLDOWN_MS`. */
+    helpServed: 0,
+    /** HELP requests admitted but swallowed by the per-channel cooldown. */
+    helpCooldown: 0,
   };
+
+  /**
+   * Last time (per `this.now()`) a HELP reply was sent to a given channel —
+   * see `HELP_COOLDOWN_MS`. Transient/in-memory only: a restart resetting
+   * this costs at most one extra identical reply, never a correctness or
+   * security property, so it does not need `state.ts`'s durability.
+   */
+  private readonly lastHelpAt = new Map<string, number>();
 
   constructor(deps: AtlasRuntimeDeps) {
     this.deps = deps;
@@ -584,13 +623,23 @@ export class AtlasRuntime {
     return isConfiguredPrincipal(identity, platform, platformId);
   }
 
-  /** Intake first, then the gate. Both are total; neither throws. */
+  /** HELP first, then intake, then the gate. All three are total; none throws. */
   private async handleAdmitted(task: TaskEvent): Promise<TaskDisposition> {
     const layer = this.deps.effectLayer;
     if (layer === null) return "no-effect-layer";
     const text = typeof task.payload?.text === "string" ? task.payload.text : "";
     const platform = typeof task.source.surface === "string" ? task.source.surface : "";
     const authorId = typeof task.source.user === "string" ? task.source.user : "";
+
+    // ── HELP (atlas#45) ───────────────────────────────────────────────────
+    // Checked FIRST, ahead of both proposal intake and the gate, and reads
+    // no identity field at all — see `handleHelp`. It must not be reachable
+    // only for the population that also happens to fail intake/the gate: a
+    // proposer or the principal typing "HELP" gets the same answer as an
+    // outsider, from the same admitted channel, every time.
+    if (isHelpRequest(text)) {
+      return this.handleHelp(task);
+    }
 
     // ── Intake ──────────────────────────────────────────────────────────────
     // `task_id` is cortex's envelope id (see protocol.ts): stable across a
@@ -718,6 +767,46 @@ export class AtlasRuntime {
         return "gate-ignored";
       }
     }
+  }
+
+  /**
+   * The HELP verb (atlas#45). Reachable by anyone the admission check in
+   * `serveTask` has already let through — the SAME channel/thread/adapter-
+   * instance path every other verb uses, no new one forked.
+   *
+   * ── Identity-neutral by construction ─────────────────────────────────────
+   * This method reads `task.source.channel` only, for the cooldown key —
+   * never `task.source.user` (the author). `helpText()` itself takes no
+   * argument at all. So there is no line of code anywhere in this path that
+   * COULD branch on who is asking, which is the property the issue asks for:
+   * not merely "the text happens to be the same today" but "there is no
+   * identity input for it to differ on."
+   *
+   * ── Where the reply lands ────────────────────────────────────────────────
+   * `this.reply` — the same call `proposal-surfaced`/`gate-*` outcomes use —
+   * emits a bare `post` keyed only on `task.task_id`; the HOST derives the
+   * destination from the task's own recorded source (the bound channel, or
+   * the thread the conversation was retargeted into — `protocol.ts`'s
+   * `PostEffect`). A HELP asked inside a thread Atlas owns therefore answers
+   * in that thread, and one asked in the bound channel answers there, with no
+   * special-casing here. This never touches `HostLedgerTransport`/
+   * `noteRetarget` at all — that bookkeeping exists ONLY to pin LEDGER posts
+   * (the ➕/➖ entries) to the one configured channel (see `transport.ts`);
+   * ordinary conversational replies, HELP included, were never routed through
+   * it and so cannot trip its post-window/retarget logic (PR #43).
+   */
+  private handleHelp(task: TaskEvent): TaskDisposition {
+    const channel = typeof task.source?.channel === "string" ? task.source.channel : "";
+    const now = this.now();
+    const last = this.lastHelpAt.get(channel);
+    if (last !== undefined && now - last < HELP_COOLDOWN_MS) {
+      this.stats.helpCooldown += 1;
+      return "help-cooldown";
+    }
+    this.lastHelpAt.set(channel, now);
+    this.stats.helpServed += 1;
+    this.reply(task.task_id, helpText());
+    return "help-served";
   }
 
   // ── Scheduled passes ──────────────────────────────────────────────────────

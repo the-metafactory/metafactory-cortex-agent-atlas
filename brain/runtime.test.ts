@@ -310,6 +310,114 @@ describe("RATIFY from the principal reaches the gate", () => {
   });
 });
 
+// ── HELP (atlas#45) ─────────────────────────────────────────────────────────
+
+describe("HELP — identity-neutral, admitted like everything else, cooldown-bounded", () => {
+  test("the principal, a known proposer, and an outsider get BYTE-IDENTICAL text", async () => {
+    // The load-bearing property (issue #45): a help text that varies by
+    // sender would leak who is trusted. Three different authors, three
+    // separate runtimes (so no cooldown interferes with this comparison),
+    // same channel, same everything except who sent it.
+    const asPrincipal = makeRuntime();
+    await serve(asPrincipal, task("HELP", PRINCIPAL_PLATFORM_ID));
+    const principalReply = posts()[0]!.text;
+    sent.length = 0;
+
+    const asProposer = makeRuntime();
+    await serve(asProposer, task("HELP", PROPOSER_PLATFORM_ID));
+    const proposerReply = posts()[0]!.text;
+    sent.length = 0;
+
+    const asOutsider = makeRuntime();
+    await serve(asOutsider, task("HELP", "pid-total-stranger-fixture"));
+    const outsiderReply = posts()[0]!.text;
+
+    expect(principalReply).toBe(proposerReply);
+    expect(proposerReply).toBe(outsiderReply);
+    expect(summaryOf(results()[0])).toBe("help-served");
+  });
+
+  test("lowercase 'help' is accepted too", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task("help", PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+    expect(summaryOf(results()[0])).toBe("help-served");
+  });
+
+  test("the reply names all three causes of silence and both command families", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID));
+    const reply = posts()[0]!.text;
+    expect(reply).toMatch(/never arrived/i);
+    expect(reply).toMatch(/admitted/i);
+    expect(reply).toMatch(/parsed/i);
+    expect(reply).toContain("ADD:");
+    expect(reply).toContain("REMOVE:");
+    expect(reply).toContain("RATIFY");
+    expect(reply).toContain("DECLINE");
+  });
+
+  test("HELP does not create a proposal, does not touch the gate, and does not edit the plan", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task("HELP", PRINCIPAL_PLATFORM_ID));
+    expect(runtime.stats.surfaced).toBe(0);
+    expect(runtime.stats.ratified).toBe(0);
+    expect(repo.invocations.filter((i) => i.argv[2] === "edit")).toHaveLength(0);
+  });
+
+  test("HELP is admitted through the SAME path as every other verb — a foreign channel is silent", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID, OTHER_CHANNEL));
+    expect(posts()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+    expect(runtime.stats.helpServed).toBe(0);
+  });
+
+  test("a repeat HELP in the same channel within the cooldown window is swallowed silently", async () => {
+    let clock = 1_000_000;
+    const runtime = makeRuntime({ now: () => clock });
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+    expect(runtime.stats.helpServed).toBe(1);
+
+    clock += 1_000; // well inside HELP_COOLDOWN_MS (60s)
+    await serve(runtime, task("HELP", "pid-someone-else-fixture"));
+    expect(posts()).toHaveLength(1); // no second reply
+    expect(runtime.stats.helpServed).toBe(1);
+    expect(runtime.stats.helpCooldown).toBe(1);
+    expect(summaryOf(results()[1])).toBe("help-cooldown");
+  });
+
+  test("a HELP after the cooldown window elapses gets a fresh reply", async () => {
+    let clock = 1_000_000;
+    const runtime = makeRuntime({ now: () => clock });
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+
+    clock += 60_001; // just past HELP_COOLDOWN_MS
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(2);
+    expect(runtime.stats.helpServed).toBe(2);
+    expect(runtime.stats.helpCooldown).toBe(0);
+  });
+
+  test("the cooldown is per-channel — a busy channel never rate-limits a quiet one", async () => {
+    // Admission only covers {bound channel} ∪ {owned threads} (atlas#22), so
+    // exercising "two different ADMITTED channels" means the bound channel
+    // and a thread Atlas has recorded owning, not an arbitrary foreign one
+    // (which would simply be refused before the cooldown is ever consulted).
+    useThreadLayer();
+    state.recordOwnedThread(OWNED_THREAD, "task-fixture-seed", 0);
+    let clock = 1_000_000;
+    const runtime = makeRuntime({ now: () => clock });
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID, CHANNEL_ID));
+    clock += 1_000;
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID, OWNED_THREAD));
+    expect(posts()).toHaveLength(2);
+    expect(runtime.stats.helpCooldown).toBe(0);
+  });
+});
+
 // ── Admission ───────────────────────────────────────────────────────────────
 
 describe("admission is config-pinned", () => {
@@ -927,6 +1035,33 @@ describe("atlas#22 — admission covers threads Atlas owns, and nothing else", (
     expect(runtime.stats.ratified).toBe(1);
     // The plan really moved — the map half of the atomic pair.
     expect(repo.body).toContain(NEW_URL);
+  });
+
+  // atlas#45 — answers design question 1: a HELP asked inside a thread Atlas
+  // owns is admitted exactly like a RATIFY there, and its reply is emitted
+  // with `this.reply` (a bare `post` keyed only on `task_id`) — the same
+  // primitive `proposal-surfaced`/`gate-*` replies already use, and NEVER
+  // `HostLedgerTransport`. There is nothing thread-specific to assert about
+  // the DESTINATION beyond "it was admitted and replied at all": the host
+  // resolves where a `post` on this task lands from the task's own recorded
+  // source, which this brain does not (and cannot) override.
+  test("a HELP posted inside an OWNED thread is admitted and answered", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+    sent.length = 0;
+
+    await serve(runtime, task("HELP", PROPOSER_PLATFORM_ID, OWNED_THREAD));
+    expect(summaryOf(results()[0])).toBe("help-served");
+    const reply = posts().find((p) => p.task_id === results()[0]!.task_id);
+    expect(reply).toBeDefined();
+    // Never routed through the ledger transport's post-window/retarget
+    // bookkeeping (transport.ts) — no refusal was recorded there for this.
+    expect(transport.refusals["retargeted-to-thread"]).toBe(0);
+    expect(transport.refusals["wrong-channel"]).toBe(0);
   });
 
   // ── P1 ──────────────────────────────────────────────────────────────────
