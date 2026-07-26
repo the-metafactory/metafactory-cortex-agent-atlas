@@ -83,6 +83,7 @@ const ATLAS_PLATFORM_ID = "pid-atlas-self-fixture";
 const PROPOSER_PLATFORM_ID = "pid-proposer-fixture";
 const OUTSIDER_PLATFORM_ID = "pid-outsider-fixture";
 const CHANNEL_ID = "chan-shadow-0000";
+const ADAPTER_INSTANCE = "adapter-shadow-0000";
 
 const SHADOW = process.env.ATLAS_SHADOW === "1";
 const shadow = SHADOW ? describe : describe.skip;
@@ -92,7 +93,12 @@ const shadow = SHADOW ? describe : describe.skip;
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("the shadow harness cannot be pointed at anything live", () => {
-  const ok = { planRepo: "someone/atlas-shadow-rehearsal", planIssue: 7, channelId: CHANNEL_ID };
+  const ok = {
+  planRepo: "someone/atlas-shadow-rehearsal",
+  planIssue: 7,
+  channelId: CHANNEL_ID,
+  adapterInstances: ADAPTER_INSTANCE,
+};
 
   test("a throwaway target is accepted", () => {
     expect(() => {
@@ -292,6 +298,7 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
       ATLAS_PLAN_REPO: fx.target.repo,
       ATLAS_PLAN_ISSUE: String(fx.target.planIssue),
       ATLAS_CHANNEL_ID: CHANNEL_ID,
+      ATLAS_TRUSTED_ADAPTER_INSTANCES: ADAPTER_INSTANCE,
       ATLAS_PLAN_BASE_BRANCH: "main",
       ATLAS_PLAN_CHECKOUT: fx.checkoutDir,
       ATLAS_STATE_DIR: fx.stateDir,
@@ -311,6 +318,7 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
       planRepo: fx.target.repo,
       planIssue: fx.target.planIssue,
       channelId: CHANNEL_ID,
+      adapterInstances: ADAPTER_INSTANCE,
       baseBranch: "main",
       checkoutDir: fx.checkoutDir,
     });
@@ -704,6 +712,7 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
           ATLAS_PLAN_REPO: fx.target.repo,
           ATLAS_PLAN_ISSUE: String(fx.target.planIssue),
           ATLAS_CHANNEL_ID: CHANNEL_ID,
+      ATLAS_TRUSTED_ADAPTER_INSTANCES: ADAPTER_INSTANCE,
           ATLAS_STATE_DIR: fx.stateDir,
           ATLAS_ENV_FILE: join(fx.dir, "overlay.env"),
           ATLAS_WATCH_INTERVAL_MS: "86400000",
