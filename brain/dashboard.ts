@@ -111,10 +111,26 @@ export interface PlanDashboardInput {
 }
 
 /**
- * The section table, computed. PURE and exported so the exact numbers are
- * testable against a fixed plan body with no store, no network and no clock.
+ * One heading's span, computed once and shared by every reader below —
+ * `planSections`, `planTickets`, and nothing else. Extracted (atlas#28) so the
+ * heading/span/checkbox walk exists in exactly one place: `planTickets` needs
+ * the identical per-section URL sets `planSections` already built, and a
+ * second walk of the body — even one using the same regexes — is the second
+ * implementation of "what counts as open" the file header warns against.
+ *
+ * `rawTitle` is the UNSANITIZED heading text (`recordBelongsTo` matches
+ * against this — unchanged from before this was extracted); `title` is the
+ * bound, sanitized display form.
  */
-export function planSections(input: PlanDashboardInput): PlanSectionSummary[] {
+interface RawSection {
+  readonly rawTitle: string;
+  readonly title: string;
+  readonly level: number;
+  readonly urls: ReadonlySet<string>;
+  readonly closedUrls: ReadonlySet<string>;
+}
+
+function computeRawSections(input: PlanDashboardInput): RawSection[] {
   const body = typeof input.body === "string" ? input.body : "";
   const lines = body.split("\n");
   const headings: Array<{ index: number; level: number; text: string }> = [];
@@ -125,7 +141,7 @@ export function planSections(input: PlanDashboardInput): PlanSectionSummary[] {
     if (headings.length >= MAX_SECTIONS) break;
   }
 
-  const out: PlanSectionSummary[] = [];
+  const out: RawSection[] = [];
   for (let h = 0; h < headings.length; h += 1) {
     const heading = headings[h]!;
     // `[start, end)` — every line under this heading up to the next heading of
@@ -154,12 +170,30 @@ export function planSections(input: PlanDashboardInput): PlanSectionSummary[] {
       if (!closedUrls.has(url) && safeAnnounced(input.announced, url)) closedUrls.add(url);
     }
 
-    const attributed = input.records.filter((r) => recordBelongsTo(r, heading.text, urls));
     out.push({
+      rawTitle: heading.text,
       title: boundTitle(heading.text),
       level: heading.level,
-      total: urls.size,
-      open: urls.size - closedUrls.size,
+      urls,
+      closedUrls,
+    });
+  }
+  return out;
+}
+
+/**
+ * The section table, computed. PURE and exported so the exact numbers are
+ * testable against a fixed plan body with no store, no network and no clock.
+ */
+export function planSections(input: PlanDashboardInput): PlanSectionSummary[] {
+  const out: PlanSectionSummary[] = [];
+  for (const section of computeRawSections(input)) {
+    const attributed = input.records.filter((r) => recordBelongsTo(r, section.rawTitle, section.urls));
+    out.push({
+      title: section.title,
+      level: section.level,
+      total: section.urls.size,
+      open: section.urls.size - section.closedUrls.size,
       running: attributed.filter((r) => r.phase === "ratified" || r.phase === "applied").length,
       held: attributed.filter((r) => r.phase === "surfaced").length,
     });
@@ -201,30 +235,59 @@ function safeAnnounced(announced: (url: string) => boolean, url: string): boolea
 }
 
 /**
+ * The whole-body closedness walk, shared by `bodyTotals` and `planTickets`
+ * (atlas#28) — one URL set, one ticked/announced determination, in
+ * first-seen document order. Extracted for the same reason
+ * `computeRawSections` was: a second scan of the body is a second
+ * implementation of "what counts as closed" to keep in lockstep by hand.
+ */
+function computeRawBodyClosedness(input: PlanDashboardInput): {
+  readonly order: readonly string[];
+  /** The plan body's OWN checkbox, before the announced-completion merge. */
+  readonly tickedInBody: ReadonlyMap<string, boolean>;
+  /** `tickedInBody` OR'd with `input.announced` — the one `bodyTotals` counts. */
+  readonly closed: ReadonlyMap<string, boolean>;
+} {
+  const body = typeof input.body === "string" ? input.body : "";
+  const order: string[] = [];
+  const tickedInBody = new Map<string, boolean>();
+  for (const line of body.split("\n")) {
+    const ticked = CHECKED_RE.test(line);
+    for (const m of line.matchAll(new RegExp(ISSUE_URL_RE.source, "g"))) {
+      const url = m[0];
+      if (!tickedInBody.has(url)) {
+        tickedInBody.set(url, false);
+        order.push(url);
+      }
+      if (ticked) tickedInBody.set(url, true);
+    }
+  }
+  const closed = new Map<string, boolean>(tickedInBody);
+  for (const url of order) {
+    if (closed.get(url) !== true && safeAnnounced(input.announced, url)) closed.set(url, true);
+  }
+  return { order, tickedInBody, closed };
+}
+
+/**
  * Plan-wide counts: DISTINCT linked issues across the whole body, and each work
  * item counted once regardless of how many sections it is attributable to. This
  * is the number a 🏃 wave-post digest quotes, so it has to be the number of
  * real things — not the number of (section, thing) pairs.
+ *
+ * Exported (atlas#28) — the status tool's overall/`--live` totals call this
+ * directly rather than re-deriving the same count from `planSections`' rows
+ * (which would double-count through the parent/child span overlap; see the
+ * TOTALS test below for exactly why summing section rows is wrong).
  */
-function bodyTotals(input: PlanDashboardInput): {
+export function bodyTotals(input: PlanDashboardInput): {
   total: number;
   open: number;
   running: number;
   held: number;
 } {
-  const body = typeof input.body === "string" ? input.body : "";
-  const urls = new Set<string>();
-  const closed = new Set<string>();
-  for (const line of body.split("\n")) {
-    const ticked = CHECKED_RE.test(line);
-    for (const m of line.matchAll(new RegExp(ISSUE_URL_RE.source, "g"))) {
-      urls.add(m[0]);
-      if (ticked) closed.add(m[0]);
-    }
-  }
-  for (const url of urls) {
-    if (!closed.has(url) && safeAnnounced(input.announced, url)) closed.add(url);
-  }
+  const { order, closed } = computeRawBodyClosedness(input);
+  const closedCount = order.filter((u) => closed.get(u) === true).length;
   const seen = new Set<string>();
   let running = 0;
   let held = 0;
@@ -234,7 +297,60 @@ function bodyTotals(input: PlanDashboardInput): {
     if (r.phase === "ratified" || r.phase === "applied") running += 1;
     else if (r.phase === "surfaced") held += 1;
   }
-  return { total: urls.size, open: urls.size - closed.size, running, held };
+  return { total: order.length, open: order.length - closedCount, running, held };
+}
+
+export interface PlanTicketSummary {
+  /** The linked issue URL — the ticket's identity. */
+  readonly url: string;
+  /** The plan body's OWN checkbox for this URL — before the announced merge. */
+  readonly tickedInBody: boolean;
+  /** Ticked in the body OR announced complete — the SAME rule `bodyTotals` uses. */
+  readonly closed: boolean;
+  /**
+   * Every section heading (sanitized display form, matching `planSections`'
+   * own `title`) this URL is linked under, in section-document order. Empty
+   * when the URL appears before any heading, or the body carries none at all
+   * — present here even though `planSections` has nothing to attribute it to
+   * (the per-ticket granularity `planSections`/`bodyTotals` stop short of;
+   * see the file header).
+   */
+  readonly sections: readonly string[];
+}
+
+/**
+ * One entry per DISTINCT linked issue URL, body-wide, in first-seen document
+ * order. Built from the SAME two walks `planSections` and `bodyTotals` use
+ * (`computeRawSections` for section attribution, `computeRawBodyClosedness`
+ * for the ticked/closed bits and the canonical ordering) — never a third
+ * implementation of either question, so a ticket's `closed` state and its
+ * `sections` list can never disagree with what the dashboard already says
+ * about the section(s), or the plan overall.
+ *
+ * `tickedInBody` and `closed` are BOTH exposed (atlas#28) because a caller
+ * that only needs "is this closed" (this file's own `bodyTotals`) and a
+ * caller that needs to show the plan body's checkbox and Atlas's own
+ * completion record as two SEPARATE facts (`atlas status`'s `planState` vs
+ * `ledgerState` — reconcile.ts's detector (c) is precisely about them
+ * disagreeing) are both real, and collapsing them here would force the
+ * second caller to re-derive one from the other by hand.
+ */
+export function planTickets(input: PlanDashboardInput): PlanTicketSummary[] {
+  const sectionsByUrl = new Map<string, string[]>();
+  for (const section of computeRawSections(input)) {
+    for (const url of section.urls) {
+      const list = sectionsByUrl.get(url);
+      if (list === undefined) sectionsByUrl.set(url, [section.title]);
+      else list.push(section.title);
+    }
+  }
+  const { order, tickedInBody, closed } = computeRawBodyClosedness(input);
+  return order.map((url) => ({
+    url,
+    tickedInBody: tickedInBody.get(url) === true,
+    closed: closed.get(url) === true,
+    sections: sectionsByUrl.get(url) ?? [],
+  }));
 }
 
 function boundTitle(text: string): string {

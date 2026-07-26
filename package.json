@@ -1,6 +1,6 @@
 {
   "name": "metafactory-cortex-agent-atlas",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Atlas — the Factory's product-manager agent (plan steward). ADD/REMOVE intake with a principal RATIFY gate, map+ledger atomic updates, self-healing reconcile, doc changes by PR only. Spec: the-metafactory/vision#9",
   "type": "module",
   "private": true,
