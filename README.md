@@ -39,6 +39,18 @@ true. The examples above are asserted against the real parser in
 missing separator, or dropping the mention back to the bare form this file
 exists to prevent) turns CI red.
 
+### `@atlas HELP` (atlas#45)
+
+A fifth, identity-neutral command: `@atlas HELP` (also accepted lowercase,
+`@atlas help`) replies with this same grammar, in-channel, plus the three
+reasons a message can go unanswered (never mentioned, not admitted, not
+parsed) — every sender gets byte-identical text, so this reply cannot be used
+to learn who the configured principal is. Deliberately NOT restated here —
+another copy of the grammar is exactly what this section exists to prevent.
+The one source of truth is `brain/templates.ts`'s `helpText()`, held to the
+real parsers by `brain/help.test.ts` the same way the examples above are held
+to them by `docs-grammar.test.ts`.
+
 ## Running it
 
 `brain/main.ts` is the daemon entrypoint. cortex spawns it
