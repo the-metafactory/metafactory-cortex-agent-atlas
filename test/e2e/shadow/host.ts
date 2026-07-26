@@ -80,7 +80,26 @@ export function buildBrainEnv(opts: {
 export interface HostEffect {
   type: string;
   [k: string]: unknown;
+  /**
+   * WHERE this effect landed, decided by the host exactly as cortex decides
+   * it (atlas#22/#25). Set on `post` only: the task's own source channel,
+   * unless that task has been RETARGETED into a thread the brain asked for
+   * (cortex#2248), in which case it is the thread's id. The brain never names
+   * it — that is the whole point of `PostEffect` having no channel field, and
+   * a harness that let the brain choose would be validating a wire that does
+   * not exist.
+   */
+  landedIn?: string;
 }
+
+/**
+ * How the host answers a `create_private_thread` (cortex#2206). The default
+ * models TODAY'S cortex for Atlas: `refuse`, because the effect is wired for
+ * `openOnboarding` agents only (`brain-consumer-boot.ts`) and Atlas is not
+ * one. `create` models the cortex the thread work is written against;
+ * `silent` models a host that never answers at all.
+ */
+export type ThreadPolicy = "refuse" | "create" | "silent";
 
 export class FakeCortexHost {
   readonly effects: HostEffect[] = [];
@@ -103,7 +122,17 @@ export class FakeCortexHost {
      * — the harness models a real adapter, and a real adapter always sends this.
      */
     readonly adapterInstance: string = "adapter-shadow-0000",
+    /** How this host answers `create_private_thread`. See {@link ThreadPolicy}. */
+    public threadPolicy: ThreadPolicy = "refuse",
   ) {}
+
+  /** task id → the channel that task's messages came from (and posts go to). */
+  private readonly taskChannel = new Map<string, string>();
+  /** task id → the thread it was retargeted into, once one exists. */
+  private readonly retargeted = new Map<string, string>();
+  /** Threads this host has opened, in order. Fixture ids only, never live. */
+  readonly threadsOpened: Array<{ taskId: string; threadId: string; name: string }> = [];
+  private threadSeq = 0;
 
   async start(): Promise<void> {
     const self = this;
@@ -172,7 +201,45 @@ export class FakeCortexHost {
       this.authed = true;
       return;
     }
+    if (obj.type === "post") {
+      // The host, not the brain, decides where a post lands: the task's own
+      // source channel, unless the task has been retargeted into a thread.
+      const taskId = String(obj.task_id ?? "");
+      obj.landedIn = this.retargeted.get(taskId) ?? this.taskChannel.get(taskId) ?? "";
+    }
     this.effects.push(obj);
+    if (obj.type === "create_private_thread") this.answerThreadRequest(obj);
+  }
+
+  /**
+   * cortex#2206 + cortex#2248, modelled faithfully: on success the host FIRST
+   * retargets the task's conversation into the new thread, and only then tells
+   * the brain the thread exists — so a post the brain emits on hearing
+   * `thread_created` can never race back into the parent channel. A refusal
+   * reuses the existing `effect_rejected` event; there is no bespoke failure
+   * shape.
+   */
+  private answerThreadRequest(effect: HostEffect): void {
+    const taskId = String(effect.task_id ?? "");
+    if (this.threadPolicy === "silent") return;
+    if (this.threadPolicy === "refuse") {
+      this.send({
+        v: 1,
+        type: "effect_rejected",
+        task_id: taskId,
+        effect: "create_private_thread",
+        reason: {
+          kind: "cant_do",
+          detail: `agent "atlas" has no thread-capable surface binding configured`,
+        },
+      });
+      return;
+    }
+    this.threadSeq += 1;
+    const threadId = `thread-shadow-${this.threadSeq}`;
+    this.threadsOpened.push({ taskId, threadId, name: String(effect.name ?? "") });
+    this.retargeted.set(taskId, threadId);
+    this.send({ v: 1, type: "thread_created", task_id: taskId, thread_id: threadId });
   }
 
   send(event: Record<string, unknown>): void {
@@ -191,6 +258,9 @@ export class FakeCortexHost {
 
   /** Deliver a surface message exactly as `buildBrainTaskPayload` shapes it. */
   task(taskId: string, text: string, user: string, channel = this.channelId): void {
+    // Remember where this task came from, so a `post` riding it can be
+    // attributed to a channel the same way cortex attributes it.
+    this.taskChannel.set(taskId, channel);
     this.send({
       v: 1,
       type: "task",
@@ -231,6 +301,37 @@ export class FakeCortexHost {
   async turn(taskId: string, text: string, user: string, ms = 60_000): Promise<HostEffect> {
     this.task(taskId, text, user);
     return this.awaitResult(taskId, ms);
+  }
+
+  /**
+   * A turn typed IN A THREAD (atlas#22). The shipped Discord adapter puts the
+   * THREAD's own snowflake in `channelId` AND `threadId` for such a message —
+   * there is no parent-channel signal on the wire at all
+   * (`metafactory-cortex-adapter-discord/src/index.ts`) — so this is just an
+   * ordinary task whose channel is the thread. That fidelity is the point:
+   * the harness must not hand Atlas a signal the real adapter never sends.
+   */
+  async threadTurn(
+    taskId: string,
+    text: string,
+    user: string,
+    threadId: string,
+    ms = 60_000,
+  ): Promise<HostEffect> {
+    this.task(taskId, text, user, threadId);
+    return this.awaitResult(taskId, ms);
+  }
+
+  /** Every `post` that landed in one channel (or thread) — the room's view. */
+  postsIn(channel: string): string[] {
+    return this.effects
+      .filter((e) => e.type === "post" && e.landedIn === channel)
+      .map((e) => String(e.text));
+  }
+
+  /** Every `create_private_thread` the brain asked for. */
+  threadRequests(): HostEffect[] {
+    return this.effects.filter((e) => e.type === "create_private_thread");
   }
 
   postsFor(taskId: string): string[] {

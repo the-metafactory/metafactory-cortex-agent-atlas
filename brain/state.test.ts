@@ -501,3 +501,67 @@ describe("atlas#15/#19 — defaultInstanceDir / defaultBundleDir path resolution
     });
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The owned-thread registry (atlas#22 + atlas#25).
+//
+// This table is the ONLY state in the pack that WIDENS what Atlas will act on,
+// so its tests are about the two directions separately: what it must remember
+// (restart-safety — a forgotten thread is a conversation Atlas goes deaf in)
+// and what it must refuse to remember (anything that does not look like a
+// platform id, and anything at all while the store cannot persist).
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("owned threads — the admission registry", () => {
+  test("a recorded thread is owned; an unrecorded one is not", () => {
+    expect(proposals.isOwnedThread("thread-fixture-1")).toBe(false);
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("thread-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("thread-fixture-2")).toBe(false);
+  });
+
+  test("RESTART-SAFE — a reopened store still owns the thread", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-restart", "task-fixture-1")).toBe(true);
+    store.close();
+
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("expected the store to reopen");
+    store = reopened;
+    proposals = new AtlasProposals(store);
+
+    expect(proposals.isOwnedThread("thread-fixture-restart")).toBe(true);
+    expect(store.ownedThreadCount()).toBe(1);
+  });
+
+  test("recording the same thread twice is a no-op that still reports success", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-2")).toBe(true);
+    expect(store.ownedThreadCount()).toBe(1);
+  });
+
+  test("a malformed id is refused, not stored — this table decides what Atlas acts on", () => {
+    for (const bad of ["", "   ", "thread with spaces", "thread\nnewline", "x".repeat(129)]) {
+      expect(proposals.recordOwnedThread(bad, "task-fixture-1")).toBe(false);
+      expect(proposals.isOwnedThread(bad)).toBe(false);
+    }
+    expect(store.ownedThreadCount()).toBe(0);
+  });
+
+  test("an empty channel never matches, whatever else the table holds", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("")).toBe(false);
+  });
+
+  test("a snowflake-shaped id round-trips (the real Discord shape)", () => {
+    // 17-20 decimal digits. A fixture value, never a live channel.
+    const snowflake = "1".repeat(19);
+    expect(proposals.recordOwnedThread(snowflake, "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread(snowflake)).toBe(true);
+  });
+
+  test("FAIL-CLOSED in degraded mode: a memory-only store owns nothing", () => {
+    const degraded = new AtlasProposals(null);
+    expect(degraded.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(false);
+    expect(degraded.isOwnedThread("thread-fixture-1")).toBe(false);
+  });
+});

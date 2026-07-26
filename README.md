@@ -80,6 +80,19 @@ A misconfigured Atlas **runs and refuses audibly**; it never exits and burns
 `maxRestarts`. Read the line: `GATE UNARMED` means every `RATIFY`/`DECLINE`
 will be ignored.
 
+## Threads (atlas#22 + atlas#25)
+
+Two halves. Only one of them is switchable.
+
+**Admission — always on, no flag.** Atlas admits a task whose `source.channel` is the bound ledger channel **or a thread Atlas itself opened and durably recorded opening** (`owned_threads` in `brain/state.ts`). Before this, a reply typed in a thread was refused *in silence* — including a `RATIFY` Atlas had itself invited — because the shipped Discord adapter puts the **thread's** snowflake in `source.channel` and sends no parent-channel signal at all. "A thread under my channel" is therefore not a question this protocol can answer; "a thread I opened" is the only one it can, which is why the registry exists. With no thread ever opened the registry is empty and nothing extra is admitted.
+
+**Conversation — `ATLAS_THREAD_CONVERSATION`, off by default.** On, a surfaced proposal asks the host to open a thread and the exchange happens there. Read all four of these before enabling:
+
+1. **On today's cortex it cannot succeed.** `create_private_thread` is wired only for agents flagged `openOnboarding: true` (cortex `src/runner/brain-consumer-boot.ts`: `wireCreatePrivateThread = isOpenOnboarding && discordAgentChannelId !== undefined`). Atlas is not anon-reachable and must not become so to obtain a thread, so every request comes back `effect_rejected`/`cant_do` and Atlas keeps talking in the channel. Enabling the flag changes the log, not the behaviour, until cortex wires the trusted-agent path.
+2. **There is no public-thread effect.** cortex ships `create_private_thread` and the Discord adapter creates `ChannelType.PrivateThread`. atlas#25 prefers a **public** thread (the plan is public; the community may want to follow a proposal's reasoning). That preference cannot be expressed on this wire, so this pack ships the switch off rather than silently choosing the other option. Note that thread privacy does not affect **who may ratify** — that is identity-checked against the configured principal map, never channel-checked.
+3. **Ledger entries do not follow the conversation.** cortex retargets every `post` on a thread-created task *into* that thread (cortex#2248) and offers no way to aim one at the parent, so a ledger entry earned in a thread is **refused** by `transport.ts` rather than written in the wrong room. The plan still moves; the entry parks in `applied` and `reconcile.ts` carries it into the main channel on the next post window that opens **from the bound channel**. If every conversation lives in threads, that window only opens when somebody speaks to Atlas in the channel itself.
+4. **The thread parent is `presence.discord.agentChannelId`.** That is the field cortex reads (and the one its placeholder resolver recognises); `channelId` is not a member of cortex's `DiscordPresenceSchema` at all.
+
 ### Two wiring limits worth knowing
 
 1. **Ledger posts ride a live task.** `cortex-brain/v1` has no free-standing
@@ -142,6 +155,7 @@ cortex resolves `PlatformAdapter.instanceId` **three different ways** depending 
 |---|---|---|
 | `ATLAS_PLAN_BASE_BRANCH` | Base branch for doc-change PRs. Atlas never pushes to it directly. | Defaults to `main`. A value that is not a plain branch name is `malformed-base-branch`, which refuses the **entire** effect config — a typo here disables the ledger too. |
 | `ATLAS_PLAN_CHECKOUT` | A local working checkout of the plan repo, used to build doc-change PR branches. | Doc-change PRs are **disabled** — fail closed: an unset checkout means "Atlas cannot do doc changes here", never "Atlas guesses a directory". Every other effect still works. |
+| `ATLAS_THREAD_CONVERSATION` | atlas#25 — when `1`/`true`/`yes`/`on`, a surfaced proposal's **conversation** moves into a thread Atlas opens off the bound channel; ledger entries never follow it. Admission of threads Atlas already owns (atlas#22) is unconditional and needs no flag. | **Off** — byte-identical to pre-atlas#25 Atlas. Read ["Threads"](#threads-atlas22--atlas25) before turning it on: on today's cortex the request is refused `cant_do`, because `create_private_thread` is wired only for `openOnboarding` agents. |
 | `ATLAS_WATCH_INTERVAL_MS` | Completion-watcher poll cadence, in milliseconds. | Defaults to `900000` (15 minutes). Any accepted value is clamped to `[60000, 86400000]`, so an out-of-range number is corrected rather than refused. |
 | `ATLAS_RECONCILE_INTERVAL_MS` | Self-healing reconcile-loop poll cadence, in milliseconds. | Defaults to `21600000` (6 hours). Clamped to `[60000, 604800000]` (1 minute to 7 days); an out-of-range number is corrected rather than refused. |
 | `ATLAS_STATE_DIR` | Instance-state directory (`state.sqlite`, events). | Defaults to `~/.config/cortex/agents/atlas`. |

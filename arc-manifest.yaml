@@ -119,6 +119,7 @@ capabilities:
     # OPTIONAL — defaulted.
     - ATLAS_PLAN_BASE_BRANCH       # default `main`; malformed refuses the WHOLE effect config
     - ATLAS_PLAN_CHECKOUT          # unset ⇒ doc-change PRs disabled (fail closed)
+    - ATLAS_THREAD_CONVERSATION    # atlas#25 — 1|true|yes|on ⇒ surface a proposal into a thread Atlas opens; unset ⇒ OFF (today's cortex refuses the effect anyway — see README)
     - ATLAS_WATCH_INTERVAL_MS      # default 900000 ms, clamped to [60000, 86400000]
     - ATLAS_RECONCILE_INTERVAL_MS  # default 21600000 ms, clamped (brain/reconcile.ts) — found missing from this block, atlas#19 honesty pass
     - ATLAS_STATE_DIR              # default ~/.config/cortex/agents/atlas

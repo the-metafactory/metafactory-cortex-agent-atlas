@@ -99,6 +99,12 @@ runtime:
       # Optional cadences. Unset ⇒ 900000 / 21600000, both clamped.
       - ATLAS_WATCH_INTERVAL_MS
       - ATLAS_RECONCILE_INTERVAL_MS
+      # atlas#25 — the thread opt-in. Unset, or anything other than
+      # 1|true|yes|on ⇒ OFF, and OFF is byte-identical to pre-atlas#25 Atlas.
+      # See the `threads:` block below before turning it on: on TODAY'S cortex
+      # it cannot succeed, and what it would do if it could is a product call
+      # that is recorded there rather than made here.
+      - ATLAS_THREAD_CONVERSATION
       # Optional durable-state locations. Unset ⇒ the documented defaults.
       - ATLAS_STATE_DIR
       - ATLAS_AGENT_STATE_DIR
@@ -307,6 +313,39 @@ adapterTrust:
 watch:
   intervalMs: __ATLAS_WATCH_INTERVAL_MS__
 
+# ── THREADS (atlas#22 + atlas#25) ───────────────────────────────────────────
+#
+# Two halves, and only one of them is switchable:
+#
+#   ADMISSION (atlas#22) — always on, no flag. Atlas admits a task from the
+#     bound channel OR from a thread IT OPENED and durably recorded opening
+#     (brain/state.ts `owned_threads`). Before this, a reply typed in a thread
+#     was refused in silence — including a RATIFY Atlas had itself invited —
+#     because the shipped Discord adapter puts the THREAD's snowflake in
+#     `source.channel` and sends no parent-channel signal at all. With no
+#     thread ever opened the registry is empty and nothing extra is admitted,
+#     so this half is inert until the half below is enabled.
+#
+#   CONVERSATION (atlas#25) — `ATLAS_THREAD_CONVERSATION`, OFF by default.
+#     On, a surfaced proposal asks the host to open a thread and the exchange
+#     happens there. Read all three of these before enabling:
+#
+#     1. cortex wires `create_private_thread` ONLY for agents flagged
+#        `openOnboarding: true` (cortex src/runner/brain-consumer-boot.ts).
+#        Atlas is NOT anon-reachable and must not become so to obtain a
+#        thread, so on today's cortex every request is refused `cant_do` and
+#        Atlas simply keeps talking in the channel. Enabling the flag changes
+#        the log, not the behaviour, until cortex wires the trusted-agent path.
+#     2. cortex has no PUBLIC-thread effect. atlas#25 prefers a public thread
+#        (the plan is public; the community may want to follow the reasoning);
+#        the only effect on the wire opens a PRIVATE one. This pack does not
+#        silently ship the other choice.
+#     3. `presence.discord.agentChannelId` is what the host uses as the thread
+#        parent — see the presence block below, which does not currently set
+#        it under that name.
+threads:
+  conversation: __ATLAS_THREAD_CONVERSATION__   # OPTIONAL. 1|true|yes|on ⇒ on. Default OFF.
+
 # Discord presence — placeholders ONLY. Every identifier below resolves at
 # cortex config-load from the daemon environment (compass#84 / L2), same
 # discipline as escort's agents.d/escort.yaml. No live token or snowflake is
@@ -318,7 +357,23 @@ presence:
     enabled: true
     token: __ATLAS_BOT_TOKEN__              # resolved at cortex load
     guildId: __ATLAS_GUILD_ID__             # resolve-at-install
-    channelId: __ATLAS_CHANNEL_ID__         # the #iteration-plan channel Atlas is bound to
+    # THE FIELD NAME IS `agentChannelId`, not `channelId` (atlas#25, found
+    # while wiring threads). cortex's `DiscordPresenceSchema`
+    # (src/common/types/cortex-config.ts) has no `channelId` member at all:
+    # zod DROPS the unknown key, and because `agentChannelId` is declared
+    # `z.coerce.string().min(1)`, an ABSENT value coerces to the literal
+    # string "undefined" and passes validation. So the previous spelling did
+    # not bind this agent to #iteration-plan — it bound it to a channel named
+    # "undefined", silently. It is also the name cortex's placeholder resolver
+    # recognises (`resolve-env-placeholders.ts` DISCORD_ID_FIELDS = token,
+    # guildId, agentChannelId, logChannelId), so under the old spelling
+    # `__ATLAS_CHANNEL_ID__` was never resolved either. Same env var, same
+    # intent, correct field — matching escort's own agents.d fragment.
+    #
+    # It is ALSO the thread parent: cortex derives `create_private_thread`'s
+    # channel from exactly this field (cortex#2206), which is why the fix
+    # belongs to the thread slice.
+    agentChannelId: __ATLAS_CHANNEL_ID__    # the #iteration-plan channel Atlas is bound to
     dmOwner: false                          # Atlas never claims DMs
     contextDepth: 10
     surfaceSubjects: []                     # no raw envelope surface

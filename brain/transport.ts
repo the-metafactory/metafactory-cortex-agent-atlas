@@ -27,6 +27,24 @@
  * the live task's `source.channel` IS the configured ledger channel. A mention
  * from anywhere else gets a refusal, not a ledger entry in the wrong room.
  *
+ * ── `wrong-channel` is REACHABLE since atlas#22, and it is load-bearing ─────
+ * atlas#22 observed that this guard could not fire in production, because
+ * `runtime.ts` admitted the bound channel and nothing else — so the live
+ * task's source channel was the configured one by construction. That is no
+ * longer true: admission now also covers a thread Atlas opened
+ * (`owned_threads`), and a task from such a thread carries the THREAD's id as
+ * its source channel. `canPost` is `false` there and `post` refuses
+ * `wrong-channel`.
+ *
+ * That refusal is the correct behaviour, not a gap to paper over. The ledger
+ * is the bound channel's record; cortex#2248 retargets every post on a
+ * thread-created task INTO the thread and offers no way to aim one at the
+ * parent, so the only alternatives to refusing are (a) writing the ledger
+ * inside a thread, which defeats the ledger, or (b) claiming a receipt for a
+ * post that went somewhere else, which is a recorded lie. Refusing parks the
+ * entry for `reconcile.ts` (`apply.ts` reports `applied-not-posted`) and
+ * `runtime.ts` says so in a `log` effect naming the cause.
+ *
  * **3. A post returns no platform message id.** `post` is fire-and-forget;
  * cortex has no ack event for it (unlike `create_private_thread` →
  * `thread_created`). `LedgerTransport.post` must nevertheless return a receipt,

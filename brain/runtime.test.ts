@@ -197,6 +197,12 @@ function results(): ResultLine[] {
   return sent.filter((e): e is ResultLine => e.type === "result");
 }
 
+/** The disposition a result carries, or "" for a failed one. */
+function summaryOf(result: ResultLine | undefined): string {
+  if (result === undefined) return "";
+  return result.status === "complete" ? (result.summary ?? "") : "";
+}
+
 async function serve(runtime: AtlasRuntime, event: TaskEvent): Promise<void> {
   runtime.onEvent(event);
   await runtime.drained();
@@ -559,5 +565,362 @@ describe("protocol hygiene", () => {
     // post; the sampled-counter design deliberately lets this one through. The
     // assertion is that the routing happened at all.
     expect(await transport.post(CHANNEL_ID, "x")).not.toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THREADS — atlas#22 (Atlas was deaf in threads) + atlas#25 (converse in one).
+//
+// The four properties an adversarial reviewer will attack, each with its own
+// test, plus the plumbing that makes them reachable:
+//
+//   P1  a message in a thread Atlas does NOT own is still refused, in silence
+//   P2  owning a thread does NOT widen who may ratify
+//   P3  owned threads survive a restart
+//   P4  no effect can target anything outside {bound channel} ∪ {owned threads}
+// ═══════════════════════════════════════════════════════════════════════════
+
+const OWNED_THREAD = "thread-fixture-owned";
+const FOREIGN_THREAD = "thread-fixture-foreign";
+
+/** Effects config with the atlas#25 opt-in ON. */
+function makeThreadEffects(): EffectsConfig {
+  const loaded = makeEffectsConfig({
+    planRepo: PLAN_REPO,
+    planIssue: 4,
+    channelId: CHANNEL_ID,
+    adapterInstances: ADAPTER_INSTANCE_ID,
+    threadConversation: "1",
+  });
+  if (loaded.kind !== "ok") throw new Error("fixture: thread effects config refused");
+  return loaded.config;
+}
+
+/** Swap the whole effect layer onto a thread-enabled config. */
+function useThreadLayer(): void {
+  effects = makeThreadEffects();
+  layer = {
+    effects,
+    plan: new GhCliPlanWriter(effects, (inv: GhInvocation) => repo.spawn(inv)),
+    linked,
+    ledger: new DiscordLedger(effects, transport),
+    transport,
+  };
+}
+
+async function waitUntil(pred: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await Bun.sleep(2);
+  }
+  throw new Error(`waitUntil: ${label}`);
+}
+
+function threadEffects(): Array<Extract<BrainEffect, { type: "create_private_thread" }>> {
+  return sent.filter(
+    (e): e is Extract<BrainEffect, { type: "create_private_thread" }> =>
+      e.type === "create_private_thread",
+  );
+}
+
+/**
+ * Serve a task, answering its `create_private_thread` the way the host would.
+ * `answer` decides which answer arrives; `null` means none ever does (the
+ * timeout path).
+ */
+async function serveWithHost(
+  runtime: AtlasRuntime,
+  event: TaskEvent,
+  answer: { kind: "created"; threadId: string } | { kind: "refused" } | null,
+): Promise<void> {
+  const served = (async () => {
+    runtime.onEvent(event);
+    await runtime.drained();
+  })();
+  if (answer !== null) {
+    await waitUntil(() => threadEffects().length > 0, "no create_private_thread was emitted");
+    if (answer.kind === "created") {
+      runtime.onEvent({
+        v: 1,
+        type: "thread_created",
+        task_id: event.task_id,
+        thread_id: answer.threadId,
+      });
+    } else {
+      runtime.onEvent({
+        v: 1,
+        type: "effect_rejected",
+        task_id: event.task_id,
+        effect: "create_private_thread",
+        reason: { kind: "cant_do", detail: "no thread-capable surface binding configured" },
+      });
+    }
+  }
+  await served;
+}
+
+describe("atlas#25 — opening the thread the exchange moves into", () => {
+  test("OFF by default: a surfaced proposal asks for no thread at all", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    expect(threadEffects()).toHaveLength(0);
+    expect(posts()).toHaveLength(1);
+    expect(runtime.stats.threadsOpened).toBe(0);
+  });
+
+  test("ON: one create_private_thread, named from Atlas's own display id, members 'source'", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    const event = task(ADD_TEXT, PROPOSER_PLATFORM_ID);
+    await serveWithHost(runtime, event, { kind: "created", threadId: OWNED_THREAD });
+
+    const asked = threadEffects();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.name).toBe("Proposal #1");
+    expect(asked[0]!.members).toBe("source");
+    // Never the proposer's text or id — the only dynamic part is Atlas's own
+    // number.
+    expect(asked[0]!.name).not.toContain(PROPOSER_PLATFORM_ID);
+    expect(asked[0]!.name).not.toContain("http");
+    // The thread is asked for BEFORE the summary is posted, so the host's
+    // retarget (cortex#2248) puts the summary in the thread.
+    const askedAt = sent.findIndex((e) => e.type === "create_private_thread");
+    const postedAt = sent.findIndex((e) => e.type === "post");
+    expect(askedAt).toBeLessThan(postedAt);
+    expect(runtime.stats.threadsOpened).toBe(1);
+    expect(state.isOwnedThread(OWNED_THREAD)).toBe(true);
+  });
+
+  test("a host refusal is an ordinary outcome: the reply still lands, no thread is owned", async () => {
+    // This is the ONLY path today's cortex can produce for Atlas —
+    // create_private_thread is wired for openOnboarding agents only.
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), { kind: "refused" });
+
+    expect(posts()).toHaveLength(1);
+    expect(posts()[0]!.text).toContain("Proposal #1 — ADD:");
+    expect(state.isOwnedThread(OWNED_THREAD)).toBe(false);
+    expect(runtime.stats.threadsOpened).toBe(0);
+    expect(results()).toHaveLength(1);
+  });
+
+  test("a host that never answers falls back to the channel, bounded by threadWaitMs", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 30 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), null);
+    expect(posts()).toHaveLength(1);
+    expect(runtime.stats.threadsOpened).toBe(0);
+    expect(results()).toHaveLength(1);
+  });
+
+  test("a degraded store never opens a thread — Atlas will not invite a reply it cannot hear", async () => {
+    useThreadLayer();
+    const memoryOnly = new AtlasProposals(null);
+    const runtime = makeRuntime({ state: memoryOnly, threadWaitMs: 50 });
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    expect(threadEffects()).toHaveLength(0);
+  });
+
+  test("a task ALREADY in a thread never asks for a second thread", async () => {
+    useThreadLayer();
+    expect(state.recordOwnedThread(OWNED_THREAD, "task-fixture-seed")).toBe(true);
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID, OWNED_THREAD));
+    expect(threadEffects()).toHaveLength(0);
+    expect(posts()).toHaveLength(1);
+  });
+
+  test("an uncorrelated thread_created records NOTHING — the registry is not writable by an event", async () => {
+    // The attack: a task Atlas never asked a thread for (or a forged/stale
+    // event) claiming a thread id, hoping to have it admitted afterwards.
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    runtime.onEvent({
+      v: 1,
+      type: "thread_created",
+      task_id: "task-fixture-never-asked",
+      thread_id: FOREIGN_THREAD,
+    });
+    await runtime.drained();
+    expect(state.isOwnedThread(FOREIGN_THREAD)).toBe(false);
+
+    // …and a message from it is still refused.
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID, FOREIGN_THREAD));
+    expect(posts()).toHaveLength(0);
+    expect(summaryOf(results()[0])).toBe("not-admitted");
+  });
+
+  test("a malformed thread id is refused rather than stored", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: "not a thread id — with spaces",
+    });
+    expect(runtime.stats.threadsOpened).toBe(0);
+    expect(state.isOwnedThread("not a thread id — with spaces")).toBe(false);
+    // The reply still went out; only the ownership claim was dropped.
+    expect(posts()).toHaveLength(1);
+  });
+});
+
+describe("atlas#22 — admission covers threads Atlas owns, and nothing else", () => {
+  test("a RATIFY posted in an OWNED thread is admitted and applied", async () => {
+    // The interaction atlas#22/#25 exist for: Atlas invites `RATIFY 1` into a
+    // thread, and the principal typing it there is heard.
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+    sent.length = 0;
+
+    await serve(runtime, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, OWNED_THREAD));
+    expect(summaryOf(results()[0])).toBe("gate-ratified");
+    expect(runtime.stats.ratified).toBe(1);
+    // The plan really moved — the map half of the atomic pair.
+    expect(repo.body).toContain(NEW_URL);
+  });
+
+  // ── P1 ──────────────────────────────────────────────────────────────────
+  test("P1 — a message in a thread Atlas does NOT own is refused, in silence", async () => {
+    useThreadLayer();
+    expect(state.recordOwnedThread(OWNED_THREAD, "task-fixture-seed")).toBe(true);
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+
+    // A proposal AND a ratification, both from the foreign thread.
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID, FOREIGN_THREAD));
+    await serve(runtime, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, FOREIGN_THREAD));
+
+    expect(posts()).toHaveLength(0);
+    expect(threadEffects()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(2);
+    for (const r of results()) {
+      expect(summaryOf(r)).toBe("not-admitted");
+    }
+    // Nothing was recorded either — an unadmitted proposal never enters state.
+    expect(repo.invocations.filter((i) => i.argv[2] === "edit")).toHaveLength(0);
+  });
+
+  test("P1 (cont.) — an empty or absent channel never matches an owned thread", async () => {
+    useThreadLayer();
+    expect(state.recordOwnedThread(OWNED_THREAD, "task-fixture-seed")).toBe(true);
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID, ""));
+    expect(posts()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+  });
+
+  // ── P2 ──────────────────────────────────────────────────────────────────
+  test("P2 — an owned thread does NOT widen who may ratify", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+    sent.length = 0;
+
+    // The proposer — who is IN the thread Atlas opened FOR them — ratifies.
+    await serve(runtime, task("RATIFY 1", PROPOSER_PLATFORM_ID, OWNED_THREAD));
+
+    expect(runtime.stats.ratified).toBe(0);
+    expect(repo.body).not.toContain(NEW_URL);
+    expect(posts()).toHaveLength(0); // outsider RATIFY is silence, in a thread too
+    expect(summaryOf(results()[0])).toBe("gate-ignored");
+  });
+
+  test("P2 (cont.) — Atlas's own id cannot ratify from inside its own thread", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+    sent.length = 0;
+    await serve(runtime, task("RATIFY 1", ATLAS_PLATFORM_ID, OWNED_THREAD));
+    expect(runtime.stats.ratified).toBe(0);
+    expect(repo.body).not.toContain(NEW_URL);
+  });
+
+  // ── P3 ──────────────────────────────────────────────────────────────────
+  test("P3 — an owned thread survives a restart: a fresh store still admits it", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+
+    // The daemon dies and comes back on the same instance dir — a maxRestarts
+    // restart, a redeploy, a config reload.
+    store.close();
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("fixture: reopen failed");
+    store = reopened;
+    state = new AtlasProposals(store);
+    expect(state.isOwnedThread(OWNED_THREAD)).toBe(true);
+
+    sent.length = 0;
+    const rebooted = makeRuntime({ threadWaitMs: 50 });
+    await serve(rebooted, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, OWNED_THREAD));
+    expect(rebooted.stats.notAdmitted).toBe(0);
+    expect(rebooted.stats.ratified).toBe(1);
+  });
+
+  // ── P4 ──────────────────────────────────────────────────────────────────
+  test("P4 — no effect rides a task from outside {bound channel} ∪ {owned threads}", async () => {
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    const opener = task(ADD_TEXT, PROPOSER_PLATFORM_ID);
+    await serveWithHost(runtime, opener, { kind: "created", threadId: OWNED_THREAD });
+
+    // Everything an outsider could try, from everywhere Atlas must not act.
+    const foreign = [
+      task(ADD_TEXT, PROPOSER_PLATFORM_ID, OTHER_CHANNEL),
+      task("RATIFY 1", PRINCIPAL_PLATFORM_ID, OTHER_CHANNEL),
+      task("RATIFY 1", PRINCIPAL_PLATFORM_ID, FOREIGN_THREAD),
+      task(ADD_TEXT, PROPOSER_PLATFORM_ID, CHANNEL_ID, OTHER_ADAPTER_INSTANCE_ID),
+      task("RATIFY 1", PRINCIPAL_PLATFORM_ID, OWNED_THREAD, OTHER_ADAPTER_INSTANCE_ID),
+    ];
+    for (const f of foreign) await serve(runtime, f);
+    const foreignIds = new Set(foreign.map((f) => f.task_id));
+
+    // The universe check: EVERY effect that names a task must name a task
+    // Atlas admitted, i.e. one whose source channel is the bound channel or an
+    // owned thread. `log`/`result` are exempt from the first half only because
+    // `log` carries no task at all.
+    for (const effect of sent) {
+      if (effect.type === "post" || effect.type === "create_private_thread") {
+        expect(foreignIds.has(effect.task_id)).toBe(false);
+        expect(effect.task_id).toBe(opener.task_id);
+      }
+    }
+    expect(posts()).toHaveLength(1); // the opener's summary, and nothing else
+  });
+
+  test("P4 (cont.) — a ledger entry earned in a thread is PARKED, never written to the thread", async () => {
+    // cortex#2248 retargets every post on a thread-created task INTO the
+    // thread, and there is no way to aim one at the parent. So the ledger post
+    // is REFUSED (transport `wrong-channel`) rather than written in the wrong
+    // room — the plan moves, the entry parks, and reconcile is flagged due.
+    useThreadLayer();
+    const runtime = makeRuntime({ threadWaitMs: 50 });
+    await serveWithHost(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID), {
+      kind: "created",
+      threadId: OWNED_THREAD,
+    });
+    sent.length = 0;
+
+    await serve(runtime, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, OWNED_THREAD));
+    expect(repo.body).toContain(NEW_URL); // the map moved
+    expect(transport.refusals["wrong-channel"]).toBeGreaterThan(0); // …the ledger did not
+    expect(runtime.stats.applied).toBe(0);
+    // Said out loud, on the wire, naming the cause.
+    const logs = sent.filter((e) => e.type === "log").map((e) => String(e.text));
+    expect(logs.join("\n")).toContain("arrived in a thread");
   });
 });
