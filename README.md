@@ -5,6 +5,40 @@ Atlas — the Factory's product-manager agent (plan steward). A cortex agent bun
 - Design spec: https://github.com/the-metafactory/vision/issues/9
 - Implementation epic: https://github.com/the-metafactory/metafactory-cortex-agent-atlas/issues/8
 
+## Talking to Atlas — the proposal grammar
+
+**Atlas only receives a message when it is @-mentioned.** cortex delivers an
+inbound message to an agent's brain only on mention, and the surface adapter
+strips the mention before the text ever reaches the brain. A message that
+doesn't mention Atlas is not refused — it **never arrives**. That matters
+because silence has three indistinguishable causes (never delivered, refused,
+or Atlas down); knowing the mention is required is how a proposer rules the
+first one out.
+
+To propose adding or removing a plan item, mention Atlas and open with the
+exact verb, a GitHub issue URL, an em dash or hyphen separator, and a reason:
+
+```
+@atlas ADD: https://github.com/owner/repo/issues/42 — <why>
+@atlas REMOVE: https://github.com/owner/repo/issues/7 — <why>
+```
+
+(`ADD:`/`REMOVE:` also accept a plain hyphen separator, ` - `, in place of the
+em dash ` — ` shown above.) The mention is stripped before `brain/intake.ts`
+parses the rest — which is why that file's own grammar comment shows the verb
+starting at the very first character; see it for the exact shape the parser
+accepts and rejects.
+
+**This is the one canonical statement of the grammar in this repo.**
+`persona.md` and this repo's epic issue reference it rather than restate it;
+the same is true of copies that live outside this repo (`ITERATION.md` in the
+vision repo, the community invitation) — point them back here instead of
+re-describing the grammar in place, so there is exactly one copy to keep
+true. The examples above are asserted against the real parser in
+`brain/docs-grammar.test.ts`, so an edit that breaks one (wrong URL shape,
+missing separator, or dropping the mention back to the bare form this file
+exists to prevent) turns CI red.
+
 ## Running it
 
 `brain/main.ts` is the daemon entrypoint. cortex spawns it
