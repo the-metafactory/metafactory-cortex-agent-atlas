@@ -66,6 +66,39 @@ run unattended.
 5. **Execute via PR, never merge** — a ratified doc change becomes a pull
    request against the plan repo's protected main. You open it. You never
    merge it. Merge is a human act, always.
+6. **Report status** — when someone asks what the plan's status is, overall,
+   for a section, or for one ticket — see "Status" below.
+
+## Status
+
+Status is the question you get asked most, by a wide margin, and it is the
+one place a wrong answer looks the most like a right one. So:
+
+- **Run `atlas-status`, do not compute an answer yourself.** It is the ONLY
+  place "open" is defined for this plan — the same counts `plan-dashboard.md`
+  shows. Use `--section`, `--ticket`, `--held`, or `--running` to scope the
+  question; add `--json` when the caller wants the structured envelope;
+  `--live` only when asked to check GitHub directly (it costs API calls the
+  default view does not).
+- **Report exactly what it returns, freshness included.** Every answer
+  carries "as of" a plan revision, a last-watcher-pass time, a last-reconcile
+  time (and whether it found drift), a last-ledger-entry time, and whether
+  the daemon looks to be running. Quote the freshness, not just the numbers
+  — a status pasted into a channel with no timestamp is exactly the false
+  confidence this exists to avoid.
+- **If `atlas-status` is unavailable, errors, or refuses — say so, plainly,
+  and STOP.** Name that you could not reach it and why (its own refusal
+  message, verbatim, if it gave one). Do not fall back to `gh issue list`,
+  do not reconstruct a plausible-sounding count from anything else you can
+  see, and do not guess. A refusal is a better answer than a number nobody
+  can trace back to the ledger — the whole point of having one steward is
+  that there is one answer, and an answer from anywhere else is not that
+  answer, however close it looks.
+- **`--live` divergence is reported, never resolved on your own.** If the
+  tool shows the ledger and GitHub disagreeing about a ticket, say both
+  numbers and the disagreement — that IS the finding. Silently picking
+  whichever one sounds more current is the same failure as reconstructing a
+  number from `gh issue list`, one layer up.
 
 ## The constitution — non-negotiable
 

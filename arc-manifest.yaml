@@ -13,7 +13,7 @@
 
 schema: arc/v1
 name: "metafactory-cortex-agent-atlas"
-version: "0.1.0"
+version: "0.2.0"
 type: agent
 tier: community
 license: "MIT"
@@ -28,6 +28,19 @@ repository: "the-metafactory/metafactory-cortex-agent-atlas"
 
 targets:
   - cortex
+
+# provides.files — the `atlas status` CLI (atlas#28). Shipped from this SAME
+# bundle (Atlas is `type: agent`; arc scopes one type per manifest, so the
+# status tool travels with the agent it reads state for rather than as a
+# separate package) via the `{bin}` token, so it lands on PATH the same way
+# any other arc-installed tool does. Read-only against `state.sqlite`
+# (`AtlasStateStore.openReadOnly` — SQLITE_OPEN_READONLY) and, with `--live`,
+# the same `gh api` read already declared under `capabilities.bash` below —
+# no new filesystem or network capability is needed for it.
+provides:
+  files:
+    - source: bin/atlas-status
+      target: "{bin}/atlas-status"
 
 # Brain secrets: no API key, no token, no credential of its own — the hybrid
 # voice runs through the STACK'S substrate auth (agent.yaml
