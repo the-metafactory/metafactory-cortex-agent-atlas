@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authorizeRatifierAction,
@@ -11,7 +11,13 @@ import {
   type RatifyIdentityConfig,
 } from "./identity";
 import { requireRatification, type RatificationCertificate } from "./ratification";
-import { AtlasProposals, AtlasStateStore, type DashboardSpawnResult } from "./state";
+import {
+  AtlasProposals,
+  AtlasStateStore,
+  defaultBundleDir,
+  defaultInstanceDir,
+  type DashboardSpawnResult,
+} from "./state";
 
 let dir: string;
 let store: AtlasStateStore;
@@ -432,5 +438,66 @@ describe("atlas#8 finding 5 — dashboard-regen subprocess spawns are bounded, n
       opened.close();
       rmSync(dir2, { recursive: true, force: true });
     }
+  });
+});
+
+describe("atlas#15/#19 — defaultInstanceDir / defaultBundleDir path resolution", () => {
+  test("defaultInstanceDir names the flat ~/.config/cortex/agents/atlas convention, not the metafactory/cortex config-move path", () => {
+    // Matches arc-manifest.yaml's `owns.state` and cortex's own
+    // `resolveInstanceDir()` (host hardcoded to the literal "cortex" at every
+    // call site — never derived from cortexConfigDir()/METAFACTORY_DIRNAME).
+    expect(defaultInstanceDir()).toBe(join(homedir(), ".config", "cortex", "agents", "atlas"));
+    expect(defaultInstanceDir()).not.toContain("metafactory/cortex");
+  });
+
+  describe("defaultBundleDir — existence-gated canonical/legacy resolution", () => {
+    let fakeHome: string;
+
+    beforeEach(() => {
+      fakeHome = mkdtempSync(join(tmpdir(), "atlas-bundle-home-"));
+    });
+
+    afterEach(() => {
+      rmSync(fakeHome, { recursive: true, force: true });
+    });
+
+    test("neither tree exists -> falls back to the canonical path (never the legacy one)", () => {
+      const dirPath = defaultBundleDir({ home: fakeHome, env: {} });
+      expect(dirPath).toBe(
+        join(fakeHome, ".local", "share", "metafactory", "arc", "repos", "agent-state"),
+      );
+    });
+
+    test("only the legacy pre-arc#287 tree exists -> resolves to it", () => {
+      const legacy = join(fakeHome, ".config", "metafactory", "pkg", "repos", "agent-state");
+      mkdirSync(legacy, { recursive: true });
+      const dirPath = defaultBundleDir({ home: fakeHome, env: {} });
+      expect(dirPath).toBe(legacy);
+    });
+
+    test("both trees exist -> the canonical (current arc install) tree wins", () => {
+      const canonical = join(
+        fakeHome,
+        ".local",
+        "share",
+        "metafactory",
+        "arc",
+        "repos",
+        "agent-state",
+      );
+      const legacy = join(fakeHome, ".config", "metafactory", "pkg", "repos", "agent-state");
+      mkdirSync(canonical, { recursive: true });
+      mkdirSync(legacy, { recursive: true });
+      const dirPath = defaultBundleDir({ home: fakeHome, env: {} });
+      expect(dirPath).toBe(canonical);
+    });
+
+    test("honors $XDG_DATA_HOME for the canonical tree", () => {
+      const xdgData = join(fakeHome, "custom-data-home");
+      const canonical = join(xdgData, "metafactory", "arc", "repos", "agent-state");
+      mkdirSync(canonical, { recursive: true });
+      const dirPath = defaultBundleDir({ home: fakeHome, env: { XDG_DATA_HOME: xdgData } });
+      expect(dirPath).toBe(canonical);
+    });
   });
 });

@@ -466,14 +466,84 @@ const defaultSpawnDashboardProcess: DashboardSpawnFn = (cmd, opts) =>
  */
 const DEFAULT_DASHBOARD_DEBOUNCE_MS = 250;
 
-/** `~/.config/cortex/agents/atlas` — matches arc-manifest.yaml's `owns.state`. */
+/**
+ * `~/.config/cortex/agents/atlas` — matches arc-manifest.yaml's `owns.state`.
+ *
+ * This is NOT the pre-XDG-split legacy path (atlas#19's premise correction):
+ * cortex's `~/.config/metafactory/cortex` move (cortex#1869) is scoped to
+ * config FILES only (`config-path.ts`'s own header: "does NOT touch the live
+ * runtime state the same directory also holds — `state/`, `networks/`,
+ * `logs/`, `personas/`"). Per-agent instance state is a SEPARATE resolver,
+ * `resolveInstanceDir()` in cortex's `src/common/agents/agent-state-scaffold.ts`,
+ * which builds `~/.config/<host>/agents/<id>` with `host` defaulting to the
+ * literal string `"cortex"` at every call site — never derived from
+ * `cortexConfigDir()`/`METAFACTORY_DIRNAME`. So the flat `~/.config/cortex/agents/`
+ * tree IS the canonical, current location for agent instance state, and this
+ * already agrees with it. Verified empirically on a live host: `~/.config/
+ * metafactory/cortex` has no `agents/` subdirectory at all, while `~/.config/
+ * cortex/agents/` holds every installed agent's real instance dir (escort,
+ * luna, sage, …).
+ */
 export function defaultInstanceDir(): string {
   return join(homedir(), ".config", "cortex", "agents", "atlas");
 }
 
-/** Where `arc` installs the agent-state bundle on a cortex host. */
-export function defaultBundleDir(): string {
-  return join(homedir(), ".config", "metafactory", "pkg", "repos", "agent-state");
+/** Injectable `{home, env}` seam for hermetic tests (mirrors cortex's `ArcPackReposDirSeam`). */
+export interface BundleDirSeam {
+  home?: string;
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * arc's canonical package-repos dir, byte-mirroring arc's own `dataRoot/repos`
+ * resolution (`arc/src/lib/paths.ts` `reposDir`) and cortex's
+ * `arcCanonicalPackReposDir()` (`src/common/config/arc-pack-repos-dir.ts`,
+ * cortex#2007): `($XDG_DATA_HOME` trimmed, or `~/.local/share`) / metafactory
+ * / arc / repos.
+ */
+function arcCanonicalPackReposDir(seam?: BundleDirSeam): string {
+  const home = seam?.home ?? homedir();
+  const raw = (seam?.env ?? process.env).XDG_DATA_HOME?.trim();
+  const base = raw ? raw : join(home, ".local", "share");
+  return join(base, "metafactory", "arc", "repos");
+}
+
+/**
+ * arc's LEGACY (pre-arc#287) package-repos dir `~/.config/metafactory/pkg/repos`
+ * — the path a `singleTree` / `ARC_CONFIG_ROOT`-override install still uses.
+ * Read-fallback only, existence-gated in {@link defaultBundleDir}.
+ */
+function legacyArcPackReposDir(seam?: BundleDirSeam): string {
+  return join(seam?.home ?? homedir(), ".config", "metafactory", "pkg", "repos");
+}
+
+/**
+ * Where `arc` installs the agent-state bundle on a cortex host.
+ *
+ * Existence-gated, mirroring arc's own `dataRoot/repos` resolution and
+ * cortex's `resolveArcPackReposDir()` (cortex#2007): the canonical XDG tree
+ * wins if it exists (a default / migrated box), else the legacy
+ * `~/.config/metafactory/pkg/repos` tree if IT exists (a singleTree /
+ * `ARC_CONFIG_ROOT`-override install), else the canonical path as the
+ * fresh-host default.
+ *
+ * Before this fix (atlas#15/#19) this unconditionally returned the legacy
+ * path — arc's PRE-#287 default. On a real, migrated host BOTH trees exist,
+ * so this failed quietly rather than loudly: `regenDashboard` ran against a
+ * legacy clone dated 27 April rather than the current bundle arc actually
+ * installs at `~/.local/share/metafactory/arc/repos/agent-state` — a worse
+ * outcome than a no-op, because the dashboard looked live while being
+ * produced by months-stale code. Existence-gating (rather than a bare
+ * canonical-string swap) means a `singleTree` install that genuinely still
+ * has content ONLY at the legacy path keeps resolving there, instead of
+ * silently pointing at an empty canonical dir.
+ */
+export function defaultBundleDir(seam?: BundleDirSeam): string {
+  const canonical = join(arcCanonicalPackReposDir(seam), "agent-state");
+  if (existsSync(canonical)) return canonical;
+  const legacy = join(legacyArcPackReposDir(seam), "agent-state");
+  if (existsSync(legacy)) return legacy;
+  return canonical;
 }
 
 function warn(msg: string): void {

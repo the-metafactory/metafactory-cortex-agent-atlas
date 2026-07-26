@@ -18,7 +18,27 @@
 # scaffold is a real error.
 set -euo pipefail
 
-SCAFFOLD="${AGENT_STATE_SCAFFOLD:-$HOME/.config/metafactory/pkg/repos/agent-state/skill/scripts/scaffold.ts}"
+# Bundle-root resolution mirrors brain/state.ts's `defaultBundleDir()` and
+# cortex's `resolveArcPackReposDir()` (cortex#2007): canonical XDG tree
+# (`$XDG_DATA_HOME`, else `~/.local/share`) first, existence-gated fall back
+# to the legacy pre-arc#287 `~/.config/metafactory/pkg/repos` tree, else the
+# canonical path (a fresh host with no bundle installed at all — the
+# "not installed" skip below then fires correctly). atlas#15/#19: the old
+# unconditional legacy default meant this script (like the brain) resolved a
+# stale April clone instead of the bundle arc actually installs today.
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CANONICAL_SCAFFOLD="$DATA_HOME/metafactory/arc/repos/agent-state/skill/scripts/scaffold.ts"
+LEGACY_SCAFFOLD="$HOME/.config/metafactory/pkg/repos/agent-state/skill/scripts/scaffold.ts"
+
+if [ -n "${AGENT_STATE_SCAFFOLD:-}" ]; then
+  SCAFFOLD="$AGENT_STATE_SCAFFOLD"
+elif [ -f "$CANONICAL_SCAFFOLD" ]; then
+  SCAFFOLD="$CANONICAL_SCAFFOLD"
+elif [ -f "$LEGACY_SCAFFOLD" ]; then
+  SCAFFOLD="$LEGACY_SCAFFOLD"
+else
+  SCAFFOLD="$CANONICAL_SCAFFOLD"
+fi
 INSTANCE_DIR="${MF_INSTANCE_DIR:-$HOME/.config/cortex/agents/atlas}"
 
 if ! command -v bun >/dev/null 2>&1; then
