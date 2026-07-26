@@ -1879,10 +1879,14 @@ describe("issue #6 finding 2 — degraded is not absent", () => {
     // awaiting a decision. Nothing was changed." about a row that was sitting
     // in waiting_human on disk — and got it for every subsequent verb, until
     // restart.
+    //
+    // atlas#8: `hasSeenGateMessage` now reads the dedicated `gate_replay_keys`
+    // index instead of scanning `events` — same failure shape, different
+    // table, so the injected fault below targets that table's name instead.
     const displayId = surface("c1");
     expect(rawRow("c1")?.status).toBe("waiting_human"); // genuinely live
 
-    const disarm = failNextQuery("gate_message_id");
+    const disarm = failNextQuery("gate_replay_keys");
     const out = processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
     disarm();
 
@@ -1905,7 +1909,7 @@ describe("issue #6 finding 2 — degraded is not absent", () => {
 
   test("DECLINE takes the same honest branch when state is unreadable", () => {
     const displayId = surface("c1");
-    const disarm = failNextQuery("gate_message_id");
+    const disarm = failNextQuery("gate_replay_keys");
     const out = processGateMessage(msg(`DECLINE ${displayId} nope`, { id: "m1" }), config, state);
     disarm();
 
@@ -1931,7 +1935,7 @@ describe("issue #6 finding 2 — degraded is not absent", () => {
     const displayId = surface("c1");
     expect(state.degradation()).toBeNull();
 
-    const disarm = failNextQuery("gate_message_id");
+    const disarm = failNextQuery("gate_replay_keys");
     processGateMessage(msg(`RATIFY ${displayId}`, { id: "m1" }), config, state);
     disarm();
 
