@@ -24,6 +24,7 @@ function armedEnv(): Record<string, string> {
     ATLAS_PLAN_REPO: "acme/widgets",
     ATLAS_PLAN_ISSUE: "4",
     ATLAS_CHANNEL_ID: CHANNEL_ID,
+    ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:instance-fixture-0000",
   };
 }
 
@@ -65,6 +66,22 @@ describe("the verdict", () => {
     expect(line).toContain("1 platform id(s)");
     expect(line).toContain("plan=acme/widgets#4");
     expect(line).toContain("state=durable");
+  });
+
+  test("the ARMED line shows the trusted-adapter-instance COUNT (atlas#24 B1)", () => {
+    // The exact failure an adversarial review reproduced: a wrong (but
+    // non-empty) ATLAS_TRUSTED_ADAPTER_INSTANCES rejected 100% of traffic
+    // while the line still said GATE ARMED, because this second admission
+    // dimension appeared nowhere in it — only `channelId` did. A count is
+    // enough to notice "0 configured" or "not what I expected" without
+    // leaking the value itself.
+    const env = armedEnv();
+    env.ATLAS_TRUSTED_ADAPTER_INSTANCES = "discord:one,discord:two";
+    const line = buildStartupLine(facts({}, env));
+    expect(line).toContain("GATE ARMED");
+    expect(line).toContain("adapterInstances=2");
+    expect(line).not.toContain("discord:one");
+    expect(line).not.toContain("discord:two");
   });
 
   test("it is ONE line — no embedded newline anywhere", () => {
@@ -124,6 +141,18 @@ describe("the verdict", () => {
     expect(line).toContain("the gate never sees it");
   });
 
+  test("no trusted adapter instance ⇒ UNARMED, naming unreachability as the reason (atlas#24)", () => {
+    // Same shape as the missing-channel-id case above: identity loads and
+    // state is durable, but the second admission check (`runtime.ts`) still
+    // makes every message unreachable, so ARMED would overstate the promise.
+    const env = armedEnv();
+    delete env.ATLAS_TRUSTED_ADAPTER_INSTANCES;
+    const line = buildStartupLine(facts({ stateDurable: true }, env));
+    expect(line.startsWith("atlas: GATE UNARMED (")).toBe(true);
+    expect(line).toContain("unreachable:missing-adapter-instances");
+    expect(line).toContain("IGNORED");
+  });
+
   test("every blocking reason is named at once, not one reboot at a time", () => {
     const env = armedEnv();
     delete env.ATLAS_SELF_PLATFORM_IDS;
@@ -168,5 +197,34 @@ describe("the verdict", () => {
   test("the overlay file is named with the count it filled", () => {
     const line = buildStartupLine(facts({ envPath: "/tmp/x/.env", envFilled: 6 }));
     expect(line).toContain("env=/tmp/x/.env(+6)");
+  });
+
+  // atlas#24 B1 — the structural guard against a THIRD admission dimension
+  // repeating this exact finding. This cannot fully automate the judgment
+  // call ("does a new field belong in the ARMED line?") — that is still a
+  // human decision — but it makes silently SKIPPING that decision impossible:
+  // `EffectsConfig`'s own key list is pinned here, so the moment a developer
+  // adds a field to the interface without touching this test, the suite
+  // fails on THIS line, not three atlas#-issues later after an adversarial
+  // review finds it again.
+  test("every EffectsConfig field is accounted for here — a new one must update this test", () => {
+    const loaded = loadEffectsConfig(armedEnv());
+    if (loaded.kind !== "ok") throw new Error("fixture: expected ok");
+    const KNOWN_FIELDS = [
+      "plan", // shown: `plan=`
+      "planUrl", // NOT shown (derived from `plan`; redundant with it)
+      "channelId", // shown, masked: `channel=`
+      "trustedAdapterInstances", // shown, count-only: `adapterInstances=`
+      "baseBranch", // shown: `base=`
+      "checkoutDir", // shown: `docPRs=`
+    ].sort();
+    expect(Object.keys(loaded.config).sort()).toEqual(KNOWN_FIELDS);
+
+    const line = buildStartupLine(facts());
+    expect(line).toContain("channel=");
+    expect(line).toContain("adapterInstances=");
+    expect(line).toContain("base=");
+    expect(line).toContain("docPRs=");
+    expect(line).toContain("plan=");
   });
 });

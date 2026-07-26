@@ -113,15 +113,28 @@ An id listed in **both** `ATLAS_SELF_PLATFORM_IDS` and `ATLAS_RATIFIER_PLATFORM_
 
 ### Required — the effect universe
 
-One repo, one issue, one channel. All three come from configuration, never from a proposal's content.
+One repo, one issue, one channel, one set of recognised adapter instances. All four come from configuration, never from a proposal's content.
 
 | Variable | What it does | If missing or unusable |
 |---|---|---|
 | `ATLAS_PLAN_REPO` | `owner/repo` of the plan issue. Intended value: `the-metafactory/vision`. **No code default.** | Refusal `missing-plan-repo` / `malformed-plan-repo`. Atlas still intakes, surfaces and ratifies, but **cannot edit the plan, post to the ledger, or open a PR**. |
 | `ATLAS_PLAN_ISSUE` | The plan issue number — a positive integer. Intended value: `4`. **No code default.** | Refusal `missing-plan-issue`. Same consequence. |
 | `ATLAS_CHANNEL_ID` | The one Discord channel the ledger posts to. An opaque string, compared with `===`. | Refusal `missing-channel-id` / `malformed-channel-id`. Same consequence. |
+| `ATLAS_TRUSTED_ADAPTER_INSTANCES` | The adapter-instance id(s) Atlas admits a task from, comma-separated. An opaque string per entry, compared with `===`. | Refusal `missing-adapter-instances` / `malformed-adapter-instance`. Same consequence — **and** a task is refused (silently, same as a wrong channel) even with everything else correct if its `adapter_instance` isn't in this set. |
 
 `ATLAS_CHANNEL_ID` has **two independent consumers**. cortex resolves the `__ATLAS_CHANNEL_ID__` placeholder in `presence.discord.channelId` to bind the Discord *surface*; the brain separately reads `ATLAS_CHANNEL_ID` from its own process environment to decide where a ledger post *goes*. One name, two wirings — satisfying one does not satisfy the other.
+
+#### `ATLAS_TRUSTED_ADAPTER_INSTANCES` — this is a second admission check, and the value depends on cortex's topology
+
+cortex resolves `PlatformAdapter.instanceId` **three different ways** depending on how the deployment runs, verified against cortex directly:
+
+1. **Per-stack (regular, non-gateway) boot** — `atlas-discord-<guildId>`.
+2. **Gateway, one bot token shared across multiple guilds** — `discord:token:<sha256(token, stack)[0:12]>`, a 48-bit digest of a secret.
+3. **Gateway, exactly one guild per bot token** — `discord:<guildId>`.
+
+**Do not guess which formula applies.** The reliable way to set this value is to read the real `adapter_instance` off one genuine live inbound task (a log line, or a temporary debug tap) and copy it verbatim — this pack has no way to know, from its own configuration, which topology a given deployment runs under. Getting it wrong is **silent**: a wrong-but-non-empty value refuses every message the same way a wrong channel does, and the only visible signal is the `adapterInstances=<count>` field in the boot line below (a count, never the values) disagreeing with what you expect.
+
+**What this control actually buys, stated precisely:** `deriveTaskSource` (cortex's bus consumer) reads `adapter_instance` out of the same attacker-controlled payload it reads `channel` from, so for shapes 1 and 3 above this is **not** a secret — a guild id is visible to every member of that guild, and shape 1's `atlas-discord-<guildId>` form is even less protected (the agent name is public; this repo is public). What it buys regardless of shape: it kills the lazy replay (an envelope that omits the field entirely, which an adversarial review found admitted), it kills accidental cross-wiring between two adapter instances that both reach this brain, and it forces a forger who already knows the channel to also supply a plausible-looking value rather than getting in for free. It does **not** stop someone who already knows which guild Atlas is bound to. Where the topology offers shape 2 (the token digest), prefer it — that is the one case where this is close to a real secret.
 
 ### Optional — defaulted
 

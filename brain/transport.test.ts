@@ -23,6 +23,7 @@ function effectsConfig(): EffectsConfig {
     planRepo: "acme/widgets",
     planIssue: 4,
     channelId: CHANNEL_ID,
+    adapterInstances: "adapter-fixture",
   });
   if (loaded.kind !== "ok") throw new Error("fixture: effects config refused");
   return loaded.config;

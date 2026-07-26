@@ -97,6 +97,12 @@ export class FakeCortexHost {
     private readonly env: Record<string, string>,
     /** The channel every task claims to come from — the configured ledger channel. */
     readonly channelId: string,
+    /**
+     * The adapter instance every task claims to come from. Must match one of
+     * `ATLAS_TRUSTED_ADAPTER_INSTANCES` or admission refuses the task (atlas#24)
+     * — the harness models a real adapter, and a real adapter always sends this.
+     */
+    readonly adapterInstance: string = "adapter-shadow-0000",
   ) {}
 
   async start(): Promise<void> {
@@ -196,7 +202,19 @@ export class FakeCortexHost {
         user,
         response_routing: { surface: "discord", channel, thread: channel },
       },
-      source: { surface: "discord", channel, thread: channel, user },
+      // `adapter_instance` is REQUIRED for admission since atlas#24. The real
+      // Discord adapter always sends it — cortex's `InboundMessage.instanceId`
+      // is a required string — so a harness that omitted it was not modelling
+      // the wire, it was modelling a task no adapter actually produces. Same
+      // class as the `revisedAt` fake that made the unit suite blind to #26: a
+      // double that quietly disagrees with reality validates the disagreement.
+      source: {
+        surface: "discord",
+        channel,
+        thread: channel,
+        user,
+        adapter_instance: this.adapterInstance,
+      },
     });
   }
 

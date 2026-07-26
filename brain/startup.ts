@@ -82,13 +82,36 @@ export interface StartupFacts {
  *                  degraded path refuses every RATIFY/DECLINE).
  *   reachability — with no effect target, `runtime.ts`'s `serveTask`
  *                  short-circuits to `no-effect-layer` BEFORE intake and before
- *                  the gate: `processGateMessage` is never called at all.
+ *                  the gate: `processGateMessage` is never called at all. This
+ *                  is now TWO admission dimensions, not one (atlas#24): a task
+ *                  must match BOTH the configured channel AND a trusted
+ *                  adapter instance, and either one being unreachable prints
+ *                  the same `unreachable:` blocker (`missing-channel-id` /
+ *                  `malformed-channel-id` / `missing-adapter-instances` /
+ *                  `malformed-adapter-instance`).
  *
  * Reachability is the newest of the three and by far the most deceptive
  * (atlas#20). Identity and storage both fail INSIDE the gate, which answers the
  * principal; an unreachable gate discards the message in silence. Printing
  * ARMED over that was epic #5's silently-dead gate wearing the badge this line
  * exists to withhold.
+ *
+ * ── A reachable line must show EVERY admission dimension, not just the first
+ *    one added (atlas#24 B1) ────────────────────────────────────────────────
+ * An adversarial review reproduced this exactly: a wrong (but non-empty)
+ * `ATLAS_TRUSTED_ADAPTER_INSTANCES` value made `serveTask` refuse 100% of
+ * traffic while the line still printed `GATE ARMED` — because the `effects:`
+ * clause below echoed `channelId` (the FIRST admission dimension) but not
+ * `trustedAdapterInstances` (the second one this pack added). A per-message
+ * stderr warn under an ARMED banner is not a visible failure; it is atlas#20
+ * again, one dimension later. So `effects:` now echoes BOTH — a masked
+ * `channelId` and a `trustedAdapterInstances` COUNT (never the values
+ * themselves; see `maskId`'s note on identifiers). `startup.test.ts` pins an
+ * exhaustive list of `EffectsConfig`'s own keys against what this function
+ * consumes, so a THIRD admission-relevant field added later without updating
+ * that list fails a test immediately — forcing the next person to decide, in
+ * the open, whether it belongs in this line, rather than silently repeating
+ * this finding a third time.
  *
  * The three are reported as ONE verdict rather than three claims deliberately:
  * a reader who has to assemble "armed" out of three sub-clauses scattered along
@@ -147,6 +170,7 @@ export function buildStartupLine(facts: StartupFacts): string {
     const cfg = facts.effects.config;
     parts.push(
       `effects: plan=${cfg.plan.repo}#${cfg.plan.issue} channel=${maskId(cfg.channelId)} ` +
+        `adapterInstances=${cfg.trustedAdapterInstances.size} ` +
         `base=${cfg.baseBranch} docPRs=${cfg.checkoutDir === null ? "disabled" : "enabled"}`,
     );
   } else {
