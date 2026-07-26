@@ -171,7 +171,14 @@ export function buildStartupLine(facts: StartupFacts): string {
     parts.push(
       `effects: plan=${cfg.plan.repo}#${cfg.plan.issue} channel=${maskId(cfg.channelId)} ` +
         `adapterInstances=${cfg.trustedAdapterInstances.size} ` +
-        `base=${cfg.baseBranch} docPRs=${cfg.checkoutDir === null ? "disabled" : "enabled"}`,
+        `base=${cfg.baseBranch} docPRs=${cfg.checkoutDir === null ? "disabled" : "enabled"} ` +
+        // atlas#25 — WHERE a surfaced proposal is discussed, stated at boot
+        // because it is an ADMISSION dimension, exactly like `adapterInstances`:
+        // `on` means Atlas will also admit tasks from threads it opened; `off`
+        // means the bound channel is the whole universe. An operator debugging
+        // "why did nothing happen" should not have to read code to find out
+        // which one is live.
+        `threads=${cfg.threadConversation ? "on" : "off"}`,
     );
   } else {
     parts.push(

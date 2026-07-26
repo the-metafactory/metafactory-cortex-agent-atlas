@@ -214,6 +214,73 @@ export interface EffectsConfig {
    * which is exactly what `missing-adapter-instances` refuses instead.
    */
   readonly trustedAdapterInstances: ReadonlySet<string>;
+  /**
+   * atlas#25 — may Atlas move a surfaced proposal's conversation into a thread
+   * it opens off the bound channel (`create_private_thread`, protocol.ts)?
+   *
+   * OPT-IN and OFF BY DEFAULT, which is a decision rather than timidity. Three
+   * facts about the SHIPPED host make "on by default" the wrong shape today:
+   *
+   *   1. cortex wires `create_private_thread` ONLY for agents flagged
+   *      `openOnboarding: true` (`src/runner/brain-consumer-boot.ts`). Atlas
+   *      is not anon-reachable and must not become so to obtain a thread, so
+   *      on today's cortex the request is always refused `cant_do` — the flag
+   *      would otherwise be an inert switch that changes nothing but the log.
+   *   2. cortex offers no PUBLIC-thread variant. atlas#25 records a preference
+   *      for a public thread ("the plan is public; the community may want to
+   *      follow a proposal's reasoning"); the only effect on the wire opens a
+   *      PRIVATE one. Defaulting ON would silently ship the option the
+   *      principal did not choose.
+   *   3. A ledger entry cannot follow the conversation into the thread and
+   *      cannot be steered back out of it (`transport.ts`; cortex#2248's
+   *      per-task retarget). While an exchange lives in a thread, a ledger
+   *      entry earned there PARKS for `reconcile.ts` to carry on the next post
+   *      window opened from the bound channel itself.
+   *
+   * `false` (the default) ⇒ the emitted effect stream is byte-identical to
+   * pre-atlas#25 Atlas.
+   *
+   * ── It is a KILL SWITCH, and it works in both directions (BLOCKER 2) ──────
+   * This flag gates BOTH halves: opening threads AND admitting a message from
+   * a thread already opened (`runtime.ts`'s admission union). An earlier draft
+   * gated only the first — which meant an operator who enabled threads, saw
+   * trouble, and flipped the flag off had NOT narrowed admission back. Rows
+   * never expire and there is no revoke verb, so every thread ever opened
+   * stayed admitted, forever. An irrevocable widening of the surface in front
+   * of the ratification gate, with no operator control, is not a defensible
+   * thing to ship.
+   *
+   * So: OFF ⇒ on the next boot Atlas admits the bound channel and nothing
+   * else, whatever the registry holds. One honest cost, stated rather than
+   * hidden: while it is off, a reply typed in a thread Atlas opened earlier is
+   * refused in silence and the conversation must return to the channel.
+   * Turning it back on re-admits those same threads (rows are kept, not
+   * deleted), which is what makes this a switch and not a demolition.
+   */
+  readonly threadConversation: boolean;
+}
+
+/**
+ * Parse the `ATLAS_THREAD_CONVERSATION` opt-in. Anything that is not an
+ * explicit, recognised affirmative is `false` — an unparseable value must not
+ * turn a capability ON by accident, and there is no refusal for it because a
+ * typo here should degrade to today's behaviour, not disable Atlas's whole
+ * effect layer.
+ *
+ * FAIL-CLOSED BY ALLOWLIST, never by denylist (adversarial review, M1). The
+ * distinction is the whole property: a denylist (`v !== "0" && v !== "false"`)
+ * reads as equivalent and arms the capability on a blank string, a typo,
+ * `off`, `no`, `disabled`, or anything else nobody thought to list — and the
+ * capability it arms sits in front of the ledger. The allowlist below is
+ * pinned by negative tests in `config.test.ts` precisely because the wrong
+ * version passes every positive test.
+ */
+const THREAD_CONVERSATION_TRUE: ReadonlySet<string> = new Set(["1", "true", "yes", "on"]);
+
+function parseThreadConversation(raw: string | boolean | undefined): boolean {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return false;
+  return THREAD_CONVERSATION_TRUE.has(raw.trim().toLowerCase());
 }
 
 export type EffectsConfigRefusal =
@@ -245,6 +312,8 @@ export function makeEffectsConfig(input: {
   adapterInstances: string;
   baseBranch?: string | undefined;
   checkoutDir?: string | undefined;
+  /** atlas#25 opt-in; absent/unrecognised ⇒ `false`. See `threadConversation`. */
+  threadConversation?: string | boolean | undefined;
 }): EffectsConfigLoad {
   const repo = typeof input.planRepo === "string" ? input.planRepo.trim() : "";
   if (repo.length === 0) {
@@ -326,6 +395,7 @@ export function makeEffectsConfig(input: {
       baseBranch,
       checkoutDir: checkoutRaw.length > 0 ? checkoutRaw : null,
       trustedAdapterInstances,
+      threadConversation: parseThreadConversation(input.threadConversation),
     }),
   };
 }
@@ -341,6 +411,9 @@ export function makeEffectsConfig(input: {
  *                                    from (atlas#24); comma/whitespace-separated
  *   ATLAS_PLAN_BASE_BRANCH           optional, default `main`
  *   ATLAS_PLAN_CHECKOUT              optional local clone for doc-change PRs (J6)
+ *   ATLAS_THREAD_CONVERSATION        optional opt-in (atlas#25); `1`/`true`/`yes`/`on`
+ *                                    ⇒ surface a proposal into a thread Atlas opens.
+ *                                    Anything else, including unset ⇒ off.
  */
 export function loadEffectsConfig(
   env: Record<string, string | undefined> = process.env,
@@ -352,6 +425,7 @@ export function loadEffectsConfig(
     adapterInstances: env.ATLAS_TRUSTED_ADAPTER_INSTANCES ?? "",
     baseBranch: env.ATLAS_PLAN_BASE_BRANCH,
     checkoutDir: env.ATLAS_PLAN_CHECKOUT,
+    threadConversation: env.ATLAS_THREAD_CONVERSATION,
   });
 }
 

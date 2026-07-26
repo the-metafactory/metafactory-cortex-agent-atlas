@@ -33,13 +33,38 @@
  * The result is: correct always, prompt when there is traffic, and never a
  * claim that something was said when it was not.
  *
- * ── Admission is config-pinned ─────────────────────────────────────────────
- * A task is served only when its HOST-RESOLVED `source.channel` is the
- * configured ledger channel. Atlas's presence already binds it to one channel,
- * so this is defence in depth — but it is the difference between "the adapter
- * is expected not to deliver that" and "Atlas will not act on it". A
- * non-admitted task is answered with silence (a `log` effect, no `post`):
- * replying would let anyone anywhere make Atlas speak.
+ * ── Admission is config-pinned (and state-pinned, atlas#22) ────────────────
+ * A task is served only when its HOST-RESOLVED `source.channel` is either
+ *
+ *   1. the configured ledger channel, or
+ *   2. a thread ATLAS ITSELF OPENED and durably recorded opening
+ *      (`state.isOwnedThread`, the `owned_threads` table).
+ *
+ * Atlas's presence already binds it to one channel, so (1) is defence in depth
+ * — but it is the difference between "the adapter is expected not to deliver
+ * that" and "Atlas will not act on it". A non-admitted task is answered with
+ * silence (a `log` effect, no `post`): replying would let anyone anywhere make
+ * Atlas speak.
+ *
+ * (2) exists because the shipped Discord adapter sets `source.channel` to the
+ * THREAD's own snowflake and sends no parent-channel signal at all (see
+ * `protocol.ts`'s `TaskSource`) — so before atlas#22 a reply typed in a thread
+ * was refused in silence, including a `RATIFY` the agent had itself invited.
+ * "A thread under my channel" is a question this protocol cannot answer; "a
+ * thread I opened" is one only Atlas's own write record can answer, which is
+ * exactly what it is. Three properties of that record are load-bearing:
+ *
+ *   - it is written ONLY from a host-resolved `thread_created.thread_id`
+ *     correlated to a `create_private_thread` THIS process emitted;
+ *   - it is DURABLE, so a restart does not make Atlas deaf in a thread it is
+ *     still talking in (`state.ts`'s `OWNED_THREADS_SCHEMA`);
+ *   - it widens WHERE Atlas listens and nothing else. Identity is unchanged:
+ *     `ratify.ts` authorises on the platform-authenticated author id against
+ *     the configured principal map, never on which room the message arrived
+ *     in. A thread is not an authority.
+ *
+ * The adapter-instance check (atlas#24) applies to BOTH, unchanged and in the
+ * same silence.
  *
  * A SECOND admission check, same disposition, same silence (atlas#24):
  * `source.adapter_instance` must be a member of `effects.trustedAdapterInstances`.
@@ -108,11 +133,32 @@ export interface AtlasRuntimeDeps {
   readonly instanceDir: string | null;
   readonly watchIntervalMs: number;
   readonly reconcileIntervalMs: number;
+  /**
+   * How long to wait for the host's answer to a `create_private_thread`
+   * before giving up and conversing in the bound channel instead (atlas#25).
+   *
+   * A wait is safe by contract: cortex PAUSES the task's liveness timeout
+   * while a thread create is in flight (`daemon-brain-host.ts`, the same pause
+   * `ask_principal` gets), so this cannot race the host into failing the task.
+   * It is bounded anyway — a host that never answers must not hold a user's
+   * task open forever, and the fallback (post in the channel) is exactly
+   * today's behaviour, never a lost reply.
+   */
+  readonly threadWaitMs?: number;
   /** Injectable clock/timers so no test ever waits on a real interval. */
   readonly now?: () => number;
   readonly setIntervalFn?: (fn: () => void, ms: number) => unknown;
   readonly clearIntervalFn?: (handle: unknown) => void;
 }
+
+/**
+ * The default bound on waiting for a `thread_created` / `effect_rejected`.
+ * Generous, because the host is doing a real Discord REST round trip with the
+ * liveness timer paused; bounded, because a silent host must not hold a user's
+ * task open. Overridable per-runtime (`AtlasRuntimeDeps.threadWaitMs`) so no
+ * test ever waits on it.
+ */
+const DEFAULT_THREAD_WAIT_MS = 10_000;
 
 /** What one served task did. Recorded for the `result` summary and for tests. */
 export type TaskDisposition =
@@ -126,11 +172,50 @@ export type TaskDisposition =
   | "gate-replied"
   | "gate-ignored";
 
+/**
+ * The answer to one `create_private_thread` request. Never throws.
+ *
+ * `recorded` is separate from `created` on purpose: the host can succeed at
+ * making the thread while Atlas fails to durably note that it owns it (a
+ * degraded store, a malformed id, an id that collides with the bound channel).
+ * The conversation has moved either way — the host retargets before it
+ * answers — so the two facts must be reportable independently.
+ */
+type ThreadOutcome =
+  | { kind: "created"; threadId: string; recorded: boolean }
+  | { kind: "refused"; detail: string };
+
 export class AtlasRuntime {
   private readonly deps: AtlasRuntimeDeps;
   private readonly now: () => number;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
+  private readonly threadWaitMs: number;
+
+  /**
+   * In-flight `create_private_thread` correlation: task id → the resolver its
+   * answer settles. TRANSIENT per-task plumbing (escort's `pendingThreads`),
+   * never member/thread state — the durable half is `owned_threads` in
+   * `state.ts`, written only once the host has answered.
+   *
+   * An answer for a task id that is NOT in this map is dropped and logged: it
+   * is either stale, cancelled, or an event Atlas never asked for, and none of
+   * those may write the registry that decides what Atlas admits.
+   */
+  private readonly pendingThreads = new Map<string, (outcome: ThreadOutcome) => void>();
+
+  /**
+   * Task ids Atlas has emitted a `create_private_thread` for and not yet had
+   * an answer to. Deliberately OUTLIVES the resolver above: a `thread_created`
+   * that arrives after the turn timed out still describes a real thread, and
+   * recording it is the difference between "Atlas hears that thread" and "an
+   * orphan thread Atlas opened and is deaf in". Cleared on the answer, on
+   * `cancel`, and on a send that never left.
+   *
+   * This — not the resolver map — is the guard that decides whether an inbound
+   * `thread_created` may write the owned-thread registry.
+   */
+  private readonly requestedThreads = new Set<string>();
 
   /**
    * Serialises EVERYTHING — served tasks and scheduled passes alike — onto one
@@ -171,6 +256,8 @@ export class AtlasRuntime {
     watchPasses: 0,
     reconcilePasses: 0,
     effectRejections: 0,
+    /** Threads the host opened for Atlas AND Atlas durably recorded owning. */
+    threadsOpened: 0,
   };
 
   constructor(deps: AtlasRuntimeDeps) {
@@ -180,6 +267,10 @@ export class AtlasRuntime {
       deps.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms) as unknown);
     this.clearIntervalFn =
       deps.clearIntervalFn ?? ((h) => { clearInterval(h as ReturnType<typeof setInterval>); });
+    this.threadWaitMs =
+      typeof deps.threadWaitMs === "number" && deps.threadWaitMs > 0
+        ? deps.threadWaitMs
+        : DEFAULT_THREAD_WAIT_MS;
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -254,16 +345,51 @@ export class AtlasRuntime {
       case "effect_rejected":
         this.stats.effectRejections += 1;
         this.deps.effectLayer?.transport.noteRejection(event.task_id, event.effect);
+        // A refused thread create is a FIRST-CLASS outcome, not an error: the
+        // serving task is waiting on exactly this answer and falls back to the
+        // bound channel when it arrives (see `openThread`). Settled
+        // SYNCHRONOUSLY here, never through `enqueue` — the task that is
+        // waiting holds the queue, so queueing the answer behind it would
+        // deadlock until the wait times out.
+        if (event.effect === "create_private_thread") {
+          this.settleThread(event.task_id, {
+            kind: "refused",
+            detail: `${event.reason.kind}: ${event.reason.detail}`,
+          });
+        }
         warn(
           `HOST REFUSED effect "${event.effect}" on task ${event.task_id} ` +
             `(${event.reason.kind}): ${event.reason.detail}`,
         );
         return;
+      case "thread_created":
+        // The host opened a thread on this task (cortex#2206). TWO things
+        // happen, in this order, and the order is the whole point:
+        //
+        //   1. The TRANSPORT is told, UNCONDITIONALLY — because the host has
+        //      already retargeted this task's conversation into the thread
+        //      (cortex#2248 performs the retarget BEFORE sending this event),
+        //      so every subsequent post on this task lands there whether or
+        //      not Atlas asked for the thread or still remembers asking. A
+        //      ledger post after this point must be refused, never receipted.
+        //   2. The REGISTRY is written only if Atlas correlated this to a
+        //      `create_private_thread` IT emitted.
+        //
+        // The asymmetry is deliberate. (1) is Atlas believing the host about
+        // the host's OWN routing, which is true by construction. (2) is Atlas
+        // widening its own admission, which requires Atlas's own evidence.
+        this.deps.effectLayer?.transport.noteRetarget(event.task_id);
+        this.onThreadCreated(event.task_id, event.thread_id);
+        return;
       case "cancel":
+        // Drop any in-flight thread correlation: the task is going away, and a
+        // thread recorded against an abandoned task would be one Atlas listens
+        // in but never spoke in.
+        this.requestedThreads.delete(event.task_id);
+        this.settleThread(event.task_id, { kind: "refused", detail: "task cancelled by host" });
         warn(`cancel for task ${event.task_id} — nothing long-running to abandon`);
         return;
       case "gate_verdict":
-      case "thread_created":
       case "composed":
         // Atlas emits none of the effects these answer (see protocol.ts). An
         // arrival means a host/agent-identity mix-up, which is worth a line.
@@ -296,9 +422,36 @@ export class AtlasRuntime {
       // it cannot keep. `main.ts`'s startup line already said this out loud.
       this.log("error", "no effect config — Atlas admits nothing and can perform no effect");
       disposition = "no-effect-layer";
-    } else if (channel !== layer.effects.channelId) {
-      // Config-pinned admission. Silent to the surface on purpose: a reply here
-      // would let anyone, anywhere, make Atlas speak.
+    } else if (
+      channel !== layer.effects.channelId &&
+      // THE KILL SWITCH (adversarial review, BLOCKER 2). The owned-thread half
+      // of admission is gated by the SAME flag that opens threads in the first
+      // place, so turning `ATLAS_THREAD_CONVERSATION` off genuinely narrows
+      // admission back to the bound channel on the next boot.
+      //
+      // Before this, the union was unconditional: rows never expire and there
+      // is no revoke verb, so an operator who enabled threads, saw trouble and
+      // flipped the flag off had NOT taken the surface away — every thread ever
+      // opened stayed admitted forever. An irrevocable widening in front of the
+      // ratification gate, with no operator control, is not a defensible thing
+      // to ship; a widening the operator can withdraw with the switch they used
+      // to grant it is.
+      //
+      // The cost is stated rather than hidden: with the flag off, a reply typed
+      // in a thread Atlas previously opened is refused in silence — the
+      // pre-atlas#22 behaviour, now deliberately chosen by an operator instead
+      // of imposed by a bug. The conversation moves back to the channel.
+      (!layer.effects.threadConversation || !this.deps.state.isOwnedThread(channel))
+    ) {
+      // Config-pinned admission, UNION the state-pinned one (atlas#22): the
+      // bound ledger channel, or — while the flag is on — a thread Atlas itself
+      // opened and durably recorded opening. Nothing else, and they are checked
+      // in that order so the ordinary case costs no query.
+      //
+      // Silent to the surface on purpose, for BOTH halves: a reply here would
+      // let anyone, anywhere, make Atlas speak — and a DISTINGUISHABLE silence
+      // ("wrong channel" vs "not one of my threads") would tell a prober which
+      // thread ids Atlas owns.
       this.stats.notAdmitted += 1;
       this.log("warn", "task from a channel Atlas is not bound to — ignored, nothing recorded");
       disposition = "not-admitted";
@@ -397,6 +550,14 @@ export class AtlasRuntime {
 
     if (outcome.kind === "surfaced") {
       this.stats.surfaced += 1;
+      // atlas#25 — move the EXCHANGE (not the ledger) into a thread Atlas
+      // opens, when the deployment has opted in. Awaited before the reply so
+      // the summary lands in the thread rather than racing it into the parent
+      // channel: the host retargets this task the moment the thread exists
+      // (cortex#2248), so post-order is what decides where the words appear.
+      // Every failure path falls through to the pre-atlas#25 behaviour — a
+      // reply in the bound channel — and none of them costs the reply.
+      await this.openThreadForProposal(task, outcome.displayId);
       this.reply(task.task_id, outcome.reply);
       return "proposal-surfaced";
     }
@@ -459,6 +620,25 @@ export class AtlasRuntime {
           // path, and it is flagged due so the very next window carries it.
           this.due.reconcile = true;
           this.log("error", "plan changed but the ledger entry did not land — reconcile will catch up");
+          // …and name the ONE cause this slice introduced, because "reconcile
+          // will catch up" is a weaker promise here than it sounds. A ratify
+          // typed in a thread produces a task whose source is the THREAD, and
+          // a ledger entry may only ever go to the bound channel
+          // (`transport.ts`, unchanged and deliberately so). cortex offers no
+          // way to aim a post at the parent channel of the task it rides, so
+          // the entry PARKS until a post window opens from the bound channel
+          // itself — i.e. until somebody speaks to Atlas there. Documented,
+          // logged, and the reason `threadConversation` ships OFF (atlas#25).
+          if (
+            typeof task.source?.channel === "string" &&
+            task.source.channel !== layer.effects.channelId
+          ) {
+            this.log(
+              "error",
+              "this ratification arrived in a thread, and a ledger entry can only be written " +
+                "in the bound channel — the entry is PARKED until a window opens there",
+            );
+          }
         } else {
           this.stats.applyRefused += 1;
           this.log("error", `apply refused (${applied.reason})`);
@@ -587,6 +767,212 @@ export class AtlasRuntime {
     if (outcome.kind === "skipped") {
       warn(`dashboard not redrawn (${outcome.reason}): ${outcome.detail}`);
     }
+  }
+
+  // ── The thread the exchange moves into (atlas#22 + atlas#25) ─────────────
+
+  /**
+   * Ask the host to open a thread for a just-surfaced proposal, wait for its
+   * answer, and record the thread durably if it arrives.
+   *
+   * ── Every precondition, and why it refuses rather than tries ─────────────
+   *   - `threadConversation` off (the DEFAULT) ⇒ no effect at all. See
+   *     `effects/config.ts` for the three reasons that flag exists.
+   *   - the task did NOT come from the bound channel ⇒ no effect. A task
+   *     already in a thread is the conversation continuing; opening a thread
+   *     off a thread is not something this protocol offers, and re-asking
+   *     would burn the host's 10/hour create budget on every turn.
+   *   - durable state unavailable ⇒ no effect. A thread Atlas cannot RECORD is
+   *     a thread it will be deaf in after the next restart, which is precisely
+   *     the one-way conversation atlas#22 exists to prevent. Better to keep
+   *     talking where it can still hear.
+   *   - the host refuses, or never answers ⇒ the reply goes to the bound
+   *     channel, exactly as before this slice. On today's cortex this is the
+   *     ONLY outcome for Atlas (`create_private_thread` is wired for
+   *     `openOnboarding` agents only — protocol.ts), and it must be an
+   *     ordinary Tuesday, not an error path.
+   *   - the host answers with an id that does not look like a platform id, or
+   *     the write does not stick ⇒ NOT recorded, and the conversation stays in
+   *     the channel. Atlas never claims a thread it cannot re-admit.
+   *
+   * The thread NAME is Atlas's own display id (`Proposal #7`) — never message
+   * text, never a user id, never anything an outsider chose. `members:
+   * "source"` is resolved host-side to the task's own recorded source user.
+   *
+   * ── KNOWN, RECORDED, NOT FIXED HERE: an outsider-paced amplifier ─────────
+   * (adversarial review, M4 — same family as atlas#38.) Every VALID `ADD:`
+   * from anyone triggers one `create_private_thread`, against cortex's budget
+   * of 10 per hour per agent (`daemon-brain-host.ts`); ten valid proposals in
+   * an hour exhaust it, after which the host refuses and Atlas converses in
+   * the channel. And `main.ts` wires no `threadWaitMs`, so production waits
+   * the 10s default on the single serialised queue — no other task, watch or
+   * reconcile runs during that wait.
+   *
+   * Both degrade SAFELY (refusal ⇒ channel; a slow turn ⇒ a slow turn) and
+   * neither is reachable today: the flag is off by default, and on today's
+   * cortex the effect is refused immediately without I/O anyway. Not fixed in
+   * this slice because every fix worth having is a rate/queue policy that
+   * belongs with atlas#38's, not a special case bolted here — and a cheap
+   * local mitigation (a brain-side per-hour cap) would duplicate a limit the
+   * host already enforces authoritatively. The cost of leaving it: a busy day
+   * of genuine proposals can spend the thread budget on the tenth one.
+   */
+  private async openThreadForProposal(task: TaskEvent, displayId: number): Promise<void> {
+    const layer = this.deps.effectLayer;
+    if (layer === null || !layer.effects.threadConversation) return;
+    const channel = typeof task.source?.channel === "string" ? task.source.channel : "";
+    if (channel !== layer.effects.channelId) return;
+    if (!this.deps.state.isDurable()) {
+      this.log(
+        "warn",
+        "durable state unavailable — keeping the exchange in the bound channel rather than " +
+          "opening a thread Atlas could not remember (and would go deaf in)",
+      );
+      return;
+    }
+    if (!Number.isSafeInteger(displayId) || displayId <= 0) return;
+
+    const outcome = await this.openThread(task.task_id, `Proposal #${displayId}`);
+    if (outcome.kind === "refused") {
+      this.log(
+        "warn",
+        `the host would not open a thread (${outcome.detail}) — the exchange stays in the ` +
+          `bound channel, which is where Atlas can hear a reply anyway`,
+      );
+      return;
+    }
+    if (!outcome.recorded) {
+      // The thread EXISTS (the host said so) but Atlas could not durably note
+      // that it owns it — so a reply typed there would not be admitted. Said
+      // out loud: this is a real, if rare, one-way surface. Note the
+      // conversation has ALREADY moved (the host retargeted the task before
+      // telling us), so this is a warning about hearing, not about speaking.
+      this.log(
+        "error",
+        "a thread was opened but could NOT be recorded as owned — replies posted in it will " +
+          "not be admitted; ratify in the bound channel instead",
+      );
+      return;
+    }
+    this.stats.threadsOpened += 1;
+  }
+
+  /**
+   * Emit ONE `create_private_thread` and wait for its correlated answer.
+   *
+   * The wait is bounded by `threadWaitMs` and settles at most once, whichever
+   * of `thread_created` / `effect_rejected` / `cancel` / the timer gets there
+   * first.
+   *
+   * `requestedThreads` outlives the resolver deliberately (adversarial review,
+   * nit 4): if the answer arrives AFTER the timeout, the thread still exists —
+   * the host made it — and Atlas must still record owning it, or it has left
+   * an orphan thread it invited nobody into and cannot hear. The resolver map
+   * is the "is a turn still waiting" question; the requested set is the "did
+   * Atlas ask for this at all" question, and only the second may write the
+   * registry.
+   */
+  private openThread(taskId: string, name: string): Promise<ThreadOutcome> {
+    return new Promise<ThreadOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: ThreadOutcome): void => {
+        if (settled) return;
+        settled = true;
+        this.pendingThreads.delete(taskId);
+        clearTimeout(timer);
+        resolve(outcome);
+      };
+      const timer = setTimeout(() => {
+        finish({ kind: "refused", detail: `no answer within ${this.threadWaitMs}ms` });
+      }, this.threadWaitMs);
+      // `unref` where the runtime has it: a pending timer must never be the
+      // reason a drained daemon fails to exit.
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.pendingThreads.set(taskId, finish);
+      this.requestedThreads.add(taskId);
+      try {
+        this.deps.send({
+          v: 1,
+          type: "create_private_thread",
+          task_id: taskId,
+          name,
+          // The ONLY members value this pack ever constructs. The host resolves
+          // it server-side to the task's own recorded source user; nothing read
+          // from a message body can reach this field.
+          members: "source",
+        });
+      } catch (err) {
+        // A throwing socket write left the correlation entry behind, which the
+        // docstring above promises never happens (adversarial review, nit 3).
+        // Settle it here instead of waiting `threadWaitMs` for a timer to
+        // clean up after an effect that never left.
+        this.requestedThreads.delete(taskId);
+        finish({
+          kind: "refused",
+          detail: `the effect could not be written: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    });
+  }
+
+  /**
+   * The registry write, and the ONLY one. Reached from the `thread_created`
+   * event alone, and only for a task Atlas actually asked a thread for.
+   *
+   * Three refusals, each closing a way the registry could be made to widen
+   * admission by something other than Atlas's own correlated request:
+   *   - the task is not one Atlas asked about → nothing recorded (an inbound
+   *     event cannot mint ownership);
+   *   - the id does not look like a platform thread id, or reads as a
+   *     placeholder (`undefined`, `null`, …) → nothing recorded (state.ts);
+   *   - the id IS the bound channel → nothing recorded. A registry row must
+   *     never shadow the config: admission already covers the bound channel,
+   *     and letting a row claim it would make a config change silently
+   *     un-take-effect (adversarial review, nit 1).
+   */
+  private onThreadCreated(taskId: string, threadId: string): void {
+    if (!this.requestedThreads.has(taskId)) {
+      warn(
+        `ignoring "thread_created" for task ${taskId} — ` +
+          `Atlas never asked for a thread on it; nothing recorded`,
+      );
+      return;
+    }
+    this.requestedThreads.delete(taskId);
+
+    const bound = this.deps.effectLayer?.effects.channelId ?? null;
+    if (bound !== null && threadId === bound) {
+      warn(
+        `refusing to record the BOUND CHANNEL as an owned thread — ` +
+          `the registry must never shadow the configured channel`,
+      );
+      this.settleThread(taskId, { kind: "created", threadId, recorded: false });
+      return;
+    }
+
+    const recorded = this.deps.state.recordOwnedThread(threadId, taskId, this.now());
+    if (recorded && !this.settleThread(taskId, { kind: "created", threadId, recorded: true })) {
+      // A LATE answer: the turn that asked has already given up and replied in
+      // the channel, but the thread is real and now durably owned, so Atlas
+      // will hear anything typed in it rather than leaving it orphaned.
+      this.stats.threadsOpened += 1;
+      warn(`recorded a late thread for task ${taskId} — its turn had already timed out`);
+      return;
+    }
+    if (!recorded) {
+      this.settleThread(taskId, { kind: "created", threadId, recorded: false });
+    }
+  }
+
+  /**
+   * Deliver an answer to a waiting `openThread`. Returns `false` when there
+   * was nothing waiting — a timed-out, cancelled, or never-requested task.
+   */
+  private settleThread(taskId: string, outcome: ThreadOutcome): boolean {
+    const pending = this.pendingThreads.get(taskId);
+    if (pending === undefined) return false;
+    pending(outcome);
+    return true;
   }
 
   // ── Effect helpers ────────────────────────────────────────────────────────

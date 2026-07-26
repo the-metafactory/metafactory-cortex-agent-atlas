@@ -27,6 +27,24 @@
  * the live task's `source.channel` IS the configured ledger channel. A mention
  * from anywhere else gets a refusal, not a ledger entry in the wrong room.
  *
+ * ── `wrong-channel` is REACHABLE since atlas#22, and it is load-bearing ─────
+ * atlas#22 observed that this guard could not fire in production, because
+ * `runtime.ts` admitted the bound channel and nothing else — so the live
+ * task's source channel was the configured one by construction. That is no
+ * longer true: admission now also covers a thread Atlas opened
+ * (`owned_threads`), and a task from such a thread carries the THREAD's id as
+ * its source channel. `canPost` is `false` there and `post` refuses
+ * `wrong-channel`.
+ *
+ * That refusal is the correct behaviour, not a gap to paper over. The ledger
+ * is the bound channel's record; cortex#2248 retargets every post on a
+ * thread-created task INTO the thread and offers no way to aim one at the
+ * parent, so the only alternatives to refusing are (a) writing the ledger
+ * inside a thread, which defeats the ledger, or (b) claiming a receipt for a
+ * post that went somewhere else, which is a recorded lie. Refusing parks the
+ * entry for `reconcile.ts` (`apply.ts` reports `applied-not-posted`) and
+ * `runtime.ts` says so in a `log` effect naming the cause.
+ *
  * **3. A post returns no platform message id.** `post` is fire-and-forget;
  * cortex has no ack event for it (unlike `create_private_thread` →
  * `thread_created`). `LedgerTransport.post` must nevertheless return a receipt,
@@ -78,11 +96,31 @@ export const RECEIPT_PREFIX = "host-effect";
  */
 export const SETTLE_MS = 50;
 
+/**
+ * How many retargeted task ids to remember. A retarget is per-task and a task
+ * is short-lived, so this only has to outlive the gap between an out-of-order
+ * `thread_created` and the window it applies to. Bounded because a daemon runs
+ * for months and an uncorrelated event costs an entry.
+ */
+export const MAX_TRACKED_RETARGETS = 256;
+
 /** The live task a post may ride on. Set by `openWindow`, cleared by `closeWindow`. */
 interface PostWindow {
   readonly taskId: string;
   /** The task's `source.channel`, host-resolved. Compared against config. */
   readonly sourceChannel: string;
+  /**
+   * The host has moved THIS task's conversation into a thread (cortex#2248),
+   * so its posts no longer land in `sourceChannel`. Set by `noteRetarget`,
+   * never unset — a retarget is one-way for the life of the task.
+   *
+   * This is not bookkeeping: it is the difference between "where this task
+   * came from" and "where a post on it will land", which are the same value
+   * right up until a thread is created and different for every post after.
+   * `sourceChannel` alone answered the first question while `canPost`/`post`
+   * were asking the second.
+   */
+  retargeted: boolean;
 }
 
 /** Why a post did not go out. Every one is logged; the caller sees `null`. */
@@ -91,6 +129,12 @@ export type PostRefusal =
   | "no-post-window"
   /** The live task did not originate in the configured ledger channel. */
   | "wrong-channel"
+  /**
+   * The live task DID originate in the ledger channel, but the host has since
+   * moved its conversation into a thread — so a post riding it would land
+   * there instead. See {@link HostLedgerTransport.noteRetarget}.
+   */
+  | "retargeted-to-thread"
   /** A caller asked for a channel that is not the configured one. */
   | "foreign-channel-argument"
   /** Nothing to say. */
@@ -116,6 +160,12 @@ export class HostLedgerTransport implements LedgerTransport {
   private seq = 0;
   /** Rejections seen per task id, so a settle check can tell "since when". */
   private readonly rejections = new Map<string, number>();
+  /**
+   * Task ids the host has moved into a thread. Kept independently of the live
+   * window so `openWindow` can consult it — see `noteRetarget`. Bounded by
+   * {@link MAX_TRACKED_RETARGETS}.
+   */
+  private readonly retargetedTasks = new Set<string>();
   private readonly send: (effect: BrainEffect) => void;
   private readonly channelId: string;
   private readonly wait: (ms: number) => Promise<void>;
@@ -124,6 +174,7 @@ export class HostLedgerTransport implements LedgerTransport {
   readonly refusals: Record<PostRefusal, number> = {
     "no-post-window": 0,
     "wrong-channel": 0,
+    "retargeted-to-thread": 0,
     "foreign-channel-argument": 0,
     "empty-content": 0,
     "host-rejected": 0,
@@ -135,9 +186,18 @@ export class HostLedgerTransport implements LedgerTransport {
     this.wait = opts.wait ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
   }
 
-  /** True while a post could actually leave. Read by `runtime.ts`'s scheduler. */
+  /**
+   * True while a LEDGER post could actually leave for the ledger channel.
+   * Read by `runtime.ts`'s scheduler before it runs a due pass inside the
+   * window — which is exactly why the retarget must be part of this answer and
+   * not only of `post`'s: the due passes decide whether to RUN from here.
+   */
   get canPost(): boolean {
-    return this.window !== null && this.window.sourceChannel === this.channelId;
+    return (
+      this.window !== null &&
+      this.window.sourceChannel === this.channelId &&
+      !this.window.retargeted
+    );
   }
 
   /**
@@ -152,7 +212,66 @@ export class HostLedgerTransport implements LedgerTransport {
     this.window = {
       taskId,
       sourceChannel: typeof sourceChannel === "string" ? sourceChannel : "",
+      // A retarget already seen for this task id wins immediately — see
+      // `noteRetarget`. The window can only ever open MORE closed, never less.
+      retargeted: this.retargetedTasks.has(taskId),
     };
+  }
+
+  /**
+   * The host has moved a task's conversation into a thread (cortex#2248's
+   * `onThreadCreated` retarget). From this point every `post` on that task
+   * lands in the THREAD, whatever channel the task came from.
+   *
+   * ── The bug this closes (adversarial review, BLOCKER 1) ──────────────────
+   * `openWindow` recorded where the task CAME FROM, and `canPost`/`post`
+   * treated that as where a post WOULD GO. Those are the same value until a
+   * thread is created inside the very task that holds the window — and after
+   * that they are different for every remaining post on it. The window still
+   * said "bound channel", so a ledger post emitted later in that task (a
+   * `watch.ts` ✅ flush, a `reconcile.ts` catch-up — both of which
+   * `runDuePassesInWindow` runs INSIDE the window) went out, landed in the
+   * private thread, drew no `effect_rejected`, and was minted a receipt. The
+   * ✅ was then recorded as announced and would never be posted again: a
+   * ledger entry destroyed by the mechanism documented as its recovery path.
+   *
+   * Called from `runtime.ts` on the raw `thread_created` EVENT — deliberately
+   * before, and independently of, Atlas's own correlation bookkeeping. The
+   * host retargets the task whether or not this brain asked for the thread or
+   * still remembers asking, so the transport must learn it from the same fact
+   * the host acted on, not from Atlas's opinion about it.
+   *
+   * One-way and per-task: a retarget is never undone, and `closeWindow` +
+   * `openWindow` start the next task clean.
+   */
+  noteRetarget(taskId: string): void {
+    if (typeof taskId !== "string" || taskId.length === 0) return;
+    // Recorded against the TASK ID, not only against the live window, so the
+    // answer does not depend on whether the window happened to be open when
+    // the event arrived. `openWindow` consults this set, which is what makes
+    // the invariant hold by construction rather than by ordering — a retarget
+    // that lands before the window opens (an uncorrelated event, a redelivery)
+    // is honoured just the same.
+    if (!this.retargetedTasks.has(taskId)) {
+      this.retargetedTasks.add(taskId);
+      // Bounded: an uncorrelated retarget for a task never served would
+      // otherwise accumulate forever in a daemon that runs for months. Oldest
+      // out first — Set preserves insertion order — and the live window's own
+      // flag is already set below, so eviction can never un-retarget the task
+      // currently being served.
+      while (this.retargetedTasks.size > MAX_TRACKED_RETARGETS) {
+        const oldest = this.retargetedTasks.values().next().value;
+        if (oldest === undefined) break;
+        this.retargetedTasks.delete(oldest);
+      }
+    }
+    const window = this.window;
+    if (window === null || window.taskId !== taskId || window.retargeted) return;
+    window.retargeted = true;
+    warn(
+      `task ${taskId} was retargeted into a thread by the host — the ledger post window is ` +
+        `CLOSED for it; any ledger entry it would have carried stays parked for the bound channel`,
+    );
   }
 
   /** Close the window. Called immediately before `result` — never after. */
@@ -200,6 +319,18 @@ export class HostLedgerTransport implements LedgerTransport {
         "wrong-channel",
         "the live task did not originate in the configured ledger channel — " +
           "refusing to post the ledger somewhere else",
+      );
+    }
+    if (window.retargeted) {
+      // Same rule, later cause: the task came from the ledger channel but the
+      // host has since moved it into a thread, so this post would land there.
+      // Its own reason code, because the two are operationally different — one
+      // is "somebody spoke to Atlas elsewhere", the other is "Atlas opened a
+      // thread on this very task" — and a shared counter would hide which.
+      return this.refuse(
+        "retargeted-to-thread",
+        "the live task's conversation was moved into a thread by the host — " +
+          "refusing to post the ledger into a thread, and refusing to claim a receipt for it",
       );
     }
 

@@ -217,6 +217,7 @@ describe("the verdict", () => {
       "trustedAdapterInstances", // shown, count-only: `adapterInstances=`
       "baseBranch", // shown: `base=`
       "checkoutDir", // shown: `docPRs=`
+      "threadConversation", // shown: `threads=` — atlas#25, an admission dimension
     ].sort();
     expect(Object.keys(loaded.config).sort()).toEqual(KNOWN_FIELDS);
 
@@ -226,5 +227,14 @@ describe("the verdict", () => {
     expect(line).toContain("base=");
     expect(line).toContain("docPRs=");
     expect(line).toContain("plan=");
+    expect(line).toContain("threads=");
+  });
+
+  // atlas#25 — the boot line must distinguish the two, or an operator cannot
+  // tell from a log whether Atlas is listening to threads at all.
+  test("the thread opt-in is reported honestly in both states", () => {
+    expect(buildStartupLine(facts())).toContain("threads=off");
+    const on = loadEffectsConfig({ ...armedEnv(), ATLAS_THREAD_CONVERSATION: "1" });
+    expect(buildStartupLine(facts({ effects: on }))).toContain("threads=on");
   });
 });

@@ -27,7 +27,6 @@
  *     gate would put a second, differently-shaped authority on the trust path.
  *     One gate, one certificate discipline.
  *   - `dispatch` — Atlas commands no fleet work (`dispatch_capabilities: []`).
- *   - `create_private_thread` — Atlas's audience is one public channel.
  *   - `post_log` — Atlas declares no `presence.discord.logChannelId`, so the
  *     host would refuse it `cant_do`. `log` covers diagnostics.
  *   - `compose` — the hybrid voice is W3b (issue #3), not this slice. The
@@ -35,8 +34,42 @@
  *     exactly spec §8's "the full loop runs with compose disabled".
  *
  * Adding one later is additive on the wire; leaving them out keeps the audit
- * surface of "what can Atlas ask the host to do" to two verbs: `post` and
- * `log`, plus the mandatory `result`.
+ * surface of "what can Atlas ask the host to do" to three verbs: `post`,
+ * `create_private_thread` and `log`, plus the mandatory `result`.
+ *
+ * ── `create_private_thread` — spoken since atlas#22/#25 ────────────────────
+ * It is the ONLY route by which Atlas can ever hear a reply typed in a thread
+ * (see `TaskSource` below: the shipped adapter sends no parent-channel signal,
+ * so "a thread under my channel" is not a question this protocol can answer —
+ * "a thread I opened, and durably recorded opening" is). The effect names no
+ * channel; the host derives the parent from the agent's OWN
+ * `presence.discord.agentChannelId` binding, so speaking it cannot widen the
+ * one-channel universe by construction.
+ *
+ * THREE facts about the shipped host, verified against cortex and recorded
+ * here because each one bounds what this pack can claim:
+ *
+ *   1. The effect is wired ONLY for agents flagged `openOnboarding: true`
+ *      (cortex `src/runner/brain-consumer-boot.ts`: `wireCreatePrivateThread =
+ *      isOpenOnboarding && discordAgentChannelId !== undefined`). Atlas is not
+ *      anon-reachable and must not become so to buy a thread, so on today's
+ *      cortex every `create_private_thread` Atlas emits comes back
+ *      `effect_rejected`/`cant_do`. `runtime.ts` treats that as a first-class
+ *      outcome — it falls back to conversing in the bound channel, exactly as
+ *      before this slice — rather than as an error.
+ *   2. There is no PUBLIC-thread variant on this protocol. cortex ships
+ *      `create_private_thread` and nothing else, and the Discord adapter
+ *      creates `ChannelType.PrivateThread`. atlas#25 records a preference for
+ *      a PUBLIC thread; that preference cannot be expressed here, which is why
+ *      the request is opt-in and OFF by default (`EffectsConfig.
+ *      threadConversation`) rather than silently shipping the other choice.
+ *   3. A `post` on a task whose thread has been created is RETARGETED into
+ *      that thread by the host (cortex#2248, `onThreadCreated`), before the
+ *      brain even sees `thread_created`. So conversation follows the thread
+ *      automatically — and a LEDGER entry on such a task cannot be steered
+ *      back to the parent channel by any means this protocol offers.
+ *      `transport.ts` refuses it rather than writing the ledger somewhere
+ *      else; see its header.
  */
 
 export const V = 1 as const;
@@ -63,11 +96,26 @@ export const V = 1 as const;
  * `thread` are the same id whenever the message came from a thread, and a
  * consumer that needs "is this the bound channel OR a thread under it" cannot
  * answer that from this event — it would need a reliable parent signal the
- * adapter does not currently send. This repo's own admission check
- * (`runtime.ts`) treats `channel` as an opaque, exact-match id for that reason:
- * it admits the ONE configured channel and nothing a thread under it, which is
- * a real behavioural consequence of the fact stated here, not a choice made
- * assuming otherwise.
+ * adapter does not currently send.
+ *
+ * ── What `runtime.ts` therefore admits (atlas#22 + atlas#25) ────────────────
+ * `channel` is treated as an OPAQUE, EXACT-MATCH id — it is never parsed,
+ * never assumed to be a parent, never derived from. Admission is the union of
+ * exactly two config/state-pinned sets:
+ *
+ *   1. the ONE configured ledger channel (`EffectsConfig.channelId`), and
+ *   2. a thread ATLAS ITSELF OPENED and durably recorded opening — the
+ *      owned-thread registry in `state.ts` (`owned_threads`), written only
+ *      from a host-resolved `thread_created` id that Atlas correlated to its
+ *      own `create_private_thread` request.
+ *
+ * The second set is not a relaxation of the first: membership is decided by
+ * Atlas's own write record, never by anything on this event. A thread Atlas
+ * did not open — including one opened by the principal directly under the
+ * bound channel — is refused exactly as any foreign channel is, in silence,
+ * because this event carries nothing that could distinguish it from a thread
+ * in a room Atlas has never heard of. That is the whole reason atlas#22's
+ * "admit a thread whose parent is the bound channel" option does not exist.
  *
  * ── "HOST-AUTHORITATIVE" describes cortex's INTENT, not a wire guarantee
  *    (atlas#24) ──────────────────────────────────────────────────────────────
@@ -192,6 +240,17 @@ export interface HelloEvent {
   protocol: string;
 }
 
+/**
+ * The answer to a `create_private_thread` (cortex#2206), correlated by
+ * `task_id`. `thread_id` is the HOST-RESOLVED platform id — the brain never
+ * chose it, and it is the ONLY value Atlas ever writes into its owned-thread
+ * registry. There is no failure variant: a refused or failed create comes back
+ * as `effect_rejected` with `effect: "create_private_thread"`.
+ *
+ * By the time this arrives the host has ALREADY retargeted the task's
+ * conversation into the thread (cortex#2248) — so a `post` emitted on seeing
+ * this event lands in the thread, never racing the parent channel.
+ */
 export interface ThreadCreatedEvent {
   v: 1;
   type: "thread_created";
@@ -298,7 +357,40 @@ export interface LogEffect {
   text: string;
 }
 
-export type BrainEffect = PostEffect | ResultEffect | LogEffect;
+/**
+ * `create_private_thread` — ask the host to open a thread off the AGENT'S OWN
+ * bound channel and put people in it (cortex#2206). Mirrors the shipped wire
+ * shape exactly (cortex `src/brain/protocol.ts`,
+ * `CreatePrivateThreadEffectSchema`).
+ *
+ * Deliberately carries NO channel field, and that absence is the security
+ * property, not an omission: the host derives the parent from
+ * `presence.discord.agentChannelId`, so this effect cannot open a thread
+ * anywhere Atlas is not already bound — there is no field here to point
+ * somewhere else even if this code wanted to.
+ *
+ * `members` is the real shipped wire type (`"source" | string[]`), left OPEN
+ * to match cortex rather than narrowed. Atlas's own USAGE stays narrower than
+ * the type permits: `runtime.ts` only ever constructs the literal `"source"`,
+ * which the host resolves SERVER-SIDE to the triggering task's own recorded
+ * source user — never to anything this brain put on the wire, and never to
+ * anything read out of a message body.
+ *
+ * `name` is Atlas-generated (`Proposal #<n>`) — a display id this brain minted
+ * itself. Message text never reaches it; see `runtime.ts`'s `threadName`.
+ */
+export type CreateThreadMembers = "source" | string[];
+
+export interface CreateThreadEffect {
+  v: 1;
+  type: "create_private_thread";
+  task_id: string;
+  /** Host truncates to Discord's 100-char cap; Atlas stays far under it. */
+  name: string;
+  members: CreateThreadMembers;
+}
+
+export type BrainEffect = PostEffect | ResultEffect | LogEffect | CreateThreadEffect;
 
 /** One effect → one JSONL line (no trailing newline). */
 export function encodeEffectLine(effect: BrainEffect): string {

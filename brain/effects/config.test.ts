@@ -190,3 +190,98 @@ describe("loadEffectsConfig", () => {
     expect(cfg.channelId).toBe("chan-fixture-0000");
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ATLAS_THREAD_CONVERSATION (atlas#25; adversarial review M1).
+//
+// This one boolean is the whole guard in front of the thread feature — it
+// decides both whether Atlas opens threads AND whether it admits messages from
+// threads it opened. A denylist implementation (`v !== "0" && v !== "false"`)
+// passes EVERY positive test and arms the capability on a blank string, a
+// typo, `off`, `no`, or `disabled`. Positive tests cannot see the difference,
+// so the negative ones below are the entire property.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function threadFlagFor(raw: string | undefined): boolean {
+  const loaded = loadEffectsConfig(
+    raw === undefined ? OK : { ...OK, ATLAS_THREAD_CONVERSATION: raw },
+  );
+  if (loaded.kind !== "ok") throw new Error(`expected ok, got ${loaded.reason}`);
+  return loaded.config.threadConversation;
+}
+
+describe("the thread opt-in is fail-closed by ALLOWLIST", () => {
+  test("unset is off — the default a deployment gets by doing nothing", () => {
+    expect(threadFlagFor(undefined)).toBe(false);
+  });
+
+  test("only the four documented affirmatives arm it", () => {
+    for (const yes of ["1", "true", "yes", "on", "TRUE", "Yes", "ON", " 1 ", "  true  "]) {
+      expect(threadFlagFor(yes)).toBe(true);
+    }
+  });
+
+  test("EVERY other value is off — including the ones that read as intent", () => {
+    // `off`/`no`/`disabled`/`none` are what an operator actually types when
+    // they mean off, and a denylist parser would arm the capability on all of
+    // them. `""` is what an operator gets from `export ATLAS_THREAD_CONVERSATION=`
+    // or an empty entry in an env file — the single most likely accident.
+    for (const no of [
+      "",
+      " ",
+      "\t",
+      "0",
+      "false",
+      "FALSE",
+      "no",
+      "off",
+      "OFF",
+      "disabled",
+      "none",
+      "null",
+      "undefined",
+      "2",
+      "-1",
+      "yes please",
+      "true ish",
+      "enable",
+      "enabled",
+      "y",
+      "n",
+      "t",
+      "f",
+      "🧵",
+    ]) {
+      expect(threadFlagFor(no)).toBe(false);
+    }
+  });
+
+  test("a garbage value degrades to OFF rather than refusing the whole config", () => {
+    // The other fail-closed choice — refusing the config — would take the
+    // ledger and the plan down over a typo in an optional knob. Wrong trade:
+    // this flag failing closed means "no threads", not "no Atlas".
+    const loaded = loadEffectsConfig({ ...OK, ATLAS_THREAD_CONVERSATION: "yes-ish" });
+    expect(loaded.kind).toBe("ok");
+    if (loaded.kind !== "ok") return;
+    expect(loaded.config.threadConversation).toBe(false);
+    expect(loaded.config.channelId).toBe("chan-fixture-0000");
+  });
+
+  test("makeEffectsConfig accepts a real boolean too, for callers that have one", () => {
+    for (const [input, expected] of [
+      [true, true],
+      [false, false],
+      [undefined, false],
+    ] as const) {
+      const loaded = makeEffectsConfig({
+        planRepo: "acme/widgets",
+        planIssue: 4,
+        channelId: "chan-fixture-0000",
+        adapterInstances: "discord:instance-fixture-0000",
+        threadConversation: input,
+      });
+      if (loaded.kind !== "ok") throw new Error("expected ok");
+      expect(loaded.config.threadConversation).toBe(expected);
+    }
+  });
+});

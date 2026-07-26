@@ -12,7 +12,7 @@ import { describe, expect, test } from "bun:test";
 import { DiscordLedger } from "./effects/discord";
 import { makeEffectsConfig, type EffectsConfig } from "./effects/config";
 import type { BrainEffect } from "./protocol";
-import { HostLedgerTransport, RECEIPT_PREFIX } from "./transport";
+import { HostLedgerTransport, MAX_TRACKED_RETARGETS, RECEIPT_PREFIX } from "./transport";
 
 const CHANNEL_ID = "chan-fixture-0000";
 const OTHER_CHANNEL = "chan-fixture-9999";
@@ -224,5 +224,106 @@ describe("degenerate content", () => {
     expect(await transport.post(CHANNEL_ID, "   \n ")).toBeNull();
     expect(sent).toEqual([]);
     expect(transport.refusals["empty-content"]).toBe(2);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The thread retarget (atlas#25; adversarial review BLOCKER 1).
+//
+// `openWindow` records where a task CAME FROM. Once the host opens a thread on
+// that task (cortex#2248 retargets before it even answers the brain), that is
+// no longer where a post GOES. These pin the difference — the bug was that
+// this transport could not tell the two apart, so a ledger post emitted after
+// a thread opened went into the thread AND was minted a receipt.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("a retargeted task can no longer carry the ledger", () => {
+  test("canPost goes false, and post refuses with its own reason", async () => {
+    const { sent, transport } = harness();
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    expect(transport.canPost).toBe(true);
+
+    transport.noteRetarget("task-fixture-1");
+    expect(transport.canPost).toBe(false);
+
+    expect(await transport.post(CHANNEL_ID, "➕ a ledger entry")).toBeNull();
+    expect(transport.refusals["retargeted-to-thread"]).toBe(1);
+    // It is NOT counted as a wrong-channel refusal: the two are operationally
+    // different and a shared counter would hide which one is firing.
+    expect(transport.refusals["wrong-channel"]).toBe(0);
+    // Nothing left the process.
+    expect(sent.filter((e) => e.type === "post")).toHaveLength(0);
+  });
+
+  test("no receipt is ever minted for a retargeted task", async () => {
+    // The severe half of the bug: a post that landed in a thread came back
+    // with a receipt, so `watch.ts` recorded the ✅ as announced and never
+    // posted it again.
+    const { transport } = harness();
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    const before = await transport.post(CHANNEL_ID, "➕ before the thread");
+    expect(before).not.toBeNull();
+
+    transport.noteRetarget("task-fixture-1");
+    const after = await transport.post(CHANNEL_ID, "✅ after the thread");
+    expect(after).toBeNull();
+  });
+
+  test("the retarget is ONE-WAY for the life of the task", async () => {
+    const { transport } = harness();
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    transport.noteRetarget("task-fixture-1");
+    // A second, identical event changes nothing and does not "reset" anything.
+    transport.noteRetarget("task-fixture-1");
+    expect(transport.canPost).toBe(false);
+    expect(await transport.post(CHANNEL_ID, "x")).toBeNull();
+  });
+
+  test("the NEXT task starts clean — a retarget is per-task, not per-process", async () => {
+    const { transport } = harness();
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    transport.noteRetarget("task-fixture-1");
+    transport.closeWindow();
+
+    transport.openWindow("task-fixture-2", CHANNEL_ID);
+    expect(transport.canPost).toBe(true);
+    expect(await transport.post(CHANNEL_ID, "➕ a later entry")).not.toBeNull();
+  });
+
+  test("ORDER-INDEPENDENT — a retarget seen before the window opens still applies", async () => {
+    // The invariant must not depend on the event arriving after `openWindow`.
+    // An uncorrelated or redelivered `thread_created` can land at any time,
+    // and "we had not opened the window yet" is not a reason to post a ledger
+    // entry into a thread.
+    const { transport } = harness();
+    transport.noteRetarget("task-fixture-1");
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    expect(transport.canPost).toBe(false);
+    expect(await transport.post(CHANNEL_ID, "x")).toBeNull();
+    expect(transport.refusals["retargeted-to-thread"]).toBe(1);
+  });
+
+  test("the retarget memory is bounded", () => {
+    // A daemon runs for months; an uncorrelated event costs an entry.
+    const { transport } = harness();
+    for (let i = 0; i < MAX_TRACKED_RETARGETS + 50; i += 1) {
+      transport.noteRetarget(`task-fixture-${i}`);
+    }
+    // The most recent is still remembered…
+    transport.openWindow(`task-fixture-${MAX_TRACKED_RETARGETS + 49}`, CHANNEL_ID);
+    expect(transport.canPost).toBe(false);
+    transport.closeWindow();
+    // …and the oldest has aged out, which is the correct direction to lose.
+    transport.openWindow("task-fixture-0", CHANNEL_ID);
+    expect(transport.canPost).toBe(true);
+  });
+
+  test("an empty or foreign task id is ignored", async () => {
+    const { transport } = harness();
+    transport.openWindow("task-fixture-1", CHANNEL_ID);
+    transport.noteRetarget("");
+    transport.noteRetarget("task-fixture-somebody-else");
+    expect(transport.canPost).toBe(true);
+    expect(await transport.post(CHANNEL_ID, "➕ still fine")).not.toBeNull();
   });
 });

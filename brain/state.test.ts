@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -499,5 +499,165 @@ describe("atlas#15/#19 — defaultInstanceDir / defaultBundleDir path resolution
       const dirPath = defaultBundleDir({ home: fakeHome, env: { XDG_DATA_HOME: xdgData } });
       expect(dirPath).toBe(canonical);
     });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The owned-thread registry (atlas#22 + atlas#25).
+//
+// This table is the ONLY state in the pack that WIDENS what Atlas will act on,
+// so its tests are about the two directions separately: what it must remember
+// (restart-safety — a forgotten thread is a conversation Atlas goes deaf in)
+// and what it must refuse to remember (anything that does not look like a
+// platform id, and anything at all while the store cannot persist).
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("owned threads — the admission registry", () => {
+  test("a recorded thread is owned; an unrecorded one is not", () => {
+    expect(proposals.isOwnedThread("thread-fixture-1")).toBe(false);
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("thread-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("thread-fixture-2")).toBe(false);
+  });
+
+  test("RESTART-SAFE — a reopened store still owns the thread", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-restart", "task-fixture-1")).toBe(true);
+    store.close();
+
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("expected the store to reopen");
+    store = reopened;
+    proposals = new AtlasProposals(store);
+
+    expect(proposals.isOwnedThread("thread-fixture-restart")).toBe(true);
+    expect(store.ownedThreadCount()).toBe(1);
+  });
+
+  test("recording the same thread twice is a no-op that still reports success", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-2")).toBe(true);
+    expect(store.ownedThreadCount()).toBe(1);
+  });
+
+  test("a malformed id is refused, not stored — this table decides what Atlas acts on", () => {
+    for (const bad of ["", "   ", "thread with spaces", "thread\nnewline", "x".repeat(129)]) {
+      expect(proposals.recordOwnedThread(bad, "task-fixture-1")).toBe(false);
+      expect(proposals.isOwnedThread(bad)).toBe(false);
+    }
+    expect(store.ownedThreadCount()).toBe(0);
+  });
+
+  test("an empty channel never matches, whatever else the table holds", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread("")).toBe(false);
+  });
+
+  test("a snowflake-shaped id round-trips (the real Discord shape)", () => {
+    // 17-20 decimal digits. A fixture value, never a live channel.
+    const snowflake = "1".repeat(19);
+    expect(proposals.recordOwnedThread(snowflake, "task-fixture-1")).toBe(true);
+    expect(proposals.isOwnedThread(snowflake)).toBe(true);
+  });
+
+  test("FAIL-CLOSED in degraded mode: a memory-only store owns nothing", () => {
+    const degraded = new AtlasProposals(null);
+    expect(degraded.recordOwnedThread("thread-fixture-1", "task-fixture-1")).toBe(false);
+    expect(degraded.isOwnedThread("thread-fixture-1")).toBe(false);
+  });
+});
+
+// ── atlas#22/#25 × atlas#28: the registry must not break a READ-ONLY open ───
+//
+// The status CLI (atlas#28) opens `state.sqlite` with `{ readonly: true }`. A
+// read-only handle CANNOT `CREATE TABLE IF NOT EXISTS` — SQLITE_READONLY — so
+// an auxiliary table created unconditionally on every open would turn the
+// status tool into a crash on any DB the current daemon has not yet touched.
+// It does not, because `openReadOnly` constructs the store WITHOUT
+// `applyMigration`; these tests pin that, from both directions.
+describe("owned threads — the read-only open (atlas#28 interaction)", () => {
+  test("a read-only open succeeds on a DB that already has the table", () => {
+    expect(proposals.recordOwnedThread("thread-fixture-ro", "task-fixture-1")).toBe(true);
+    store.close();
+
+    const ro = AtlasStateStore.openReadOnly(dir);
+    expect(ro).not.toBeNull();
+    try {
+      // The registry is readable through a read-only handle — no write, no create.
+      expect(ro!.isOwnedThread("thread-fixture-ro")).toBe(true);
+      expect(ro!.ownedThreadCount()).toBe(1);
+    } finally {
+      ro!.close();
+    }
+
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("expected the store to reopen read-write");
+    store = reopened;
+    proposals = new AtlasProposals(store);
+  });
+
+  test("STRUCTURAL — `openReadOnly` does not run the migration/create path at all", () => {
+    // This is the mutation-killable form of the property, and it HAS to be
+    // structural because the behavioural symptom is SILENT: on a WAL-mode
+    // database (which every Atlas store is — `AtlasStateStore.open` sets
+    // `journal_mode = WAL`), `CREATE TABLE IF NOT EXISTS` through a read-only
+    // handle does NOT raise SQLITE_READONLY. Verified directly against
+    // bun:sqlite: it is a no-op that creates nothing and reports nothing. So a
+    // create wrongly placed on this path would not fail at open — it would
+    // "succeed", and the first query against the still-absent table would
+    // throw `no such table` somewhere else entirely, at status time. Assert
+    // the shape, because the runtime cannot tell you.
+    const src = readFileSync(join(import.meta.dir, "state.ts"), "utf8");
+    const body = /static openReadOnly\(dir: string\): AtlasStateStore \| null \{[\s\S]*?\n  \}/.exec(
+      src,
+    );
+    expect(body).not.toBeNull();
+    expect(body![0]).toContain("readonly: true");
+    expect(body![0]).not.toContain("applyMigration");
+    expect(body![0]).not.toMatch(/CREATE TABLE/i);
+  });
+
+  test("a read-only open does NOT create the table — an older DB opens fine", () => {
+    // The scenario the read-only path must survive: a `state.sqlite` written
+    // before this table existed (modelled by dropping it), opened by the status
+    // CLI before the upgraded daemon has ever run against it.
+    store.close();
+    const raw = new Database(join(dir, "state.sqlite"));
+    raw.exec("DROP TABLE IF EXISTS owned_threads;");
+    raw.close();
+
+    const ro = AtlasStateStore.openReadOnly(dir);
+    expect(ro).not.toBeNull();
+    try {
+      // Opening did not throw, and — the actual property — it did not try to
+      // create anything: the table is still absent afterwards.
+      const check = new Database(join(dir, "state.sqlite"), { readonly: true });
+      const row = check
+        .query<{ name: string }, []>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'owned_threads'`,
+        )
+        .get();
+      check.close();
+      expect(row === null || row === undefined).toBe(true);
+    } finally {
+      ro!.close();
+    }
+
+    // …and the read-write open is what repairs it, on the very next daemon boot.
+    const reopened = AtlasStateStore.open({ dir, bundleDir: null });
+    if (reopened === null) throw new Error("expected the store to reopen read-write");
+    store = reopened;
+    proposals = new AtlasProposals(store);
+    expect(store.ownedThreadCount()).toBe(0);
+    expect(proposals.recordOwnedThread("thread-fixture-after-repair", "task-fixture-1")).toBe(true);
+  });
+
+  test("the status CLI never reads the admission registry", () => {
+    // Structural: admission is a daemon concern. If a future status feature
+    // starts reading `owned_threads`, it inherits the missing-table case above
+    // and this test is the place that says so.
+    for (const rel of ["status.ts", "status-cli.ts"]) {
+      const src = readFileSync(join(import.meta.dir, rel), "utf8");
+      expect(src).not.toMatch(/isOwnedThread|ownedThreadCount|owned_threads/);
+    }
   });
 });

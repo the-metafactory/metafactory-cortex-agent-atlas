@@ -886,3 +886,378 @@ arcShadow("DoD 1 + 9 — arc install / arc purge parity (sandboxed)", () => {
     }
   }, 300_000);
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE THREAD REHEARSAL — atlas#22 + atlas#25, end to end against the same real
+// machinery, with a SECOND daemon whose only difference is
+// ATLAS_THREAD_CONVERSATION=1.
+//
+// Why its own run rather than an assertion bolted onto the walkthrough above:
+// that run proves outsider-RATIFY-is-silence and principal-RATIFY-applies IN
+// THE CHANNEL. Moving the exchange into a thread moves both onto a surface
+// those green ticks say nothing about — the task's `source.channel` is the
+// THREAD's id, which is the exact value that made Atlas deaf (atlas#22).
+// Nothing here inherits the channel run's results.
+//
+// The host double models cortex's real thread semantics: it retargets the
+// task's conversation into the thread BEFORE telling the brain the thread
+// exists (cortex#2248), and it attributes every `post` to the room the HOST
+// would have sent it to — never to anything the brain claimed, because the
+// brain cannot claim a channel at all.
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface ThreadFixture {
+  dir: string;
+  host: FakeCortexHost;
+  target: ScratchTarget;
+  stateDir: string;
+  effects: EffectsConfig;
+}
+
+let tfx: ThreadFixture;
+
+shadow("thread rehearsal — the exchange moves, the ledger does not", () => {
+  beforeAll(async () => {
+    if (!(await ghAuthenticated())) {
+      throw new Error("thread rehearsal: `gh auth status` failed — it needs a live gh");
+    }
+    const runId = `t${Date.now().toString(36)}`;
+    tfx = {} as ThreadFixture;
+    tfx.dir = mkdtempSync(join(tmpdir(), "atlas-thread-shadow-"));
+    tfx.stateDir = join(tfx.dir, "state");
+    mkdirSync(tfx.stateDir, { recursive: true });
+    mkdirSync(join(tfx.dir, "scratch"), { recursive: true });
+
+    tfx.target = await provisionScratchTarget({
+      runId,
+      linkedIssues: 2,
+      ...(process.env.ATLAS_SHADOW_REPO === undefined
+        ? {}
+        : { repo: process.env.ATLAS_SHADOW_REPO }),
+    });
+
+    // THE FENCE, again — a second run is a second chance to point at something live.
+    assertThrowawayTarget({
+      planRepo: tfx.target.repo,
+      planIssue: tfx.target.planIssue,
+      channelId: CHANNEL_ID,
+    });
+
+    const emptyOverlay = join(tfx.dir, "overlay.env");
+    writeFileSync(emptyOverlay, "# thread rehearsal: deliberately empty\n", "utf8");
+
+    const hostEnv: Record<string, string> = {
+      ATLAS_RATIFIER_PRINCIPAL: PRINCIPAL_ID,
+      ATLAS_RATIFIER_PLATFORM_IDS: `discord:${PRINCIPAL_PLATFORM_ID}`,
+      ATLAS_SELF_PLATFORM_IDS: `discord:${ATLAS_PLATFORM_ID}`,
+      ATLAS_PLAN_REPO: tfx.target.repo,
+      ATLAS_PLAN_ISSUE: String(tfx.target.planIssue),
+      ATLAS_CHANNEL_ID: CHANNEL_ID,
+      ATLAS_TRUSTED_ADAPTER_INSTANCES: ADAPTER_INSTANCE,
+      ATLAS_STATE_DIR: tfx.stateDir,
+      ATLAS_ENV_FILE: emptyOverlay,
+      // THE one difference from the walkthrough above.
+      ATLAS_THREAD_CONVERSATION: "1",
+      // Both loops parked: this rehearsal drives the ledger catch-up through
+      // the DUE flag deliberately, and an interval firing underneath it would
+      // make "which window carried the entry" a timing question.
+      ATLAS_WATCH_INTERVAL_MS: "86400000",
+      ATLAS_RECONCILE_INTERVAL_MS: "604800000",
+    };
+
+    const loaded = makeEffectsConfig({
+      planRepo: tfx.target.repo,
+      planIssue: tfx.target.planIssue,
+      channelId: CHANNEL_ID,
+      adapterInstances: ADAPTER_INSTANCE,
+      threadConversation: "1",
+    });
+    if (loaded.kind !== "ok") throw new Error(`thread: effects config refused (${loaded.reason})`);
+    tfx.effects = loaded.config;
+
+    const socketPath = join(tfx.dir, "brain.sock");
+    tfx.host = new FakeCortexHost(
+      socketPath,
+      buildBrainEnv({
+        hostEnv,
+        socketPath,
+        token: "token-fixture-0000",
+        scratchDir: join(tfx.dir, "scratch"),
+        path: process.env.PATH ?? "",
+        home: process.env.HOME ?? "",
+      }),
+      CHANNEL_ID,
+      ADAPTER_INSTANCE,
+      // The cortex this slice is written against. The DEFAULT policy —
+      // `refuse` — is what today's cortex actually does to Atlas, and it has
+      // its own test at the end of this describe.
+      "create",
+    );
+    await tfx.host.start();
+    tfx.host.hello();
+    await tfx.host.waitFor(
+      () => tfx.host.stderrText().includes("connected"),
+      15_000,
+      "the thread-rehearsal brain never connected",
+    );
+  }, 300_000);
+
+  afterAll(async () => {
+    try {
+      await tfx?.host?.stop();
+    } catch {
+      /* teardown */
+    }
+    try {
+      await tfx?.target?.cleanup();
+    } catch {
+      /* teardown */
+    }
+    if (tfx?.dir !== undefined) rmSync(tfx.dir, { recursive: true, force: true });
+  }, 120_000);
+
+  test("the boot line says threads are on — an admission dimension, stated out loud", () => {
+    expect(tfx.host.startupVerdict()).toContain("GATE ARMED");
+    expect(tfx.host.startupVerdict()).toContain("threads=on");
+  });
+
+  test("a proposal surfaces INTO A THREAD, and the parent channel stays clean", async () => {
+    const url = tfx.target.issueUrl(tfx.target.linked[0]!);
+    const result = await tfx.host.turn(
+      "t-thread-add",
+      `ADD: ${url} — [Backend] thread rehearsal: this item belongs on the plan`,
+      PROPOSER_PLATFORM_ID,
+    );
+    expect(result.summary).toBe("proposal-surfaced");
+
+    // Exactly one thread request, named from Atlas's OWN display id — never
+    // the proposer's text, never their id.
+    const asked = tfx.host.threadRequests();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.name).toBe("Proposal #1");
+    expect(asked[0]!.members).toBe("source");
+    expect(String(asked[0]!.name)).not.toContain(PROPOSER_PLATFORM_ID);
+
+    const threadId = tfx.host.threadsOpened[0]!.threadId;
+    const inThread = tfx.host.postsIn(threadId);
+    expect(inThread).toHaveLength(1);
+    expect(inThread[0]).toContain("Proposal #1 — ADD:");
+    expect(inThread[0]).toContain("RATIFY 1");
+    // …and the ledger channel heard nothing at all.
+    expect(tfx.host.postsIn(CHANNEL_ID)).toEqual([]);
+  }, 120_000);
+
+  test("THE INTERACTION THAT WAS BROKEN — a RATIFY typed in that thread is heard", async () => {
+    // Before atlas#22 this task was refused in silence: `source.channel` is the
+    // THREAD's id, and admission only knew the bound channel. Atlas had invited
+    // a reply into a room it could not hear.
+    const threadId = tfx.host.threadsOpened[0]!.threadId;
+    const result = await tfx.host.threadTurn(
+      "t-thread-ratify",
+      "RATIFY 1",
+      PRINCIPAL_PLATFORM_ID,
+      threadId,
+    );
+    expect(result.summary).toBe("gate-ratified");
+
+    // The map moved, live.
+    const body = await tfx.target.planBody();
+    expect(body).toContain(tfx.target.issueUrl(tfx.target.linked[0]!));
+
+    // The acknowledgement went to the thread, where the principal is looking.
+    expect(tfx.host.postsFor("t-thread-ratify").length).toBeGreaterThan(0);
+    for (const effect of tfx.host.effects) {
+      if (effect.type === "post" && effect.task_id === "t-thread-ratify") {
+        expect(effect.landedIn).toBe(threadId);
+      }
+    }
+  }, 180_000);
+
+  test("the ledger entry did NOT follow the conversation into the thread", () => {
+    // The honest half of atlas#25 item 3. cortex retargets every post on this
+    // task into the thread and offers no way to aim one at the parent, so the
+    // entry is REFUSED there rather than written in the wrong room — and Atlas
+    // says so on the wire, naming the cause.
+    const threadId = tfx.host.threadsOpened[0]!.threadId;
+    expect(tfx.host.postsIn(threadId).join("\n")).not.toContain("➕");
+    expect(tfx.host.postsIn(CHANNEL_ID).join("\n")).not.toContain("➕");
+    const logs = tfx.host.effects
+      .filter((e) => e.type === "log")
+      .map((e) => String(e.text))
+      .join("\n");
+    expect(logs).toContain("arrived in a thread");
+  });
+
+  test("BLOCKER 1 — the parked entry does NOT ride the NEXT proposal's task into ITS thread", async () => {
+    // The severe case the adversarial review found, live. A window opened from
+    // the bound channel stays open across the thread this task creates, and
+    // `runDuePassesInWindow` runs the due reconcile INSIDE it — so before the
+    // fix the parked ledger entry posted into thread #2, drew no rejection,
+    // took a receipt, and cleared the due flag. The recovery path destroying
+    // the entry it was recovering.
+    //
+    // This also sets up proposal #2, which the outsider-ratify probe below
+    // uses — a second live round trip we would otherwise pay for twice.
+    const url = tfx.target.issueUrl(tfx.target.linked[1]!);
+    const result = await tfx.host.turn(
+      "t-thread-add-2",
+      `ADD: ${url} — [Backend] second item, and the parked-entry probe`,
+      PROPOSER_PLATFORM_ID,
+    );
+    expect(result.summary).toBe("proposal-surfaced");
+
+    const second = tfx.host.threadsOpened[1]!;
+    expect(second).toBeDefined();
+    // The summary went to thread #2 (wanted). NOTHING ledger-shaped did.
+    const inThread2 = tfx.host.postsIn(second.threadId);
+    expect(inThread2.join("\n")).toContain("Proposal #2");
+    expect(inThread2.join("\n")).not.toContain("➕");
+    expect(inThread2.join("\n")).not.toContain("✅");
+    expect(inThread2.join("\n")).not.toContain("Catch-up");
+    // …and NO thread anywhere holds a ledger-marked post. (Thread #1 does
+    // legitimately mention proposal #1's URL — the summary and the ratify ack
+    // live there, which is the feature. What must never appear in a thread is
+    // a LEDGER ENTRY, identified by its own markers.)
+    for (const opened of tfx.host.threadsOpened) {
+      const inThread = tfx.host.postsIn(opened.threadId).join("\n");
+      expect(inThread).not.toContain("➕");
+      expect(inThread).not.toContain("✅");
+      expect(inThread).not.toContain("Catch-up");
+    }
+  }, 180_000);
+
+  test("…it lands in the MAIN channel on the next turn that opens no thread", async () => {
+    // The parked entry is carried by reconcile's `applied-unposted` detector,
+    // inside a post window that is still pointed at the bound channel — i.e. a
+    // turn that does NOT open a thread. Ordinary chatter earns no reply of its
+    // own, so the only post it produces is the catch-up itself, and it must
+    // land in CHANNEL_ID specifically.
+    const result = await tfx.host.turn("t-thread-window", "morning all", PROPOSER_PLATFORM_ID);
+    expect(result.summary).toBe("gate-ignored");
+
+    const inChannel = tfx.host.postsIn(CHANNEL_ID);
+    expect(inChannel.length).toBeGreaterThan(0);
+    expect(inChannel.join("\n")).toContain(tfx.target.issueUrl(tfx.target.linked[0]!));
+    // The ledger entry is in the CHANNEL and in no thread — the criterion
+    // atlas#25 AC 3 actually asks for, asserted by destination rather than by
+    // "it landed somewhere admissible".
+    for (const opened of tfx.host.threadsOpened) {
+      expect(tfx.host.postsIn(opened.threadId).join("\n")).not.toContain("Catch-up");
+    }
+  }, 180_000);
+
+  test("P1 — a message in a thread Atlas does NOT own is refused, in silence", async () => {
+    const before = tfx.host.effects.filter((e) => e.type === "post").length;
+    const threadRequestsBefore = tfx.host.threadRequests().length;
+    const result = await tfx.host.threadTurn(
+      "t-thread-foreign",
+      `ADD: ${tfx.target.issueUrl(tfx.target.linked[1]!)} — [Backend] from a thread Atlas never opened`,
+      PROPOSER_PLATFORM_ID,
+      "thread-shadow-999",
+    );
+    expect(result.summary).toBe("not-admitted");
+    expect(tfx.host.postsFor("t-thread-foreign")).toEqual([]);
+    // Not one post anywhere, and no NEW thread request either — a refused task
+    // must not reach the effect path at all.
+    expect(tfx.host.effects.filter((e) => e.type === "post").length).toBe(before);
+    expect(tfx.host.threadRequests()).toHaveLength(threadRequestsBefore);
+  }, 120_000);
+
+  test("P2 — the thread is not an authority: an outsider RATIFY in it is silence", async () => {
+    // Proposal #2 (surfaced above, into its own thread) ratified by the person
+    // Atlas opened that thread FOR. Identity is checked, not the room.
+    const second = tfx.host.threadsOpened[1]!;
+    expect(second).toBeDefined();
+
+    const bodyBefore = await tfx.target.planBody();
+    const result = await tfx.host.threadTurn(
+      "t-thread-outsider",
+      "RATIFY 2",
+      PROPOSER_PLATFORM_ID,
+      second.threadId,
+    );
+    expect(result.summary).toBe("gate-ignored");
+    expect(tfx.host.postsFor("t-thread-outsider")).toEqual([]);
+    expect(await tfx.target.planBody()).toBe(bodyBefore);
+  }, 240_000);
+
+  test("P3 — the owned threads survive a restart, on disk", () => {
+    // The durable half, read back from the very file the daemon is using.
+    const store = AtlasStateStore.open({ dir: tfx.stateDir });
+    expect(store).not.toBeNull();
+    try {
+      const proposals = new AtlasProposals(store);
+      for (const opened of tfx.host.threadsOpened) {
+        expect(proposals.isOwnedThread(opened.threadId)).toBe(true);
+      }
+      expect(proposals.isOwnedThread("thread-shadow-999")).toBe(false);
+    } finally {
+      store?.close();
+    }
+  });
+
+  test("P4 — every post landed in the bound channel or a thread Atlas owns", () => {
+    const store = AtlasStateStore.open({ dir: tfx.stateDir });
+    expect(store).not.toBeNull();
+    try {
+      const proposals = new AtlasProposals(store);
+      const posts = tfx.host.effects.filter((e) => e.type === "post");
+      expect(posts.length).toBeGreaterThan(0);
+      for (const post of posts) {
+        const where = String(post.landedIn ?? "");
+        if (where !== CHANNEL_ID && !proposals.isOwnedThread(where)) {
+          throw new Error(`a post landed outside the universe: ${where}`);
+        }
+        // …and the universe check alone is NOT enough (adversarial review M3):
+        // a ledger entry buried in an owned thread satisfies it while
+        // violating the criterion the ledger channel exists for. Ledger
+        // entries are identified by their own markers and must be in the
+        // CHANNEL, not merely somewhere admissible.
+        const text = String(post.text ?? "");
+        const isLedgerEntry =
+          text.startsWith("➕") ||
+          text.startsWith("➖") ||
+          text.startsWith("✅") ||
+          text.includes("Catch-up");
+        if (isLedgerEntry && where !== CHANNEL_ID) {
+          throw new Error(`a LEDGER entry landed outside the bound channel: ${where} — ${text.slice(0, 80)}`);
+        }
+      }
+    } finally {
+      store?.close();
+    }
+  });
+
+  test("TODAY'S CORTEX — a refused thread create keeps the exchange in the channel", async () => {
+    // The default policy is what cortex actually does to Atlas right now:
+    // `create_private_thread` is wired for `openOnboarding` agents only, so the
+    // effect comes back `cant_do`. Atlas must treat that as an ordinary
+    // Tuesday — reply in the bound channel, exactly as before this slice.
+    // Restored in `finally` so this describe stays order-independent
+    // (adversarial review, nit 5): a test that leaves the host in a different
+    // mode than it found it makes every later test depend on running first.
+    const previousPolicy = tfx.host.threadPolicy;
+    tfx.host.threadPolicy = "refuse";
+    const threadsBefore = tfx.host.threadsOpened.length;
+    try {
+      const result = await tfx.host.turn(
+        "t-thread-refused",
+        "ADD: https://example.invalid/nope — [Backend] a proposal whose thread is refused",
+        PROPOSER_PLATFORM_ID,
+      );
+      // The proposal itself is declined (that URL is not a real issue) — what
+      // is asserted here is WHERE the reply landed and that no thread was
+      // owned.
+      expect(String(result.summary)).toContain("proposal-");
+      expect(tfx.host.threadsOpened.length).toBe(threadsBefore);
+      expect(tfx.host.postsFor("t-thread-refused").length).toBeGreaterThan(0);
+      for (const effect of tfx.host.effects) {
+        if (effect.type === "post" && effect.task_id === "t-thread-refused") {
+          expect(effect.landedIn).toBe(CHANNEL_ID);
+        }
+      }
+    } finally {
+      tfx.host.threadPolicy = previousPolicy;
+    }
+  }, 120_000);
+});

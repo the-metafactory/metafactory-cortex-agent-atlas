@@ -175,6 +175,42 @@ CREATE TABLE IF NOT EXISTS gate_replay_keys (
 `;
 
 /**
+ * THE OWNED-THREAD REGISTRY (atlas#22 + atlas#25) — the second Atlas-owned
+ * auxiliary table, created on the same terms as `gate_replay_keys` above:
+ * outside agent-state's version gate, every open, `IF NOT EXISTS`.
+ *
+ * ── Why it must be DURABLE, not a Map ──────────────────────────────────────
+ * It is an ADMISSION input. A thread Atlas forgets is a thread Atlas goes deaf
+ * in — the principal keeps typing `RATIFY 1` into a thread nobody is listening
+ * to and gets silence, because a non-admitted task is refused WITHOUT a reply
+ * by design (`runtime.ts`). A daemon restart is routine (`maxRestarts: 3`, a
+ * config reload, a host redeploy), so an in-memory registry would turn every
+ * restart into a silently broken conversation. Restart-safety is the whole
+ * point of the table.
+ *
+ * ── What may be written here ───────────────────────────────────────────────
+ * ONLY a host-resolved `thread_created.thread_id` that `runtime.ts` correlated
+ * to a `create_private_thread` IT emitted. Never a value read off an inbound
+ * task's `source`, never anything derived from message text. This is the one
+ * table whose contents WIDEN what Atlas will act on, so its write path is
+ * deliberately the narrowest in the pack: one caller, one correlated event,
+ * one shape check (`OWNED_THREAD_ID_RE`).
+ *
+ * `task_id` is the request's correlation id, kept for audit only — nothing
+ * reads it to make a decision. Rows are never expired on a clock: a thread
+ * Discord has archived is still a thread whose messages Atlas must hear if the
+ * platform ever delivers one, and time-based expiry would reintroduce exactly
+ * the deafness this table exists to remove.
+ */
+const OWNED_THREADS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS owned_threads (
+  thread_id  TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL,
+  opened_at  INTEGER NOT NULL
+);
+`;
+
+/**
  * Atlas-OWNED auxiliary tables (atlas#28) — same posture as
  * `GATE_REPLAY_KEYS_SCHEMA` above: outside the `schema_migrations` version
  * gate, created unconditionally every open, guarded only by `IF NOT EXISTS`.
@@ -207,6 +243,49 @@ CREATE TABLE IF NOT EXISTS linked_issue_title_cache (
   fetched_at INTEGER NOT NULL
 );
 `;
+
+/**
+ * The shape a platform thread id must have before it is stored or matched.
+ * Discord snowflakes are decimal digit strings; this repo's fixtures use
+ * `thread-fixture-…`. Deliberately permissive about WHICH characters (a pack
+ * must not encode one platform's id grammar as a security boundary) and strict
+ * about the two things that matter: no whitespace and a bound — so a stored id
+ * can never be a sentence, and a blank/absent channel on an inbound task can
+ * never match a stored row.
+ */
+const OWNED_THREAD_ID_RE = /^[A-Za-z0-9:_.-]{1,128}$/;
+
+/**
+ * Values that PASS the shape check above but can only ever be a bug by the
+ * time they reach this table: the STRING FORMS of absent/empty values, which
+ * is exactly what a mis-serialised or coerced id looks like once it is a
+ * string. No path that produces one is proven — this is a denylist on the one
+ * table that WIDENS admission, and one line is a cheap way to make "a
+ * stringified `undefined` became an admitted room" impossible rather than
+ * merely unobserved (adversarial review, nit 1). It is not theoretical
+ * paranoia either: cortex's own config layer coerces an absent
+ * `agentChannelId` to the literal string `"undefined"` under the zod it ships
+ * (4.3.6), so this class of value demonstrably exists in this ecosystem.
+ * Compared case-insensitively: `Null` is no more a thread id than `null`.
+ */
+const IMPLAUSIBLE_THREAD_IDS: ReadonlySet<string> = new Set([
+  "undefined",
+  "null",
+  "nan",
+  "none",
+  "nil",
+  "false",
+  "true",
+  "0",
+  "-1",
+]);
+
+/** True when `id` is a plausible platform thread id. Never throws. */
+export function isPlausibleThreadId(id: unknown): id is string {
+  if (typeof id !== "string") return false;
+  if (!OWNED_THREAD_ID_RE.test(id)) return false;
+  return !IMPLAUSIBLE_THREAD_IDS.has(id.toLowerCase());
+}
 
 /**
  * Plan bodies are operator-sized (GitHub's own issue-body ceiling is 65536
@@ -2040,6 +2119,55 @@ export class AtlasStateStore {
     this.regenDashboard();
   }
 
+  // ── The owned-thread registry (atlas#22 + atlas#25) ──────────────────────
+
+  /**
+   * Record a thread Atlas itself opened, so a message posted in it is
+   * admitted after a restart. `threadId` MUST be a host-resolved
+   * `thread_created.thread_id` correlated to this brain's own
+   * `create_private_thread` — see `OWNED_THREADS_SCHEMA` and the single caller
+   * in `runtime.ts`.
+   *
+   * Returns `true` only when the row is durably present afterwards. A
+   * malformed id is refused (`false`) rather than stored: this table decides
+   * what Atlas will ACT on, so a value that does not look like a platform id
+   * has no business widening admission. `INSERT OR IGNORE` makes a repeat
+   * (host redelivery, a re-correlated event) a no-op that still reports
+   * success — the row exists, which is the property callers care about.
+   */
+  recordOwnedThread(threadId: string, taskId: string, now: number = Date.now()): boolean {
+    if (!isPlausibleThreadId(threadId)) return false;
+    this.db
+      .query(`INSERT OR IGNORE INTO owned_threads (thread_id, task_id, opened_at) VALUES (?, ?, ?)`)
+      .run(threadId, boundedKey(typeof taskId === "string" ? taskId : ""), now);
+    return this.isOwnedThread(threadId);
+  }
+
+  /**
+   * Is this channel id a thread Atlas opened? The admission half of the
+   * registry — an indexed point lookup on the PRIMARY KEY, called once per
+   * inbound task that is not already the bound channel.
+   *
+   * The shape check runs BEFORE the query, not as a nicety: it is what makes
+   * `""` (a task with no channel at all) unable to match, independently of
+   * what any other row in the table happens to contain.
+   */
+  isOwnedThread(threadId: string): boolean {
+    if (!isPlausibleThreadId(threadId)) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM owned_threads WHERE thread_id = ? LIMIT 1`,
+      )
+      .get(threadId);
+    return row !== null && row !== undefined;
+  }
+
+  /** How many threads Atlas owns. Observability only — no decision reads it. */
+  ownedThreadCount(): number {
+    const row = this.db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM owned_threads`).get();
+    return row?.n ?? 0;
+  }
+
   // ── atlas#28: the status cache + the watch-pass marker ───────────────────
   //
   // Everything in this block is either a durable write `watch.ts` makes on
@@ -2450,6 +2578,26 @@ class MemoryProposals {
     return false;
   }
 
+  /**
+   * Always `false` — the owned-thread registry is FAIL-CLOSED in degraded
+   * mode, on the same reasoning as the ratification block above and with a
+   * sharper edge. This table is an ADMISSION input: an in-memory copy would
+   * widen what Atlas acts on using state that evaporates on restart, and the
+   * failure it produces is the exact one atlas#22 exists to remove — a thread
+   * Atlas invited a reply into and can no longer hear. `runtime.ts` closes the
+   * loop from the other side: it never REQUESTS a thread while the store is
+   * not durable, so a degraded Atlas keeps the whole conversation in the bound
+   * channel, where it can still be heard.
+   */
+  recordOwnedThread(): boolean {
+    return false;
+  }
+
+  /** Always `false`: a thread this store cannot remember is one it must not admit. */
+  isOwnedThread(): boolean {
+    return false;
+  }
+
   /** Always `null`: no durable ratification is possible here. See the block comment above. */
   markRatified(): StoredRatification | null {
     return null;
@@ -2780,6 +2928,38 @@ export class AtlasProposals {
     );
   }
 
+  // ── The owned-thread registry (atlas#22 + atlas#25) ──────────────────────
+
+  /**
+   * Record a thread Atlas opened. `false` when it was not durably stored —
+   * a malformed id, a degraded store, or a storage failure. The caller
+   * (`runtime.ts`) treats `false` as "do not converse in that thread": a
+   * thread Atlas cannot remember is a thread it will be deaf in, and it must
+   * not invite a reply there.
+   */
+  recordOwnedThread(threadId: string, taskId: string, now?: number): boolean {
+    return this.run(
+      (db) => db.recordOwnedThread(threadId, taskId, now ?? Date.now()),
+      (m) => m.recordOwnedThread(),
+    );
+  }
+
+  /**
+   * Is this inbound channel id a thread Atlas opened? The second half of
+   * `runtime.ts`'s admission union.
+   *
+   * A degraded store answers `false` — deliberately, and it is the safe
+   * direction: admission NARROWS to the configured channel (which is exactly
+   * pre-atlas#22 behaviour), never widens, when Atlas cannot read its own
+   * record of what it opened.
+   */
+  isOwnedThread(threadId: string): boolean {
+    return this.run(
+      (db) => db.isOwnedThread(threadId),
+      (m) => m.isOwnedThread(),
+    );
+  }
+
   /** See `AtlasStateStore.markRatified` — the authority-only ratify transition. */
   markRatified(id: string, authority: GateAuthority): StoredRatification | null {
     return this.run(
@@ -3103,6 +3283,19 @@ function applyMigration(db: Database): void {
       backfillGateReplayKeys(db);
     })();
   }
+
+  // The owned-thread registry (atlas#22/#25) — same terms as the table above:
+  // Atlas-owned, outside the agent-state version gate, `IF NOT EXISTS` every
+  // open. There is nothing to backfill: before this table existed Atlas owned
+  // no threads, so an empty table is the accurate history, not a gap.
+  //
+  // NOTE this runs from `applyMigration`, which is on the READ-WRITE open path
+  // ONLY — `openReadOnly` (atlas#28) constructs the store without it, because a
+  // read-only handle cannot `CREATE TABLE` at all. That is why the status CLI
+  // can open a DB this table has never touched: it never gets here, and it
+  // never queries `owned_threads` either (admission is a daemon concern). Both
+  // halves are pinned by a test in `state.test.ts`.
+  db.exec(OWNED_THREADS_SCHEMA);
 
   // atlas#28's status cache — same "outside the version gate, IF NOT EXISTS"
   // posture as the replay-key table above. Nothing to backfill: an empty
