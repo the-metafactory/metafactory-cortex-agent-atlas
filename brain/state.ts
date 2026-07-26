@@ -303,6 +303,16 @@ export interface AppliedReceipt {
    */
   readonly revision: string;
   readonly ts: number;
+  /**
+   * The checkbox-insensitive twin of `revision` (`plan-revision.ts`'s
+   * `planBodyRevisionNormalized`, atlas#34) — OPTIONAL so every existing
+   * caller and fixture that builds a receipt without it keeps compiling.
+   * `apply.ts` always supplies it now; a receipt recorded without one (a
+   * fixture, or a row written before atlas#34) reads back as "no normalised
+   * baseline for this revision", which `reconcile.ts` treats exactly like a
+   * legacy revision — a safe absence, never a false match.
+   */
+  readonly normalizedRevision?: string;
 }
 
 /** The receipt for half (b): the ledger entry landed. */
@@ -1155,6 +1165,10 @@ export class AtlasStateStore {
           // message is recorded here purely as an audit backlink.
           ratified_message_id: cert.messageId,
           plan_revision: receipt === null ? null : cap(receipt.revision, 128),
+          plan_revision_normalized:
+            receipt === null || typeof receipt.normalizedRevision !== "string" || receipt.normalizedRevision.length === 0
+              ? null
+              : cap(receipt.normalizedRevision, 128),
         },
         ts,
       );
@@ -1463,6 +1477,73 @@ export class AtlasStateStore {
   }
 
   /**
+   * The last plan-body revision reconcile could account for, exact hash AND
+   * normalised hash together (`plan-revision.ts`'s `PlanRevisionBaseline`,
+   * atlas#34) — the freshest of EITHER an apply's `work_item_resolved` or a
+   * reconcile pass's own `reconcile_completed`, by timestamp. This is the
+   * baseline detector (c) diffs the CURRENT body against to tell "only a
+   * checkbox marker changed" from "something else did".
+   *
+   * `null` when there is no accounted revision yet, OR when the freshest one
+   * predates atlas#34 and so was never recorded with a normalised twin — the
+   * two are deliberately collapsed into the same answer, because a caller
+   * that cannot tell "no baseline" from "an unusable one" apart must fail
+   * closed to the SAME safe default: fall back to reporting drift as before,
+   * rather than risk matching a checkbox-only diff against a baseline that
+   * was never actually verified.
+   */
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    const row = this.db
+      .query<{ revision: string | null; normalized: string | null }, []>(
+        `SELECT revision, normalized FROM (
+           SELECT ts,
+                  ${jsonField("payload", "$.plan_revision")} AS revision,
+                  ${jsonField("payload", "$.plan_revision_normalized")} AS normalized
+             FROM events
+             WHERE type IN ('work_item_resolved', 'reconcile_completed')
+         )
+         WHERE revision IS NOT NULL
+         ORDER BY ts DESC LIMIT 1`,
+      )
+      .get();
+    if (row === null || row === undefined) return null;
+    if (typeof row.revision !== "string" || row.revision.length === 0) return null;
+    if (typeof row.normalized !== "string" || row.normalized.length === 0) return null;
+    return { revision: row.revision, normalized: row.normalized };
+  }
+
+  /**
+   * Has THIS revision already been given its one grace pass (atlas#34)? A
+   * checkbox-only revision reconcile cannot yet corroborate is not reported
+   * the first time it is seen — the watcher may simply not have caught up —
+   * so this answers "have we already deferred this exact revision once",
+   * which is what tells the SECOND sighting to report rather than defer
+   * again. Keyed on the revision itself, same shape as `hasReconcileCatchUp`.
+   */
+  hasDeferredChecklistRevision(revision: string): boolean {
+    const key = boundedKey(cap(revision, 128));
+    if (key.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type = 'reconcile_checklist_deferred'
+            AND ${jsonField("payload", "$.revision")} = ?
+          LIMIT 1`,
+      )
+      .get(key);
+    return row !== null && row !== undefined;
+  }
+
+  /** Record that this revision has now been given its one grace pass. */
+  recordDeferredChecklistRevision(revision: string): void {
+    const key = boundedKey(cap(revision, 128));
+    if (key.length === 0) return;
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(Date.now(), "reconcile_checklist_deferred", OWNER, JSON.stringify({ revision: key }));
+  }
+
+  /**
    * Has a reconcile pass ever completed? The FIRST pass establishes the
    * revision baseline instead of reporting on it: Atlas cannot honestly claim a
    * plan-body edit is unaccounted-for when it has no record of any edit at all,
@@ -1523,7 +1604,12 @@ export class AtlasStateStore {
    * weekly retro reports, and a metric that is only written when it is non-zero
    * cannot be shown to trend to zero.
    */
-  recordReconcilePass(driftCount: number, planRevision: string | null, catchUpMessageId: string | null): void {
+  recordReconcilePass(
+    driftCount: number,
+    planRevision: string | null,
+    planRevisionNormalized: string | null,
+    catchUpMessageId: string | null,
+  ): void {
     this.db
       .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
       .run(
@@ -1533,6 +1619,9 @@ export class AtlasStateStore {
         JSON.stringify({
           drift_count: Number.isSafeInteger(driftCount) && driftCount >= 0 ? driftCount : 0,
           plan_revision: planRevision === null ? null : cap(planRevision, 128),
+          // atlas#34: only ever meaningful alongside a non-null `plan_revision` —
+          // see `lastAccountedPlanRevision`, which reads the two as a pair.
+          plan_revision_normalized: planRevisionNormalized === null ? null : cap(planRevisionNormalized, 128),
           catch_up_message_id: catchUpMessageId === null ? null : cap(catchUpMessageId, MAX_ID_LEN),
         }),
       );
@@ -1935,6 +2024,24 @@ class MemoryProposals {
     return new Set<string>();
   }
 
+  /** No durable baseline — a degraded store cannot classify a checkbox diff. */
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    return null;
+  }
+
+  /**
+   * `false` — i.e. "always defer, never report". Unreachable via
+   * `reconcile.ts` (it refuses the whole pass while degraded), but the same
+   * "every answer is the one that causes no post" posture as its W3a siblings.
+   */
+  hasDeferredChecklistRevision(): boolean {
+    return false;
+  }
+
+  recordDeferredChecklistRevision(): void {
+    // deliberately empty; degraded mode records nothing.
+  }
+
   /**
    * `true` — i.e. "not the first pass". The first-pass branch is the one that
    * SUPPRESSES revision drift, and a degraded store must not be able to claim
@@ -2274,6 +2381,27 @@ export class AtlasProposals {
     );
   }
 
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    return this.run(
+      (db) => db.lastAccountedPlanRevision(),
+      (m) => m.lastAccountedPlanRevision(),
+    );
+  }
+
+  hasDeferredChecklistRevision(revision: string): boolean {
+    return this.run(
+      (db) => db.hasDeferredChecklistRevision(revision),
+      (m) => m.hasDeferredChecklistRevision(),
+    );
+  }
+
+  recordDeferredChecklistRevision(revision: string): void {
+    this.run(
+      (db) => db.recordDeferredChecklistRevision(revision),
+      (m) => m.recordDeferredChecklistRevision(),
+    );
+  }
+
   hasReconciled(): boolean {
     return this.run(
       (db) => db.hasReconciled(),
@@ -2299,10 +2427,11 @@ export class AtlasProposals {
   recordReconcilePass(
     driftCount: number,
     planRevision: string | null,
+    planRevisionNormalized: string | null,
     catchUpMessageId: string | null,
   ): void {
     this.run(
-      (db) => db.recordReconcilePass(driftCount, planRevision, catchUpMessageId),
+      (db) => db.recordReconcilePass(driftCount, planRevision, planRevisionNormalized, catchUpMessageId),
       (m) => m.recordReconcilePass(),
     );
   }

@@ -56,7 +56,7 @@
  */
 
 import { certificateMatchesStorage, type RatificationCertificate } from "./ratification";
-import { planBodyRevision } from "./plan-revision";
+import { planBodyRevision, planBodyRevisionNormalized } from "./plan-revision";
 import type { RatifyIdentityConfig } from "./identity";
 import type { AtlasProposals, ProposalRecord } from "./state";
 import type { EffectsConfig } from "./effects/config";
@@ -184,6 +184,7 @@ export async function applyRatified(
   // act on, so the unconditional default below is right even when `edit.kind`
   // turns out to be `unchanged`.
   let revision = planBodyRevision(before.body);
+  let revisionNormalized = planBodyRevisionNormalized(before.body);
   const bodyChanged = edit.kind === "changed";
   if (edit.kind === "changed") {
     const after = await deps.gh.writePlanBody(edit.body);
@@ -201,11 +202,17 @@ export async function applyRatified(
     // rather than trusting `after.revisedAt` (`updatedAt`), which is not a
     // body-revision identity at all (that was the bug).
     revision = planBodyRevision(edit.body);
+    revisionNormalized = planBodyRevisionNormalized(edit.body);
   }
 
   // ── 5. Record `applied` with the body-revision receipt ───────────────────
+  // atlas#34: `normalizedRevision` alongside `revision` — reconcile's detector
+  // (c) diffs a later out-of-band change against the LAST accounted body, and
+  // an Atlas apply is as much an accounted body as a reconcile pass is; see
+  // `state.ts`'s `lastAccountedPlanRevision` and `plan-revision.ts`'s header.
   const applied = deps.state.markApplied(cert, deps.identity.ratifier, {
     revision,
+    normalizedRevision: revisionNormalized,
     ts: Date.now(),
   });
   if (!applied) {

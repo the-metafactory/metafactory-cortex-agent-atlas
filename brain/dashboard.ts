@@ -48,6 +48,12 @@
  * pass, which is correct for a dashboard whose job is to describe the LEDGER's
  * view of the plan — the live view belongs to `watch.ts`, which is what
  * refreshes signal 2.
+ *
+ * atlas#34: this file already treats a ticked checkbox as a legitimate
+ * closedness signal (signal 1, above) — `reconcile.ts`'s detector (c) used to
+ * disagree, reading the identical byte change as unconditionally suspicious.
+ * The two now agree; `plan-revision.ts`'s header carries the ONE canonical
+ * statement of what a tick means, so it is not restated here or there.
  */
 
 import { sanitizeForDisplay } from "./templates";

@@ -585,7 +585,7 @@ describe("a plan-body revision with no matching ➕/➖ event", () => {
   describe("re-baselining across the identity change (legacy `updatedAt` history)", () => {
     /** Seed reconcile history the way it looked BEFORE atlas#26: an ISO timestamp. */
     function seedLegacyHistory(revision = "2026-07-20T00:00:00Z"): void {
-      state.recordReconcilePass(0, revision, null);
+      state.recordReconcilePass(0, revision, null, null);
     }
 
     test("a pass whose ENTIRE history is legacy timestamps re-baselines instead of reporting drift", async () => {
@@ -635,7 +635,7 @@ describe("a plan-body revision with no matching ➕/➖ event", () => {
       seedLegacyHistory("2026-07-20T00:00:00Z");
       // A hashed revision has already been recorded once (say, by an earlier
       // deploy of the fix) — migration is over, real detection applies.
-      state.recordReconcilePass(0, planBodyRevision(repo.body), null);
+      state.recordReconcilePass(0, planBodyRevision(repo.body), null, null);
 
       // A comment lands with NO body change — this must stay clean even
       // though legacy noise is still present in history. Under the OLD
@@ -654,6 +654,122 @@ describe("a plan-body revision with no matching ➕/➖ event", () => {
       if (caught.kind !== "caught-up") throw new Error(`expected caught-up, got ${caught.kind}`);
       expect(caught.items.map((i) => i.kind)).toEqual(["plan-revised"]);
     });
+  });
+});
+
+// ── atlas#34: GitHub itself ticks a plan checkbox on issue closure ─────────
+//
+// See `plan-revision.ts`'s header for the decision this suite verifies:
+// (c) with (b) as the fallback classification, plus the ordering/race note
+// on why an uncorroborated tick is deferred once rather than reported
+// immediately.
+
+describe("a GitHub-authored checkbox tick (atlas#34)", () => {
+  /** Simulate GitHub ticking the plan's checkbox for `url` — Atlas never does. */
+  function tick(url: string): void {
+    repo.body = repo.body.replace(`- [ ] ${url}`, `- [x] ${url}`);
+    repo.touchWithoutBodyChange();
+  }
+
+  test("a tick corroborated by the completion index produces NO drift", async () => {
+    await reconcilePlan(deps(), NOW); // baseline
+
+    // The watcher gets there first and announces the closure.
+    gh.set(ISSUE_1, closed("first", "2026-07-20T08:00:00Z"));
+    await pollCompletions({ state, plan, gh, ledger }, NOW + 1);
+    expect(transport.posts).toHaveLength(1); // the ✅
+
+    // GitHub itself ticks the plan's checkbox for the now-closed issue.
+    tick(ISSUE_1);
+
+    const outcome = await reconcilePlan(deps(), NOW + 2);
+    expect(outcome.kind).toBe("clean");
+    expect(transport.posts).toHaveLength(1); // still just the ✅ — no drift post
+
+    // And it converges: re-examining the same body says nothing further.
+    expect((await reconcilePlan(deps(), NOW + 3)).kind).toBe("clean");
+    expect(transport.posts).toHaveLength(1);
+  });
+
+  test("a tick with the issue still open is DEFERRED once, then reported as drift", async () => {
+    await reconcilePlan(deps(), NOW); // baseline
+    // ISSUE_1 stays OPEN — nobody closed it. A human ticks the box anyway.
+    tick(ISSUE_1);
+
+    // First sighting: deferred, not reported — indistinguishable, from the
+    // outside, from "the watcher just has not caught up yet".
+    const first = await reconcilePlan(deps(), NOW + 1);
+    expect(first.kind).toBe("clean");
+    expect(transport.posts).toHaveLength(0);
+
+    // Second sighting over the SAME revision: the one grace pass is spent.
+    const second = await reconcilePlan(deps(), NOW + 2);
+    if (second.kind !== "caught-up") throw new Error(`expected caught-up, got ${second.kind}`);
+    expect(second.items.map((i) => i.kind)).toEqual(["plan-revised"]);
+    expect(transport.posts).toHaveLength(1);
+    expect(transport.posts[0]!.content).toContain(ISSUE_1);
+    expect(transport.posts[0]!.content).toContain("not known to be closed");
+
+    // And it converges.
+    expect((await reconcilePlan(deps(), NOW + 3)).kind).toBe("clean");
+    expect(transport.posts).toHaveLength(1);
+  });
+
+  test("the race resolves itself: a deferred tick becomes accounted-for once the watcher catches up", async () => {
+    await reconcilePlan(deps(), NOW); // baseline
+    gh.set(ISSUE_1, closed("first", "2026-07-26T11:30:00Z"));
+    tick(ISSUE_1); // GitHub ticks it the instant it closes...
+
+    // ...but the watcher has not run yet, so reconcile cannot corroborate it.
+    const first = await reconcilePlan(deps(), NOW + 1);
+    expect(first.kind).toBe("clean");
+    expect(transport.posts).toHaveLength(0);
+
+    // The watcher's own pass catches up.
+    await pollCompletions({ state, plan, gh, ledger }, NOW + 2);
+    expect(transport.posts).toHaveLength(1); // the ✅, now posted
+
+    // Reconcile re-examines the SAME (still-unaccounted) revision — now corroborated.
+    const second = await reconcilePlan(deps(), NOW + 3);
+    expect(second.kind).toBe("clean");
+    expect(transport.posts).toHaveLength(1); // no drift post ever went out
+  });
+
+  test("a non-checkbox edit alongside a tick is STILL reported immediately — the detector keeps its teeth", async () => {
+    await reconcilePlan(deps(), NOW); // baseline
+    gh.set(ISSUE_1, closed("first", "2026-07-20T08:00:00Z"));
+    await pollCompletions({ state, plan, gh, ledger }, NOW + 1);
+
+    tick(ISSUE_1);
+    repo.body = `${repo.body}\n- [ ] https://github.com/acme/widgets/issues/99\n`;
+    repo.touchWithoutBodyChange();
+
+    // Not deferred: content changed beyond the checkbox marker, so this is
+    // reported on the very FIRST pass, exactly like an ordinary out-of-band edit.
+    const outcome = await reconcilePlan(deps(), NOW + 2);
+    if (outcome.kind !== "caught-up") throw new Error(`expected caught-up, got ${outcome.kind}`);
+    expect(outcome.items.map((i) => i.kind)).toEqual(["plan-revised"]);
+    expect(outcome.items[0]!.line).toContain("revised outside Atlas");
+  });
+
+  test("multiple simultaneous ticks: a corroborated one does not shield an uncorroborated one", async () => {
+    await reconcilePlan(deps(), NOW); // baseline
+    gh.set(ISSUE_1, closed("first", "2026-07-20T08:00:00Z"));
+    await pollCompletions({ state, plan, gh, ledger }, NOW + 1);
+
+    // GitHub flips BOTH boxes in one edit — ISSUE_1 (closed, corroborated) and
+    // ISSUE_2 (still open, NOT corroborated). atlas#26's own live finding was
+    // exactly this: several checkboxes can flip in a single edit.
+    tick(ISSUE_1);
+    tick(ISSUE_2);
+
+    const first = await reconcilePlan(deps(), NOW + 2);
+    expect(first.kind).toBe("clean"); // deferred once, for ISSUE_2's sake
+
+    const second = await reconcilePlan(deps(), NOW + 3);
+    if (second.kind !== "caught-up") throw new Error(`expected caught-up, got ${second.kind}`);
+    expect(second.items[0]!.line).toContain(ISSUE_2);
+    expect(second.items[0]!.line).not.toContain(ISSUE_1); // corroborated — not named as suspect
   });
 });
 
