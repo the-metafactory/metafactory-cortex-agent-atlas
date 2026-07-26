@@ -587,7 +587,11 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
       const first = await reconcilePlan(deps, Date.now());
       const second = await reconcilePlan(deps, Date.now());
 
-      // Neither pass found drift the live run left behind…
+      // Neither pass found drift the live run left behind — including the
+      // checkbox ticks GitHub itself writes when the walkthrough's linked
+      // issues close (atlas#34): those are corroborated by Atlas's own
+      // completion index (`watch.ts`'s announcements) and accounted for
+      // silently, exactly like the walkthrough's own ➕ applies are.
       if (first.kind !== "clean") {
         const detail =
           first.kind === "caught-up" || first.kind === "post-failed"
@@ -598,22 +602,7 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
         throw new Error(
           `the first reconcile after a clean live run found drift (${first.kind}):\n    ${detail}\n` +
             `  revisions Atlas recorded: ${observed}\n` +
-            `  revision GitHub reports now: ${live?.revisedAt ?? "(unreadable)"}\n` +
-            `\n` +
-            `  KNOWN DEFECT — atlas#34. This currently FAILS, and the failure is the finding.\n` +
-            `\n` +
-            `  GitHub itself edits the plan body: when a plan line references an issue in the\n` +
-            `  same repo, GitHub ticks that checkbox on closure. Neither Atlas nor this harness\n` +
-            `  writes "[x]" (Atlas: zero occurrences in apply.ts; harness: seeds the body once).\n` +
-            `  So the bytes genuinely change with no ledger entry, and detector (c) correctly\n` +
-            `  reports it. A body-hash revision identity CANNOT filter this — unlike timestamp\n` +
-            `  noise, the content really did change. atlas#26 is fixed and is not the cause.\n` +
-            `\n` +
-            `  NOTE for whoever reads this next: an earlier version of this note claimed the\n` +
-            `  walkthrough makes "exactly TWO body edits". That was WRONG — it ratifies three\n` +
-            `  ADDs (DoD 3+4, DoD 8's RATIFY 2, DoD 5's RATIFY 3), and GitHub's tick is a\n` +
-            `  fourth. Verified against the live issue via GraphQL userContentEdits. Do not\n` +
-            `  re-derive a bug from that arithmetic. Remove this note when atlas#34 lands.`,
+            `  revision GitHub reports now: ${live?.revisedAt ?? "(unreadable)"}`,
         );
       }
       expect(second.kind).toBe("clean");
