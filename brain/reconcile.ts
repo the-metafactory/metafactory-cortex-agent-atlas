@@ -17,6 +17,16 @@
  *   (c) plan-body revisions Atlas cannot account for — an edit with no ➕/➖.
  * (b) is listed first because it is the dangerous one; see the next section.
  *
+ * atlas#34: (c) does NOT report every unaccounted revision. GitHub itself
+ * ticks a plan checkbox when a linked issue in the same repo closes, which is
+ * a real body change with no ➕/➖ — but it is the plan's ordinary healthy
+ * lifecycle, not drift. `plan-revision.ts`'s header carries the single,
+ * canonical statement of what a checkbox tick means (shared with
+ * `dashboard.ts`, which already reads one the same way) and the full
+ * reasoning for why an uncorroborated tick is DEFERRED once rather than
+ * reported immediately. This file only wires that classification in; it does
+ * not restate the decision.
+ *
  * ── SILENCE IS THE DEFAULT, and it is a hard rule ──────────────────────────
  * A pass that finds nothing posts NOTHING. Not a heartbeat, not an "all clear",
  * not an empty digest. The channel is a ledger, not a status feed, and the only
@@ -90,6 +100,12 @@
  * this reason (see `messageRecordsPlanChange`).
  */
 
+import {
+  classifyPlanRevision,
+  isHashedPlanRevision,
+  planBodyRevision,
+  planBodyRevisionNormalized,
+} from "./plan-revision";
 import { sanitizeForDisplay } from "./templates";
 import { extractLinkedIssueUrls } from "./watch";
 import { messageRecordsPlanChange, type DiscordLedger, type LedgerMessage, type LedgerReader } from "./effects/discord";
@@ -234,7 +250,25 @@ export async function reconcilePlan(
       detail: "could not read the plan body; reconcile did nothing",
     };
   }
-  const revision = snapshot.revisedAt;
+  // atlas#26: identify the revision by the BODY, not by GitHub's `updatedAt`
+  // (`snapshot.revisedAt`) — that field advances on comments, label changes,
+  // and cross-references from other issues/PRs, not only on body edits. Two
+  // reads of an unchanged body always hash the same, so this is what makes
+  // detector (c) below mean "this body differs from the one last accounted
+  // for" rather than "something, anything, happened on this issue".
+  const revision = planBodyRevision(snapshot.body);
+  // atlas#34: computed unconditionally (cheap — one more hash of text already
+  // in hand) so it is available BOTH to detector (c)'s classification below
+  // AND to `recordReconcilePass` at the end of every pass, keeping
+  // `lastAccountedPlanRevision`'s baseline fresh even on passes where
+  // detector (c) never fires at all.
+  const revisionNormalized = planBodyRevisionNormalized(snapshot.body);
+  // Defaults to `revision` — the ordinary case, "this pass accounts for the
+  // body it just read". Detector (c) below sets this to `null` for EXACTLY
+  // one case: a checkbox-only revision reconcile cannot yet corroborate,
+  // which must NOT enter `observedPlanRevisions()` yet (see plan-revision.ts's
+  // "ordering / the race" section) — everything else falls straight through.
+  let revisionToRecord: string | null = revision;
 
   const firstPass = !deps.state.hasReconciled();
   const lastLedger = deps.state.lastLedgerEntryTs();
@@ -329,19 +363,81 @@ export async function reconcilePlan(
 
   // ── 3(c). A plan-body revision with no matching ➕/➖ event ────────────────
   if (!firstPass && typeof revision === "string" && revision.length > 0) {
-    if (!deps.state.observedPlanRevisions().has(revision)) {
-      const key = `plan-revised:${revision}`;
-      if (deps.state.hasReconcileCatchUp(key)) {
-        suppress();
+    const observed = deps.state.observedPlanRevisions();
+    // atlas#26 MIGRATION: before this fix, every recorded revision was a
+    // GitHub `updatedAt` ISO timestamp; after it, every NEW one is a
+    // `sha256:`-prefixed body hash (`isHashedPlanRevision`). The two schemes
+    // can never agree by coincidence, so on a deployment that already had
+    // reconcile history, the very first pass after the fix lands would find
+    // `observed` full of legacy timestamps and the live (hashed) revision
+    // absent from it — reporting drift for every plan that has EVER been
+    // reconciled before, which is the bug this fix exists to kill, amplified.
+    //
+    // The signal: has a hashed revision EVER been recorded? If not, this pass
+    // cannot yet tell "no baseline" from "wrong-scheme baseline" apart from
+    // "genuine edit" — so, exactly like `firstPass` above establishes a
+    // baseline instead of reporting on one, this pass re-baselines instead of
+    // reporting: it says nothing here, and `recordReconcilePass` below (run
+    // unconditionally, drift or not) writes the current hashed revision down,
+    // which is what lets the very next pass resume real detection.
+    const migrating = ![...observed].some(isHashedPlanRevision);
+    if (!migrating && !observed.has(revision)) {
+      // atlas#34: is this exact diff explained by a GitHub-authored checkbox
+      // tick? See plan-revision.ts's header for the decision this implements
+      // ((c) with (b) as the fallback) and the single statement it shares
+      // with dashboard.ts about what a tick means.
+      const classification = classifyPlanRevision(
+        snapshot.body,
+        revisionNormalized,
+        deps.state.lastAccountedPlanRevision(),
+        (url) => deps.state.hasAnnouncedCompletion(url),
+      );
+      if (classification.kind === "checkbox-only" && classification.uncorroborated.length === 0) {
+        // Every ticked, issue-linked line is corroborated by Atlas's own
+        // completion index — accounted for, silently. `revisionToRecord`
+        // stays `revision`, so this falls straight into the clean/converged
+        // path below exactly like any other already-accounted revision.
+      } else if (
+        classification.kind === "checkbox-only" &&
+        !deps.state.hasDeferredChecklistRevision(revision)
+      ) {
+        // Uncorroborated, but seen for the FIRST time: the tick can race the
+        // watcher (`watch.ts` polls far more often than reconcile does), so
+        // give it one grace pass rather than crying wolf on an ordinary
+        // closure the watcher simply has not caught up to yet. Deliberately
+        // NOT accepted into `observedPlanRevisions()` — see the `null` below —
+        // so the SAME revision is re-examined, not permanently excused.
+        deps.state.recordDeferredChecklistRevision(revision);
+        revisionToRecord = null;
       } else {
-        drift.push({
-          kind: "plan-revised",
-          key,
-          url: null,
-          line:
-            `✋ plan body revised outside Atlas — revision ${revision} has no ➕/➖ ` +
-            `ledger entry`,
-        });
+        const key = `plan-revised:${revision}`;
+        if (deps.state.hasReconcileCatchUp(key)) {
+          suppress();
+        } else if (classification.kind === "checkbox-only") {
+          // Still uncorroborated on a LATER pass over this same revision — it
+          // already had its one grace pass, so this is now reported: either a
+          // human ticked a box for an issue Atlas does not believe is closed,
+          // or the underlying issue genuinely never closed. Either way this is
+          // exactly what the detector exists to catch (plan-revision.ts).
+          drift.push({
+            kind: "plan-revised",
+            key,
+            url: null,
+            line:
+              `✋ plan body checkbox ticked outside Atlas for ` +
+              `${classification.uncorroborated.join(", ")} — not known to be closed ` +
+              `(revision ${revision} has no ➕/➖ ledger entry)`,
+          });
+        } else {
+          drift.push({
+            kind: "plan-revised",
+            key,
+            url: null,
+            line:
+              `✋ plan body revised outside Atlas — revision ${revision} has no ➕/➖ ` +
+              `ledger entry`,
+          });
+        }
       }
     }
   }
@@ -350,7 +446,9 @@ export async function reconcilePlan(
   if (drift.length === 0) {
     // The observed revision is written down even on a clean pass: that is what
     // makes detector (c) converge, and it is a state write, not a channel one.
-    deps.state.recordReconcilePass(0, revision, null);
+    // atlas#34: `revisionToRecord` is `null` for exactly the deferred-checkbox
+    // case above — everything else records `revision` as usual.
+    deps.state.recordReconcilePass(0, revisionToRecord, revisionToRecord === null ? null : revisionNormalized, null);
     await redrawDashboard(deps, now);
     return { kind: "clean", checked, suppressed, revision };
   }
@@ -387,7 +485,12 @@ export async function reconcilePlan(
       deps.state.recordCompletionAnnounced(item.url, posted.receipt.messageId);
     }
   }
-  deps.state.recordReconcilePass(covered.length, revision, posted.receipt.messageId);
+  deps.state.recordReconcilePass(
+    covered.length,
+    revisionToRecord,
+    revisionToRecord === null ? null : revisionNormalized,
+    posted.receipt.messageId,
+  );
   await redrawDashboard(deps, now);
   return {
     kind: "caught-up",

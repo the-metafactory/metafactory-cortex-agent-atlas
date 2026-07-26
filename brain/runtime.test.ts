@@ -212,7 +212,7 @@ describe("an ADD comment reaches intake", () => {
     const reply = posts();
     expect(reply).toHaveLength(1);
     expect(reply[0]!.text).toContain("Proposal #1 — ADD:");
-    expect(reply[0]!.text).toContain("To ratify: RATIFY 1");
+    expect(reply[0]!.text).toContain("To ratify: @atlas RATIFY 1");
     expect(results()).toHaveLength(1);
     expect(results()[0]!.status).toBe("complete");
     // Zero effects: intake surfaces, it does not act.

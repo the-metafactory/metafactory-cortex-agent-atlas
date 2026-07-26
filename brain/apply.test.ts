@@ -25,6 +25,7 @@ import {
   StaticSelfIdentity,
   type RatifyIdentityConfig,
 } from "./identity";
+import { planBodyRevision } from "./plan-revision";
 import type { RatificationCertificate } from "./ratification";
 import { processGateMessage, type GateMessage } from "./ratify";
 import { AtlasProposals, AtlasStateStore } from "./state";
@@ -205,8 +206,10 @@ describe("ratified ADD → body edited, then ➕ posted, receipts recorded", () 
     expect(record?.applied?.revision).toBe(outcome.revision);
     expect(record?.posted?.messageId).toBe(outcome.messageId);
     expect(record?.posted?.channelId).toBe(CHANNEL_ID);
-    // The revision receipt is GitHub's, read back after the edit — not invented.
-    expect(outcome.revision).toBe(repo.revisedAt);
+    // atlas#26: the revision receipt is a hash of the body Atlas wrote — NOT
+    // GitHub's `updatedAt` (`repo.revisedAt`), which is not a body-revision
+    // identity at all (it advances on comments and cross-references too).
+    expect(outcome.revision).toBe(planBodyRevision(repo.body));
   });
 
   test("a REMOVE takes its line out and leaves the rest byte-identical", async () => {

@@ -55,8 +55,8 @@ export function surfacedSummary(
     sectionLine,
     `Proposed by @${proposerLogin}: "${sanitizeForDisplay(proposal.why)}"`,
     "",
-    `To ratify: RATIFY ${displayId}`,
-    `To decline: DECLINE ${displayId} <why>`,
+    `To ratify: @atlas RATIFY ${displayId}`,
+    `To decline: @atlas DECLINE ${displayId} <why>`,
   ].join("\n");
 }
 
@@ -79,7 +79,7 @@ export function declinedReply(proposal: ParsedProposal, reason: ValidationFailur
 export function malformedReply(verb: ProposalVerb, reason: string): string {
   return (
     `This looked like a ${verb} proposal but couldn't be parsed (${reason}). ` +
-    `Format: "${verb}: <github issue url> — <why>".`
+    `Format: "@atlas ${verb}: <github issue url> — <why>".`
   );
 }
 

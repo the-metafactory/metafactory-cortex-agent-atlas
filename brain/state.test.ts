@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,7 +11,7 @@ import {
   type RatifyIdentityConfig,
 } from "./identity";
 import { requireRatification, type RatificationCertificate } from "./ratification";
-import { AtlasProposals, AtlasStateStore } from "./state";
+import { AtlasProposals, AtlasStateStore, type DashboardSpawnResult } from "./state";
 
 let dir: string;
 let store: AtlasStateStore;
@@ -256,5 +256,181 @@ describe("AtlasProposals — memory fallback (no DB)", () => {
     const id = memOnly.markSurfaced("m1");
     expect(id).toBe(1);
     expect(memOnly.get("m1")?.phase).toBe("surfaced");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// atlas#8 — "outsider-paced cost": an outsider commenting on the public intake
+// issue must not be able to (1) make every subsequent gate message's replay
+// check cost proportional to how much they spammed, or (2) turn a burst of
+// their comments into a burst of `bun` subprocesses. Both criteria in the
+// issue are timing claims ("flat, not linear"; "O(1)-ish") — flaky as CI
+// gates and unfalsifiable as written — so both are restated below as
+// STRUCTURAL assertions: an index the query planner must use, and a spawn
+// count an injected seam can observe directly, rather than a clock.
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Reach into the raw DB, capture the SQL text of the first `.query(...)`
+ * call `fn` makes against it, then restore the original method. Same
+ * monkey-patch shape as `ratify.test.ts`'s `failNextQuery` — a capture
+ * instead of a fault injection.
+ */
+function captureQuerySql(fn: () => void): string {
+  const holder = store as unknown as { db: Database };
+  const real = holder.db;
+  const original = real.query.bind(real);
+  let captured: string | null = null;
+  (real as unknown as { query: unknown }).query = (sql: string) => {
+    if (captured === null) captured = sql;
+    return original(sql);
+  };
+  try {
+    fn();
+  } finally {
+    (real as unknown as { query: unknown }).query = original;
+  }
+  if (captured === null) throw new Error("fixture: expected a query to be captured");
+  return captured;
+}
+
+describe("atlas#8 finding 1 — replay-check cost is independent of outsider-created event rows", () => {
+  test("validation declines from spam intake comments never enter the replay index", () => {
+    // `markDeclined` is the W2a validation-decline path — reachable from
+    // EVERY invalid public `ADD:`/`REMOVE:` comment, with no `gate_message_id`
+    // in its payload (it is not a gate decision). Before this fix these rows
+    // inflated the `work_item_resolved` bucket `hasSeenGateMessage` scanned;
+    // now they must never even reach the replay index.
+    for (let i = 0; i < 200; i++) {
+      proposals.createIntake(`spam-${i}`, "ADD", URL, null, "spam", "outsider");
+      proposals.markDeclined(`spam-${i}`, "malformed");
+    }
+    const db = (store as unknown as { db: Database }).db;
+    const row = db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM gate_replay_keys`).get();
+    expect(row?.n ?? -1).toBe(0);
+  });
+
+  test("hasSeenGateMessage's query plans a search on the dedicated index, not events", () => {
+    // Same spam as above, so a regression back to the old query would have
+    // something real to be slow (and wrong) about.
+    for (let i = 0; i < 200; i++) {
+      proposals.createIntake(`spam2-${i}`, "ADD", URL, null, "spam", "outsider");
+      proposals.markDeclined(`spam2-${i}`, "malformed");
+    }
+
+    const sql = captureQuerySql(() => {
+      store.hasSeenGateMessage("m-does-not-exist");
+    });
+
+    const db = (store as unknown as { db: Database }).db;
+    const plan = db
+      .query<{ detail: string }, [string]>(`EXPLAIN QUERY PLAN ${sql}`)
+      .all("m-does-not-exist");
+    const detail = plan.map((r) => r.detail).join(" | ");
+
+    // The restated structural form of "flat, not linear": the replay check
+    // must search the dedicated `gate_replay_keys` table (whose size the
+    // spam above never touches — see the test above), not scan `events`
+    // (whose `work_item_resolved` bucket the same spam inflates directly).
+    expect(detail).toContain("gate_replay_keys");
+    expect(detail).not.toContain("events");
+  });
+});
+
+describe("atlas#8 finding 5 — dashboard-regen subprocess spawns are bounded, not one per transition", () => {
+  let bundleDir: string;
+
+  beforeEach(() => {
+    // A fake agent-state bundle: `existsSync` must find the script for
+    // `regenDashboard` to reach the (injected) spawn seam at all.
+    bundleDir = mkdtempSync(join(tmpdir(), "atlas-fake-bundle-"));
+    mkdirSync(join(bundleDir, "skill", "scripts"), { recursive: true });
+    writeFileSync(join(bundleDir, "skill", "scripts", "dashboard.ts"), "// fixture, never executed\n");
+  });
+
+  afterEach(() => {
+    rmSync(bundleDir, { recursive: true, force: true });
+  });
+
+  test("a synchronous burst of N transitions spawns the dashboard regen AT MOST ONCE", async () => {
+    let spawnCount = 0;
+    const dir2 = mkdtempSync(join(tmpdir(), "atlas-state-test-burst-"));
+    const opened = AtlasStateStore.open({
+      dir: dir2,
+      bundleDir,
+      dashboardDebounceMs: 20,
+      spawnDashboardProcess: (): DashboardSpawnResult => {
+        spawnCount += 1;
+        return { exited: Promise.resolve(0) };
+      },
+    });
+    if (opened === null) throw new Error("fixture: expected open to succeed");
+    const proposals2 = new AtlasProposals(opened);
+    try {
+      // A burst of N inbound "invalid comment" transitions, all synchronous
+      // (no await between any of them) — exactly what an outsider spamming
+      // the intake path produces. Each call reaches `regenDashboard()`.
+      for (let i = 0; i < 50; i++) {
+        proposals2.createIntake(`burst-${i}`, "ADD", URL, null, "spam", "outsider");
+        proposals2.markDeclined(`burst-${i}`, "malformed");
+      }
+      // Nothing has spawned yet — the debounce window has not elapsed, so
+      // the whole burst is still coalesced onto one pending timer.
+      expect(spawnCount).toBe(0);
+
+      await Bun.sleep(60); // past the debounce window
+
+      // 50 transitions, ONE spawn — not 50.
+      expect(spawnCount).toBe(1);
+    } finally {
+      opened.close();
+      rmSync(dir2, { recursive: true, force: true });
+    }
+  });
+
+  test("transitions arriving WHILE a spawn is running coalesce onto exactly one more spawn, never one per caller", async () => {
+    let spawnCount = 0;
+    let resolveCurrent: ((code: number) => void) | null = null;
+    const dir2 = mkdtempSync(join(tmpdir(), "atlas-state-test-coalesce-"));
+    const opened = AtlasStateStore.open({
+      dir: dir2,
+      bundleDir,
+      dashboardDebounceMs: 10,
+      spawnDashboardProcess: (): DashboardSpawnResult => {
+        spawnCount += 1;
+        return {
+          exited: new Promise<number>((resolve) => {
+            resolveCurrent = resolve;
+          }),
+        };
+      },
+    });
+    if (opened === null) throw new Error("fixture: expected open to succeed");
+    const proposals2 = new AtlasProposals(opened);
+    try {
+      proposals2.createIntake("first", "ADD", URL, null, "reason", "octocat");
+      proposals2.markDeclined("first", "malformed");
+      await Bun.sleep(30); // past the debounce window — spawn #1 is now "running"
+      expect(spawnCount).toBe(1);
+      expect(resolveCurrent).not.toBeNull();
+
+      // A burst of MORE transitions while spawn #1 is still in flight — the
+      // property under test: this must NOT be one spawn per transition.
+      for (let i = 0; i < 10; i++) {
+        proposals2.createIntake(`mid-${i}`, "ADD", URL, null, "spam", "outsider");
+        proposals2.markDeclined(`mid-${i}`, "malformed");
+      }
+      expect(spawnCount).toBe(1); // still just the one, still-running spawn
+
+      // Let spawn #1 finish; the pending flag the burst above set should
+      // trigger exactly ONE more debounced spawn — not ten.
+      resolveCurrent!(0);
+      await Bun.sleep(30);
+
+      expect(spawnCount).toBe(2);
+    } finally {
+      opened.close();
+      rmSync(dir2, { recursive: true, force: true });
+    }
   });
 });

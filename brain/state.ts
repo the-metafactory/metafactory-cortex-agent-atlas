@@ -143,6 +143,37 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 const MIGRATION_VERSION = "0001";
 
+/**
+ * Atlas-OWNED auxiliary index — deliberately NOT part of the block above.
+ * `MIGRATION_0001` is a verbatim copy of agent-state's own schema (see file
+ * header): version-gated so it is applied exactly once, in lockstep with
+ * agent-state's migrations. This table is not agent-state's concern at all —
+ * agent-state's scripts never read it — so it is created unconditionally,
+ * every open, guarded only by `IF NOT EXISTS`, and lives outside the
+ * `schema_migrations` version gate entirely (atlas#8, finding 1).
+ *
+ * It exists to answer `hasSeenGateMessage` in O(1) instead of scanning
+ * `events` filtered by `type IN (...)` — a scan whose cost is set by however
+ * many rows carry one of `GATE_EVENT_TYPES`, and `work_item_resolved` is
+ * written once per DECLINED intake comment, i.e. once per invalid `ADD:` /
+ * `REMOVE:` comment from ANYONE (`markDeclined`). An outsider spamming that
+ * path inflates the very bucket the replay check must scan on every
+ * legitimate gate message afterwards — measured by adversarial review at
+ * ~780× at 100k rows. A dedicated table keyed on the replay key itself moves
+ * the cost off that population entirely: this table only ever holds rows
+ * that ACTUALLY carry a `gate_message_id` (see `indexGateReplayKey`), so
+ * `markDeclined`'s validation-only `work_item_resolved` events never land
+ * here at all.
+ */
+const GATE_REPLAY_KEYS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS gate_replay_keys (
+  key       TEXT PRIMARY KEY,
+  event_id  INTEGER NOT NULL,
+  type      TEXT NOT NULL,
+  ts        INTEGER NOT NULL
+);
+`;
+
 /** owner_agent + event actor for everything this brain writes. */
 const OWNER = "atlas";
 /** The one work_item kind this slice creates. */
@@ -150,9 +181,18 @@ const KIND = "proposal";
 
 /**
  * The event types the ratification gate writes a `gate_message_id` into — and
- * therefore the only types `hasSeenGateMessage` will honour as a replay
- * record. Keep this list and the gate's event names in lockstep: a gate event
- * type missing here is a replay the gate would not notice.
+ * therefore the only types `indexGateReplayKey` will admit into
+ * `gate_replay_keys`, i.e. the only types `hasSeenGateMessage` will honour as
+ * a replay record. Keep this list and the gate's event names in lockstep: a
+ * gate event type missing here is a replay the gate would not notice.
+ *
+ * Enforced at WRITE time now (atlas#8, finding 1), not at read time: an
+ * earlier version filtered `type IN (...)` inside `hasSeenGateMessage`'s own
+ * query, which is exactly the scan this list now lets that method skip
+ * entirely. The scoping property this list provides — "an unrelated future
+ * slice that happens to put a `gate_message_id` in a payload cannot burn a
+ * key" — is unchanged; only which side of the write/read boundary checks it
+ * has moved.
  * (These are literals, interpolated into SQL; they are compile-time constants
  * from this file, never caller input.)
  */
@@ -164,6 +204,33 @@ const GATE_EVENT_TYPES = [
   "gate_nothing_to_ratify",
   "gate_state_unavailable",
 ] as const;
+
+/**
+ * One-time backfill, paid ONCE at upgrade — never a per-message cost. Without
+ * it, a message ratified/declined/rejected before this migration would read
+ * as "not seen" the first time `gate_replay_keys` is queried after upgrade,
+ * because the new table starts empty while `events` already holds months of
+ * history. The underlying transitions (`markRatified`,
+ * `markDeclinedByRatifier`) are guarded independently by work-item status
+ * (see their own docstrings), so this is not the only line of defence against
+ * a stale redelivery — but the audit-only gate events
+ * (`ratification_gate_rejected` etc.) have no such second guard, so without a
+ * backfill a redelivered pre-upgrade rejection would log a duplicate row.
+ * Guarded by `json_valid` exactly like `jsonField`, for the same reason: a
+ * malformed row written by another tool sharing this DB must not abort the
+ * whole backfill.
+ */
+function backfillGateReplayKeys(db: Database): void {
+  const typesList = GATE_EVENT_TYPES.map((t) => `'${t}'`).join(", ");
+  const keyExpr = `CASE WHEN json_valid(payload) THEN json_extract(payload, '$.gate_message_id') END`;
+  db.exec(`
+    INSERT OR IGNORE INTO gate_replay_keys (key, event_id, type, ts)
+    SELECT ${keyExpr} AS key, id, type, ts
+    FROM events
+    WHERE type IN (${typesList})
+      AND ${keyExpr} IS NOT NULL;
+  `);
+}
 
 const MAX_FIELD_LEN = 2_000;
 const MAX_ID_LEN = 256;
@@ -292,9 +359,27 @@ export interface ProposalRecord {
 
 /** The receipt for half (a) of the atomic pair: the plan body was edited. */
 export interface AppliedReceipt {
-  /** GitHub's `updatedAt` for the plan issue after the edit — the body revision. */
+  /**
+   * The body-revision identity produced by `plan-revision.ts`'s
+   * `planBodyRevision` (atlas#26) — a hash of the plan body itself, NOT
+   * GitHub's `updatedAt` for the issue. `updatedAt` advances on comments,
+   * label changes, and cross-references from other issues/PRs, so it never
+   * meant "the body revision" — that was the bug atlas#26 fixed. A value
+   * recorded before that fix is a legacy `updatedAt` ISO timestamp; see
+   * `isHashedPlanRevision` for how reconcile tells the two apart.
+   */
   readonly revision: string;
   readonly ts: number;
+  /**
+   * The checkbox-insensitive twin of `revision` (`plan-revision.ts`'s
+   * `planBodyRevisionNormalized`, atlas#34) — OPTIONAL so every existing
+   * caller and fixture that builds a receipt without it keeps compiling.
+   * `apply.ts` always supplies it now; a receipt recorded without one (a
+   * fixture, or a row written before atlas#34) reads back as "no normalised
+   * baseline for this revision", which `reconcile.ts` treats exactly like a
+   * legacy revision — a safe absence, never a false match.
+   */
+  readonly normalizedRevision?: string;
 }
 
 /** The receipt for half (b): the ledger entry landed. */
@@ -335,7 +420,51 @@ export interface AtlasStateOptions {
    * failure to redraw it must never roll back or mask a real transition.
    */
   onTransition?: (() => void) | null;
+  /**
+   * Debounce window (ms) for coalescing `regenDashboard`'s subprocess spawn
+   * (atlas#8, finding 5). Defaults to `DEFAULT_DASHBOARD_DEBOUNCE_MS`. Tests
+   * override this to a small value so a burst of calls collapses onto one
+   * timer deterministically, without waiting out a production-sized window.
+   */
+  dashboardDebounceMs?: number;
+  /**
+   * Injectable seam for the dashboard-regen subprocess, defaulting to a thin
+   * wrapper over `Bun.spawn`. Exists so tests can count/observe spawns
+   * without actually shelling out to `bun` (which needs a real bundle dir and
+   * a real `dashboard.ts`, and is exactly the cost this fix bounds) —
+   * narrowed to the one property this module reads off the result.
+   */
+  spawnDashboardProcess?: DashboardSpawnFn;
 }
+
+/** The subset of `Bun.Subprocess` this module actually reads. */
+export interface DashboardSpawnResult {
+  readonly exited: Promise<number>;
+}
+
+/** The subset of `Bun.spawn`'s signature this module actually calls. */
+export type DashboardSpawnFn = (
+  cmd: readonly string[],
+  opts: {
+    env: Record<string, string | undefined>;
+    stdout: "ignore";
+    stderr: "ignore";
+    stdin: "ignore";
+  },
+) => DashboardSpawnResult;
+
+/** `Bun.spawn` itself, narrowed to `DashboardSpawnFn`'s shape. */
+const defaultSpawnDashboardProcess: DashboardSpawnFn = (cmd, opts) =>
+  Bun.spawn(cmd as string[], opts);
+
+/**
+ * Default debounce window for coalescing dashboard-regen spawns. Large enough
+ * that a burst of transitions from one inbound task (or several tasks that
+ * land within the same tick) collapses onto a single timer; small enough that
+ * an operator watching the dashboard after a single real change does not
+ * perceive a delay.
+ */
+const DEFAULT_DASHBOARD_DEBOUNCE_MS = 250;
 
 /** `~/.config/cortex/agents/atlas` — matches arc-manifest.yaml's `owns.state`. */
 export function defaultInstanceDir(): string {
@@ -560,17 +689,29 @@ export class AtlasStateStore {
   private readonly bundleDir: string | null;
   private readonly onTransition: (() => void) | null;
   private dashboardWarned = false;
+  private readonly dashboardDebounceMs: number;
+  private readonly spawnDashboardProcess: DashboardSpawnFn;
+  /** Debounce timer, coalescing a burst of calls onto one pending spawn. */
+  private dashboardRegenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A spawn is currently running. */
+  private dashboardRegenRunning = false;
+  /** A transition arrived while a spawn was running; run one more after. */
+  private dashboardRegenPending = false;
 
   private constructor(
     db: Database,
     dir: string,
     bundleDir: string | null,
     onTransition: (() => void) | null,
+    dashboardDebounceMs: number,
+    spawnDashboardProcess: DashboardSpawnFn,
   ) {
     this.db = db;
     this.dir = dir;
     this.bundleDir = bundleDir;
     this.onTransition = onTransition;
+    this.dashboardDebounceMs = dashboardDebounceMs;
+    this.spawnDashboardProcess = spawnDashboardProcess;
   }
 
   /** The instance dir — where dashboards and retros are written alongside the DB. */
@@ -588,7 +729,14 @@ export class AtlasStateStore {
       db.exec("PRAGMA busy_timeout = 5000;");
       applyMigration(db);
       warn(`open — ${join(opts.dir, "state.sqlite")}`);
-      return new AtlasStateStore(db, opts.dir, opts.bundleDir ?? null, opts.onTransition ?? null);
+      return new AtlasStateStore(
+        db,
+        opts.dir,
+        opts.bundleDir ?? null,
+        opts.onTransition ?? null,
+        opts.dashboardDebounceMs ?? DEFAULT_DASHBOARD_DEBOUNCE_MS,
+        opts.spawnDashboardProcess ?? defaultSpawnDashboardProcess,
+      );
     } catch (err) {
       warn(
         `unavailable, running memory-only: ${err instanceof Error ? err.message : String(err)}`,
@@ -765,19 +913,28 @@ export class AtlasStateStore {
    *     one who gets to write the colliding row;
    *   - `boundedKey` hashes rather than truncates, so two long ids sharing a
    *     256-char prefix are no longer one replay key;
-   *   - the `type IN (...)` filter (which can use `idx_events_type_ts`) scopes
-   *     the lookup to events THIS gate writes, so an unrelated future slice
-   *     that happens to put a `gate_message_id` in a payload cannot burn a key.
+   *   - only `GATE_EVENT_TYPES` events are ever admitted into
+   *     `gate_replay_keys` (`indexGateReplayKey`, enforced at write time), so
+   *     an unrelated future slice that happens to put a `gate_message_id` in
+   *     a payload cannot burn a key.
+   *
+   * ── O(1) via `gate_replay_keys`, not a scan of `events` (atlas#8, finding 1) ─
+   * This used to be `SELECT 1 FROM events WHERE type IN (...) AND
+   * json_extract(payload, '$.gate_message_id') = ?` — a scan bounded only by
+   * how many rows carry one of `GATE_EVENT_TYPES`, and `work_item_resolved`
+   * is written once per DECLINED intake comment (`markDeclined`), i.e. once
+   * per invalid public comment from anyone. An outsider spamming that path
+   * inflated the very bucket this lookup scanned on every subsequent
+   * legitimate gate message. `gate_replay_keys` is keyed on the replay key
+   * itself (its PRIMARY KEY), so this is a single indexed point lookup whose
+   * cost does not grow with how many unrelated events exist.
    */
   hasSeenGateMessage(key: string): boolean {
     const bounded = boundedKey(key);
     if (bounded.length === 0) return false;
     const row = this.db
       .query<{ one: number }, [string]>(
-        `SELECT 1 AS one FROM events
-          WHERE type IN (${GATE_EVENT_TYPES.map((t) => `'${t}'`).join(", ")})
-            AND ${jsonField("payload", "$.gate_message_id")} = ?
-          LIMIT 1`,
+        `SELECT 1 AS one FROM gate_replay_keys WHERE key = ? LIMIT 1`,
       )
       .get(bounded);
     return row !== null && row !== undefined;
@@ -1147,6 +1304,10 @@ export class AtlasStateStore {
           // message is recorded here purely as an audit backlink.
           ratified_message_id: cert.messageId,
           plan_revision: receipt === null ? null : cap(receipt.revision, 128),
+          plan_revision_normalized:
+            receipt === null || typeof receipt.normalizedRevision !== "string" || receipt.normalizedRevision.length === 0
+              ? null
+              : cap(receipt.normalizedRevision, 128),
         },
         ts,
       );
@@ -1455,6 +1616,73 @@ export class AtlasStateStore {
   }
 
   /**
+   * The last plan-body revision reconcile could account for, exact hash AND
+   * normalised hash together (`plan-revision.ts`'s `PlanRevisionBaseline`,
+   * atlas#34) — the freshest of EITHER an apply's `work_item_resolved` or a
+   * reconcile pass's own `reconcile_completed`, by timestamp. This is the
+   * baseline detector (c) diffs the CURRENT body against to tell "only a
+   * checkbox marker changed" from "something else did".
+   *
+   * `null` when there is no accounted revision yet, OR when the freshest one
+   * predates atlas#34 and so was never recorded with a normalised twin — the
+   * two are deliberately collapsed into the same answer, because a caller
+   * that cannot tell "no baseline" from "an unusable one" apart must fail
+   * closed to the SAME safe default: fall back to reporting drift as before,
+   * rather than risk matching a checkbox-only diff against a baseline that
+   * was never actually verified.
+   */
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    const row = this.db
+      .query<{ revision: string | null; normalized: string | null }, []>(
+        `SELECT revision, normalized FROM (
+           SELECT ts,
+                  ${jsonField("payload", "$.plan_revision")} AS revision,
+                  ${jsonField("payload", "$.plan_revision_normalized")} AS normalized
+             FROM events
+             WHERE type IN ('work_item_resolved', 'reconcile_completed')
+         )
+         WHERE revision IS NOT NULL
+         ORDER BY ts DESC LIMIT 1`,
+      )
+      .get();
+    if (row === null || row === undefined) return null;
+    if (typeof row.revision !== "string" || row.revision.length === 0) return null;
+    if (typeof row.normalized !== "string" || row.normalized.length === 0) return null;
+    return { revision: row.revision, normalized: row.normalized };
+  }
+
+  /**
+   * Has THIS revision already been given its one grace pass (atlas#34)? A
+   * checkbox-only revision reconcile cannot yet corroborate is not reported
+   * the first time it is seen — the watcher may simply not have caught up —
+   * so this answers "have we already deferred this exact revision once",
+   * which is what tells the SECOND sighting to report rather than defer
+   * again. Keyed on the revision itself, same shape as `hasReconcileCatchUp`.
+   */
+  hasDeferredChecklistRevision(revision: string): boolean {
+    const key = boundedKey(cap(revision, 128));
+    if (key.length === 0) return false;
+    const row = this.db
+      .query<{ one: number }, [string]>(
+        `SELECT 1 AS one FROM events
+          WHERE type = 'reconcile_checklist_deferred'
+            AND ${jsonField("payload", "$.revision")} = ?
+          LIMIT 1`,
+      )
+      .get(key);
+    return row !== null && row !== undefined;
+  }
+
+  /** Record that this revision has now been given its one grace pass. */
+  recordDeferredChecklistRevision(revision: string): void {
+    const key = boundedKey(cap(revision, 128));
+    if (key.length === 0) return;
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(Date.now(), "reconcile_checklist_deferred", OWNER, JSON.stringify({ revision: key }));
+  }
+
+  /**
    * Has a reconcile pass ever completed? The FIRST pass establishes the
    * revision baseline instead of reporting on it: Atlas cannot honestly claim a
    * plan-body edit is unaccounted-for when it has no record of any edit at all,
@@ -1515,7 +1743,12 @@ export class AtlasStateStore {
    * weekly retro reports, and a metric that is only written when it is non-zero
    * cannot be shown to trend to zero.
    */
-  recordReconcilePass(driftCount: number, planRevision: string | null, catchUpMessageId: string | null): void {
+  recordReconcilePass(
+    driftCount: number,
+    planRevision: string | null,
+    planRevisionNormalized: string | null,
+    catchUpMessageId: string | null,
+  ): void {
     this.db
       .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
       .run(
@@ -1525,6 +1758,9 @@ export class AtlasStateStore {
         JSON.stringify({
           drift_count: Number.isSafeInteger(driftCount) && driftCount >= 0 ? driftCount : 0,
           plan_revision: planRevision === null ? null : cap(planRevision, 128),
+          // atlas#34: only ever meaningful alongside a non-null `plan_revision` —
+          // see `lastAccountedPlanRevision`, which reads the two as a pair.
+          plan_revision_normalized: planRevisionNormalized === null ? null : cap(planRevisionNormalized, 128),
           catch_up_message_id: catchUpMessageId === null ? null : cap(catchUpMessageId, MAX_ID_LEN),
         }),
       );
@@ -1611,9 +1847,12 @@ export class AtlasStateStore {
     for (const [k, v] of Object.entries(payload)) {
       safe[cap(k, 64)] = typeof v === "string" ? cap(v, 512) : v;
     }
-    this.db
+    const ts = Date.now();
+    const cappedType = cap(type, 64);
+    const result = this.db
       .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
-      .run(Date.now(), cap(type, 64), OWNER, JSON.stringify(safe));
+      .run(ts, cappedType, OWNER, JSON.stringify(safe));
+    this.indexGateReplayKey(cappedType, result.lastInsertRowid, safe, ts);
   }
 
   /**
@@ -1689,9 +1928,44 @@ export class AtlasStateStore {
   }
 
   private appendEvent(type: string, workItemId: string, payload: unknown, ts: number): void {
-    this.db
+    const result = this.db
       .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, ?, ?)`)
       .run(ts, type, OWNER, workItemId, JSON.stringify(payload));
+    this.indexGateReplayKey(type, result.lastInsertRowid, payload, ts);
+  }
+
+  /**
+   * Populate `gate_replay_keys` for ONE event, iff it is both a type this
+   * store treats as a gate decision (`GATE_EVENT_TYPES`) AND actually carries
+   * a non-empty string `gate_message_id` in its payload. Called from every
+   * event-insertion point (`appendEvent` above, `recordGateEvent` below) so
+   * no call site can forget it — the alternative (each of the ~4 places that
+   * set `gate_message_id` remembering to index it too) is the same
+   * "same fix, several places, one of them drifts" shape that produced
+   * atlas#8 finding 1 in the first place (`ratify.test.ts:1297-1316` guarding
+   * the fix rather than the property).
+   *
+   * `INSERT OR IGNORE`: a key can only legitimately appear once (it is
+   * checked via `hasSeenGateMessage` before any caller records a decision),
+   * so a collision here is itself a replay slipping through a race — silently
+   * keeping the FIRST record is the correct, fail-safe resolution, not an
+   * error.
+   */
+  private indexGateReplayKey(
+    type: string,
+    eventId: number | bigint,
+    payload: unknown,
+    ts: number,
+  ): void {
+    if (!(GATE_EVENT_TYPES as readonly string[]).includes(type)) return;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return;
+    const raw = (payload as Record<string, unknown>).gate_message_id;
+    if (typeof raw !== "string" || raw.length === 0) return;
+    this.db
+      .query(
+        `INSERT OR IGNORE INTO gate_replay_keys (key, event_id, type, ts) VALUES (?, ?, ?, ?)`,
+      )
+      .run(raw, typeof eventId === "bigint" ? Number(eventId) : eventId, type, ts);
   }
 
   /** agent-state's annotate: shallow JSON merge into notes + its own event. */
@@ -1707,13 +1981,18 @@ export class AtlasStateStore {
 
   /**
    * Best-effort `dashboard.md` regen via agent-state's own documented
-   * workflow, exactly mirroring escort's fire-and-forget subprocess call.
+   * workflow, exactly mirroring escort's fire-and-forget subprocess call —
+   * except the actual spawn is now debounced/coalesced (atlas#8, finding 5;
+   * see `scheduleDashboardSpawn`).
    */
   private regenDashboard(): void {
     // W3a: announce the transition FIRST, and independently of the agent-state
     // bundle. Atlas's own plan dashboard must redraw on every state change even
     // on a host where the agent-state bundle is absent (the `bundleDir === null`
-    // early return below), which is exactly the case every test runs in.
+    // early return below), which is exactly the case every test runs in. This
+    // hook is NOT debounced — it only sets a flag (`runtime.ts`'s own
+    // coalescing owns the redraw timing) and must fire every transition so
+    // that flag is never missed.
     if (this.onTransition !== null) {
       try {
         this.onTransition();
@@ -1722,6 +2001,58 @@ export class AtlasStateStore {
       }
     }
     if (this.bundleDir === null) return;
+    this.scheduleDashboardSpawn();
+  }
+
+  /**
+   * Debounce + coalesce the `dashboard.ts regen` subprocess (atlas#8,
+   * finding 5). `regenDashboard` used to call `Bun.spawn` unconditionally —
+   * no debounce, no queue, no cap — from 8 call sites that are ALL reachable
+   * from an outsider's inbound comment (every intake/gate transition calls
+   * it). A burst of N public comments was N bare subprocess spawns, with
+   * nothing bounding N.
+   *
+   * The bound here is deliberately COUNT-based, not a hope that subprocesses
+   * happen to overlap:
+   *   - a call arriving while a timer is already pending returns immediately
+   *     — it does not start a second timer, it rides the one already
+   *     scheduled. So however many transitions land inside one debounce
+   *     window, exactly one timer — and, once it fires, exactly one spawn —
+   *     comes out the other side.
+   *   - a call arriving while a spawn is actually RUNNING sets `pending`
+   *     instead of scheduling a new timer. When that spawn's process exits,
+   *     `finishDashboardSpawn` checks `pending` and schedules exactly ONE
+   *     more debounced spawn if anything arrived meanwhile — never one per
+   *     caller.
+   * Either branch preserves the guarantee `regenDashboard` exists for: the
+   * dashboard still ends up reflecting the latest state once the burst
+   * settles (coalescing drops no information — the LAST scheduled spawn
+   * always runs) — it is dropping duplicate PROCESSES, never the final
+   * regeneration.
+   */
+  private scheduleDashboardSpawn(): void {
+    if (this.dashboardRegenRunning) {
+      this.dashboardRegenPending = true;
+      return;
+    }
+    if (this.dashboardRegenTimer !== null) return; // already coalesced onto the pending timer
+    const timer = setTimeout(() => {
+      this.dashboardRegenTimer = null;
+      this.spawnDashboardRegen();
+    }, this.dashboardDebounceMs);
+    // Never let this timer alone keep the process alive — every path that
+    // matters here (tests, and the daemon's own `process.exit()` shutdown in
+    // `main.ts`) ends explicitly, and a lingering ref would only matter to a
+    // caller that is otherwise idle, which a debounced background regen must
+    // not do.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.dashboardRegenTimer = timer;
+  }
+
+  /** The actual (debounced) spawn. Never called directly — only via the scheduler above. */
+  private spawnDashboardRegen(): void {
+    if (this.bundleDir === null) return;
+    this.dashboardRegenRunning = true;
     try {
       const script = join(this.bundleDir, "skill", "scripts", "dashboard.ts");
       if (!existsSync(script)) {
@@ -1729,9 +2060,10 @@ export class AtlasStateStore {
           this.dashboardWarned = true;
           warn(`dashboard regen skipped — agent-state bundle not found at ${this.bundleDir}`);
         }
+        this.finishDashboardSpawn();
         return;
       }
-      const proc = Bun.spawn(["bun", script, "regen"], {
+      const proc = this.spawnDashboardProcess(["bun", script, "regen"], {
         env: { ...process.env, MF_INSTANCE_DIR: this.dir },
         stdout: "ignore",
         stderr: "ignore",
@@ -1741,9 +2073,22 @@ export class AtlasStateStore {
         .then((code) => {
           if (code !== 0) warn(`dashboard regen exited ${code}`);
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          this.finishDashboardSpawn();
+        });
     } catch (err) {
       warn(`dashboard regen failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.finishDashboardSpawn();
+    }
+  }
+
+  /** Clears the running flag and, if anything arrived meanwhile, re-arms the debounce ONCE. */
+  private finishDashboardSpawn(): void {
+    this.dashboardRegenRunning = false;
+    if (this.dashboardRegenPending) {
+      this.dashboardRegenPending = false;
+      this.scheduleDashboardSpawn();
     }
   }
 }
@@ -1925,6 +2270,24 @@ class MemoryProposals {
   /** No accounted-for revisions — and no way to report on one either. */
   observedPlanRevisions(): Set<string> {
     return new Set<string>();
+  }
+
+  /** No durable baseline — a degraded store cannot classify a checkbox diff. */
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    return null;
+  }
+
+  /**
+   * `false` — i.e. "always defer, never report". Unreachable via
+   * `reconcile.ts` (it refuses the whole pass while degraded), but the same
+   * "every answer is the one that causes no post" posture as its W3a siblings.
+   */
+  hasDeferredChecklistRevision(): boolean {
+    return false;
+  }
+
+  recordDeferredChecklistRevision(): void {
+    // deliberately empty; degraded mode records nothing.
   }
 
   /**
@@ -2266,6 +2629,27 @@ export class AtlasProposals {
     );
   }
 
+  lastAccountedPlanRevision(): { revision: string; normalized: string } | null {
+    return this.run(
+      (db) => db.lastAccountedPlanRevision(),
+      (m) => m.lastAccountedPlanRevision(),
+    );
+  }
+
+  hasDeferredChecklistRevision(revision: string): boolean {
+    return this.run(
+      (db) => db.hasDeferredChecklistRevision(revision),
+      (m) => m.hasDeferredChecklistRevision(),
+    );
+  }
+
+  recordDeferredChecklistRevision(revision: string): void {
+    this.run(
+      (db) => db.recordDeferredChecklistRevision(revision),
+      (m) => m.recordDeferredChecklistRevision(),
+    );
+  }
+
   hasReconciled(): boolean {
     return this.run(
       (db) => db.hasReconciled(),
@@ -2291,10 +2675,11 @@ export class AtlasProposals {
   recordReconcilePass(
     driftCount: number,
     planRevision: string | null,
+    planRevisionNormalized: string | null,
     catchUpMessageId: string | null,
   ): void {
     this.run(
-      (db) => db.recordReconcilePass(driftCount, planRevision, catchUpMessageId),
+      (db) => db.recordReconcilePass(driftCount, planRevision, planRevisionNormalized, catchUpMessageId),
       (m) => m.recordReconcilePass(),
     );
   }
@@ -2387,12 +2772,30 @@ function applyMigration(db: Database): void {
   const existing = db
     .query<{ version: string }, [string]>(`SELECT version FROM schema_migrations WHERE version = ?`)
     .get(MIGRATION_VERSION);
-  if (existing) return;
-  db.transaction(() => {
-    db.exec(MIGRATION_0001);
-    db.query(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`).run(
-      MIGRATION_VERSION,
-      Date.now(),
-    );
-  })();
+  if (!existing) {
+    db.transaction(() => {
+      db.exec(MIGRATION_0001);
+      db.query(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`).run(
+        MIGRATION_VERSION,
+        Date.now(),
+      );
+    })();
+  }
+
+  // Atlas-owned auxiliary index (atlas#8) — deliberately OUTSIDE the version
+  // gate above, which tracks parity with agent-state's own schema only. Run
+  // every open; `IF NOT EXISTS` makes it a no-op after the first. The
+  // backfill runs exactly once, the moment the table is first created.
+  const hadReplayTable =
+    db
+      .query<{ name: string }, []>(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gate_replay_keys'`,
+      )
+      .get() !== null;
+  db.exec(GATE_REPLAY_KEYS_SCHEMA);
+  if (!hadReplayTable) {
+    db.transaction(() => {
+      backfillGateReplayKeys(db);
+    })();
+  }
 }

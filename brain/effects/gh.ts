@@ -307,10 +307,15 @@ function bodyWithinLimit(body: unknown): body is string {
   return typeof body === "string" && new TextEncoder().encode(body).length <= MAX_BODY_BYTES;
 }
 
-/** What a plan-issue read returns. `revisedAt` is the receipt an apply records. */
+/** What a plan-issue read returns. */
 export interface PlanSnapshot {
   readonly body: string;
-  /** GitHub's `updatedAt` for the issue — the body-revision receipt (ISO 8601). */
+  /**
+   * GitHub's `updatedAt` for the issue (ISO 8601) — diagnostic only. NOT the
+   * body-revision identity: `updatedAt` advances on comments, label changes,
+   * and cross-references, not only on body edits (atlas#26). Callers that
+   * need the body revision use `plan-revision.ts`'s `planBodyRevision(body)`.
+   */
   readonly revisedAt: string;
   readonly url: string;
 }
