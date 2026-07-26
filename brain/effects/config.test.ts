@@ -34,6 +34,8 @@ describe("loadEffectsConfig", () => {
     expect(loaded.config.baseBranch).toBe("main");
     expect(loaded.config.checkoutDir).toBeNull();
     expect(loaded.config.trustedAdapterInstances.has("discord:instance-fixture-0000")).toBe(true);
+    expect(loaded.config.threadConversation).toBe(false);
+    expect(loaded.config.principalOnly).toBe(false);
   });
 
   test("each missing or malformed value is its own NAMED refusal", () => {
@@ -283,5 +285,112 @@ describe("the thread opt-in is fail-closed by ALLOWLIST", () => {
       if (loaded.kind !== "ok") throw new Error("expected ok");
       expect(loaded.config.threadConversation).toBe(expected);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ATLAS_PRINCIPAL_ONLY (atlas#47) — the FOURTH admission dimension.
+//
+// Same allowlist parser as ATLAS_THREAD_CONVERSATION (`parseBooleanFlag`), and
+// the same lesson applies with extra weight here: this flag sits directly in
+// front of who Atlas will listen to at all, not just where a conversation is
+// held. The #43 lesson (a flag with no negative test passed the whole suite
+// when mutated to accept garbage) is the reason every value below is asserted
+// both ways — including the exact "off-looking" strings an operator would
+// actually type.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function principalOnlyFor(raw: string | undefined): boolean {
+  const loaded = loadEffectsConfig(
+    raw === undefined ? OK : { ...OK, ATLAS_PRINCIPAL_ONLY: raw },
+  );
+  if (loaded.kind !== "ok") throw new Error(`expected ok, got ${loaded.reason}`);
+  return loaded.config.principalOnly;
+}
+
+describe("the principal-only opt-in is fail-closed by ALLOWLIST (atlas#47)", () => {
+  test("unset is off — the default a deployment gets by doing nothing", () => {
+    expect(principalOnlyFor(undefined)).toBe(false);
+  });
+
+  test("only the four documented affirmatives arm it", () => {
+    for (const yes of ["1", "true", "yes", "on", "TRUE", "Yes", "ON", " 1 ", "  true  "]) {
+      expect(principalOnlyFor(yes)).toBe(true);
+    }
+  });
+
+  test("EVERY other value is off — including blank, garbage, and the ones that read as intent", () => {
+    // `off`/`no`/`disabled` are exactly what an operator types when they mean
+    // off; a denylist parser would arm the capability on every one of them.
+    // `""` is what `export ATLAS_PRINCIPAL_ONLY=` or a blank env-file entry
+    // yields — the single most likely accident. Garbage (`"lockdown"`,
+    // `"yes-ish"`) must degrade to off, not to a refused config: a typo in an
+    // optional knob must not take Atlas's whole effect layer down with it.
+    for (const no of [
+      "",
+      " ",
+      "\t",
+      "0",
+      "false",
+      "FALSE",
+      "no",
+      "off",
+      "OFF",
+      "disabled",
+      "none",
+      "null",
+      "undefined",
+      "2",
+      "-1",
+      "lockdown",
+      "yes-ish",
+      "enable",
+      "enabled",
+      "y",
+      "n",
+    ]) {
+      expect(principalOnlyFor(no)).toBe(false);
+    }
+  });
+
+  test("a garbage value degrades to OFF rather than refusing the whole config", () => {
+    // The other fail-closed choice — refusing the config — would take the
+    // ledger and the plan down over a typo in an optional knob. Wrong trade:
+    // this flag failing closed means "no lockdown", not "no Atlas" (the exact
+    // distinction #43's lesson names).
+    const loaded = loadEffectsConfig({ ...OK, ATLAS_PRINCIPAL_ONLY: "lockdown-ish" });
+    expect(loaded.kind).toBe("ok");
+    if (loaded.kind !== "ok") return;
+    expect(loaded.config.principalOnly).toBe(false);
+    expect(loaded.config.channelId).toBe("chan-fixture-0000");
+  });
+
+  test("makeEffectsConfig accepts a real boolean too, for callers that have one", () => {
+    for (const [input, expected] of [
+      [true, true],
+      [false, false],
+      [undefined, false],
+    ] as const) {
+      const loaded = makeEffectsConfig({
+        planRepo: "acme/widgets",
+        planIssue: 4,
+        channelId: "chan-fixture-0000",
+        adapterInstances: "discord:instance-fixture-0000",
+        principalOnly: input,
+      });
+      if (loaded.kind !== "ok") throw new Error("expected ok");
+      expect(loaded.config.principalOnly).toBe(expected);
+    }
+  });
+
+  test("principalOnly and threadConversation are independent — setting one never touches the other", () => {
+    const loaded = loadEffectsConfig({
+      ...OK,
+      ATLAS_PRINCIPAL_ONLY: "1",
+      ATLAS_THREAD_CONVERSATION: "off",
+    });
+    if (loaded.kind !== "ok") throw new Error("expected ok");
+    expect(loaded.config.principalOnly).toBe(true);
+    expect(loaded.config.threadConversation).toBe(false);
   });
 });

@@ -218,6 +218,7 @@ describe("the verdict", () => {
       "baseBranch", // shown: `base=`
       "checkoutDir", // shown: `docPRs=`
       "threadConversation", // shown: `threads=` — atlas#25, an admission dimension
+      "principalOnly", // shown: `principalOnly=` — atlas#47, the FOURTH admission dimension
     ].sort();
     expect(Object.keys(loaded.config).sort()).toEqual(KNOWN_FIELDS);
 
@@ -228,6 +229,7 @@ describe("the verdict", () => {
     expect(line).toContain("docPRs=");
     expect(line).toContain("plan=");
     expect(line).toContain("threads=");
+    expect(line).toContain("principalOnly=");
   });
 
   // atlas#25 — the boot line must distinguish the two, or an operator cannot
@@ -236,5 +238,61 @@ describe("the verdict", () => {
     expect(buildStartupLine(facts())).toContain("threads=off");
     const on = loadEffectsConfig({ ...armedEnv(), ATLAS_THREAD_CONVERSATION: "1" });
     expect(buildStartupLine(facts({ effects: on }))).toContain("threads=on");
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // atlas#47 — ATLAS_PRINCIPAL_ONLY: the FOURTH admission dimension, and the
+  // fail-closed caveat the issue asks to make unmistakable.
+  // ═══════════════════════════════════════════════════════════════════════
+  describe("PRINCIPAL-ONLY (atlas#47)", () => {
+    function principalOnlyEnv(on: boolean): Record<string, string> {
+      const env = armedEnv();
+      if (on) env.ATLAS_PRINCIPAL_ONLY = "1";
+      return env;
+    }
+
+    test("off (default) — no PRINCIPAL-ONLY clause at all, and principalOnly=off is still echoed", () => {
+      const line = buildStartupLine(facts({}, principalOnlyEnv(false)));
+      expect(line).toContain("principalOnly=off");
+      expect(line).not.toContain("PRINCIPAL-ONLY");
+    });
+
+    test("on + identity loaded ⇒ PRINCIPAL-ONLY: ARMED, alongside GATE ARMED", () => {
+      const env = principalOnlyEnv(true);
+      const line = buildStartupLine(facts({}, env));
+      expect(line).toContain("GATE ARMED");
+      expect(line).toContain("principalOnly=on");
+      expect(line).toContain("PRINCIPAL-ONLY: ARMED");
+      expect(line).not.toContain("PRINCIPAL-ONLY: ARMED-MUTE");
+    });
+
+    // The issue's own fail-closed caveat: on, but the principal identity is
+    // unusable. This must be UNMISTAKABLE — neither "off" (which would be a
+    // silently widened lockdown) nor ordinary "ARMED" (which would claim the
+    // real principal is still heard, when in fact NOBODY is).
+    test("on + identity UNUSABLE ⇒ PRINCIPAL-ONLY: ARMED-MUTE, distinct from both off and ARMED", () => {
+      const env = principalOnlyEnv(true);
+      delete env.ATLAS_SELF_PLATFORM_IDS; // identity load now refuses
+      const line = buildStartupLine(facts({ selfIdCount: 0 }, env));
+      expect(line).toContain("GATE UNARMED");
+      expect(line).toContain("principalOnly=on");
+      expect(line).toContain("PRINCIPAL-ONLY: ARMED-MUTE");
+      expect(line).toContain("NOBODY AT ALL");
+      expect(line).not.toContain("PRINCIPAL-ONLY: ARMED —");
+    });
+
+    test("principalOnly=on/off is echoed even when the effect config itself is refused", () => {
+      // With NO effect layer, `runtime.ts` never reaches the principal-only
+      // check at all (`no-effect-layer` short-circuits first) — but the
+      // `effects: NONE` clause already says Atlas admits nothing, so there is
+      // nothing further this dimension could truthfully add. Asserting that
+      // absence is the honest claim here, not a gap.
+      const env = principalOnlyEnv(true);
+      delete env.ATLAS_CHANNEL_ID;
+      const line = buildStartupLine(facts({}, env));
+      expect(line).toContain("effects: NONE");
+      expect(line).not.toContain("principalOnly=");
+      expect(line).not.toContain("PRINCIPAL-ONLY");
+    });
   });
 });

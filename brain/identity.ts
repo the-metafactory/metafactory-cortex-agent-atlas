@@ -559,6 +559,50 @@ export function loadIdentityConfig(
   });
 }
 
+// ── Principal-only admission (atlas#47) ─────────────────────────────────────
+
+/**
+ * Is this authenticated (platform, id) the SAME identity the ratification
+ * gate would recognise as its ONE configured principal?
+ *
+ * This is the entire contract of `ATLAS_PRINCIPAL_ONLY` (`runtime.ts`'s fourth
+ * admission dimension): "the author is in the ratifier's set", nothing more.
+ * It is deliberately built from the EXACT two fields `processGateMessage`'s own
+ * step 3 compares (`config.principals.resolve(...)` against
+ * `config.ratifier.principalId`) rather than a second lookup, so "who may
+ * ratify" and "who Atlas admits" cannot silently drift apart — the failure
+ * class named in atlas#47 (and the same one #28/#34 name for other pairs of
+ * "the same fact, asked twice").
+ *
+ * There is no self-block here, and none is needed: `makeIdentityConfig`
+ * refuses at load if any (platform, id) appears in BOTH
+ * `ATLAS_SELF_PLATFORM_IDS` and the ratifier's `platform_ids`
+ * (`self-and-ratifier-platform-ids-overlap`), so a config that reaches this
+ * function already guarantees Atlas's own id can never resolve to the
+ * configured principal. Re-checking it here would be a second enforcement of
+ * a property the config's own admission already makes structurally true —
+ * exactly the kind of duplicated-instead-of-shared check this function exists
+ * to avoid introducing elsewhere.
+ *
+ * Fail-closed on a throwing resolver, same posture as `ratify.ts`'s `safely()`
+ * — a broken `PrincipalResolver` denies rather than propagating.
+ */
+export function isConfiguredPrincipal(
+  config: RatifyIdentityConfig,
+  platform: string,
+  platformId: string,
+): boolean {
+  if (typeof platform !== "string" || typeof platformId !== "string") return false;
+  if (platform.length === 0 || platformId.length === 0) return false;
+  let resolved: string | null = null;
+  try {
+    resolved = config.principals.resolve(platform, platformId);
+  } catch {
+    resolved = null;
+  }
+  return resolved !== null && resolved === config.ratifier.principalId;
+}
+
 /**
  * `loadIdentityConfig`, collapsed to the fail-closed value the gate consumes.
  * `null` means "no gate": `processGateMessage` refuses every verb. The named

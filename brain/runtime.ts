@@ -77,13 +77,25 @@
  * expected not to deliver that" a claim about the WIRE and not just about
  * `source.channel`, which a forged envelope can set to anything it likes.
  *
+ * A THIRD admission check, same disposition, same silence, OPT-IN and OFF BY
+ * DEFAULT (atlas#47 — `ATLAS_PRINCIPAL_ONLY`, a staging lockdown for a first
+ * live deployment, not the end state): when on, `source.surface` +
+ * `source.user` must resolve — via `identity.ts`'s `isConfiguredPrincipal`,
+ * the SAME resolution `ratify.ts`'s gate itself uses — to the one configured
+ * ratifier principal. There is deliberately no second notion of "the
+ * principal" here: this check is "the author is in the ratifier's set",
+ * reusing that set rather than naming a new one, so "who may ratify" and
+ * "who Atlas admits" cannot silently disagree. See `isAdmittedPrincipal`'s
+ * own docstring for the fail-closed caveat when the identity config itself is
+ * unusable.
+ *
  * ── Untrusted input is DATA ────────────────────────────────────────────────
  * `payload.text` is written by arbitrary internet users. It is passed to
  * `processComment` / `processGateMessage` as an opaque body and NOWHERE else —
  * never into a `result` summary, never into a log line, never into any
  * structural field of any effect. Identity comes only from `source.surface` +
  * `source.user` — HOST-SET on the real inbound-surface path, but (atlas#24)
- * only as trustworthy as the two admission checks above make them: this file
+ * only as trustworthy as the admission checks above make them: this file
  * does not treat `source.*` as authenticated by construction, only as admitted
  * by config.
  */
@@ -95,7 +107,7 @@ import type { DiscordLedger } from "./effects/discord";
 import type { PlanWriter } from "./effects/gh";
 import type { LinkedIssueReader, ReadOnlyGh } from "./gh";
 import { isHelpRequest } from "./help";
-import type { RatifyIdentityConfig } from "./identity";
+import { isConfiguredPrincipal, type RatifyIdentityConfig } from "./identity";
 import { processComment } from "./proposal";
 import type { BrainEffect, BrainEvent, TaskEvent } from "./protocol";
 import { processGateMessage } from "./ratify";
@@ -453,6 +465,12 @@ export class AtlasRuntime {
     const channel = typeof source?.channel === "string" ? source.channel : "";
     const adapterInstance =
       typeof source?.adapter_instance === "string" ? source.adapter_instance : "";
+    // Read here (not just inside `handleAdmitted`) because the FOURTH
+    // admission dimension (atlas#47) is checked below, before intake — same
+    // tier as the channel and adapter-instance checks, not something layered
+    // on top of them.
+    const authorPlatform = typeof source?.surface === "string" ? source.surface : "";
+    const authorId = typeof source?.user === "string" ? source.user : "";
     let disposition: TaskDisposition;
 
     if (layer === null) {
@@ -519,6 +537,27 @@ export class AtlasRuntime {
         "task from an adapter instance Atlas does not recognize — ignored, nothing recorded",
       );
       disposition = "not-admitted";
+    } else if (layer.effects.principalOnly && !this.isAdmittedPrincipal(authorPlatform, authorId)) {
+      // THE FOURTH admission dimension (atlas#47) — a staging lockdown, not
+      // the end state. SAME disposition and SAME silence as the two checks
+      // above, and for the identical reason: a reply that said "you're not
+      // the principal" would tell an outsider the trust map exists, which is
+      // precisely what silence on an outsider's RATIFY already protects.
+      //
+      // `isAdmittedPrincipal` reuses `ratify.ts`'s own identity resolution
+      // (`identity.ts`'s `isConfiguredPrincipal`, built from
+      // `this.deps.identity`) rather than a second notion of "the principal" —
+      // see that function's header for why a second source would let "who may
+      // ratify" and "who Atlas listens to" silently disagree.
+      this.stats.notAdmitted += 1;
+      this.log(
+        "warn",
+        this.deps.identity === null
+          ? "principal-only is on but the principal identity is unusable — every author is " +
+              "refused, including the real principal; nothing recorded (see the boot line)"
+          : "task from an author who is not the configured principal — ignored, nothing recorded",
+      );
+      disposition = "not-admitted";
     } else {
       layer.transport.openWindow(task.task_id, channel);
       try {
@@ -554,6 +593,34 @@ export class AtlasRuntime {
       // The summary is a fixed vocabulary term — never the user's text.
       summary: disposition,
     });
+  }
+
+  /**
+   * `ATLAS_PRINCIPAL_ONLY` (atlas#47) — is this author the ONE identity
+   * `ratify.ts`'s gate would recognise as its configured principal?
+   *
+   * ── The unusable-identity case, decided and recorded here ─────────────────
+   * `this.deps.identity === null` means the ratification gate itself is
+   * UNARMED (`identity.ts`'s `loadIdentityConfigFromEnv` refused — a missing
+   * principal, no usable platform ids, or the self/ratifier overlap refusal).
+   * There is then no principal for ANYONE'S author id to resolve to, so this
+   * returns `false` for every caller, including the real principal.
+   *
+   * That is a DELIBERATE total mute, not a bug to work around: the contract
+   * of this flag is "admit only the configured principal", and with no usable
+   * principal identity, the honest answer to "is this author the principal?"
+   * is "no" for everyone. Widening admission back to normal because identity
+   * happened to be broken would be exactly backwards — a config error making
+   * the SAFETY CONTROL silently fail open is the one outcome worse than
+   * muting. `startup.ts`'s `buildStartupLine` names this state loudly
+   * (`PRINCIPAL-ONLY: ARMED-MUTE`) specifically so it is never read as "off"
+   * or as ordinary "on and admitting the principal" — see its header for why
+   * that is called ARMED rather than UNARMED.
+   */
+  private isAdmittedPrincipal(platform: string, platformId: string): boolean {
+    const identity = this.deps.identity;
+    if (identity === null) return false;
+    return isConfiguredPrincipal(identity, platform, platformId);
   }
 
   /** HELP first, then intake, then the gate. All three are total; none throws. */

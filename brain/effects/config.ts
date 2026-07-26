@@ -258,29 +258,56 @@ export interface EffectsConfig {
    * deleted), which is what makes this a switch and not a demolition.
    */
   readonly threadConversation: boolean;
+
+  /**
+   * atlas#47 — the FOURTH admission dimension: when on, `runtime.ts`'s
+   * `serveTask` admits a task only when its author resolves (via
+   * `identity.ts`'s `isConfiguredPrincipal`) to the SAME principal
+   * `ratify.ts`'s gate would recognise. Everything else is refused silently,
+   * exactly like a wrong channel or an untrusted adapter instance.
+   *
+   * OFF BY DEFAULT (staging control, not the end state): the live rehearsal
+   * asserts a non-principal `ADD` surfaces a proposal, and default-on would
+   * silently change that shipped behaviour for every deployment that never
+   * heard of this flag.
+   *
+   * ── It is a REAL kill switch, trivially — nothing durable to un-widen ─────
+   * Unlike `threadConversation` (which widens admission via a DURABLE
+   * `owned_threads` row that outlives the flag unless the check is ALSO
+   * gated on the flag at read time — atlas#43's own first-draft mistake),
+   * this control reads NO durable state at all: every task re-evaluates
+   * `effects.principalOnly` (parsed fresh from the environment on THIS boot)
+   * against the author on the wire. There is no row, cache, or registry that
+   * could carry a widened-or-narrowed admission across a restart — the next
+   * boot's environment is the ENTIRE truth. Off ⇒ the check does not run,
+   * full stop; nothing "restores" because nothing durable was ever narrowed.
+   */
+  readonly principalOnly: boolean;
 }
 
 /**
- * Parse the `ATLAS_THREAD_CONVERSATION` opt-in. Anything that is not an
+ * Parse a boolean opt-in from the daemon environment. Anything that is not an
  * explicit, recognised affirmative is `false` — an unparseable value must not
  * turn a capability ON by accident, and there is no refusal for it because a
  * typo here should degrade to today's behaviour, not disable Atlas's whole
  * effect layer.
  *
- * FAIL-CLOSED BY ALLOWLIST, never by denylist (adversarial review, M1). The
- * distinction is the whole property: a denylist (`v !== "0" && v !== "false"`)
- * reads as equivalent and arms the capability on a blank string, a typo,
- * `off`, `no`, `disabled`, or anything else nobody thought to list — and the
- * capability it arms sits in front of the ledger. The allowlist below is
- * pinned by negative tests in `config.test.ts` precisely because the wrong
- * version passes every positive test.
+ * FAIL-CLOSED BY ALLOWLIST, never by denylist (adversarial review, M1 on
+ * `ATLAS_THREAD_CONVERSATION`; the same lesson atlas#43 names for its own
+ * flag). The distinction is the whole property: a denylist
+ * (`v !== "0" && v !== "false"`) reads as equivalent and arms the capability on
+ * a blank string, a typo, `off`, `no`, `disabled`, or anything else nobody
+ * thought to list — and every capability this helper gates sits in front of
+ * the ledger or the gate. The allowlist is pinned by negative tests in
+ * `config.test.ts` precisely because the wrong version passes every positive
+ * test.
  */
-const THREAD_CONVERSATION_TRUE: ReadonlySet<string> = new Set(["1", "true", "yes", "on"]);
+const BOOLEAN_FLAG_TRUE: ReadonlySet<string> = new Set(["1", "true", "yes", "on"]);
 
-function parseThreadConversation(raw: string | boolean | undefined): boolean {
+function parseBooleanFlag(raw: string | boolean | undefined): boolean {
   if (typeof raw === "boolean") return raw;
   if (typeof raw !== "string") return false;
-  return THREAD_CONVERSATION_TRUE.has(raw.trim().toLowerCase());
+  return BOOLEAN_FLAG_TRUE.has(raw.trim().toLowerCase());
 }
 
 export type EffectsConfigRefusal =
@@ -314,6 +341,8 @@ export function makeEffectsConfig(input: {
   checkoutDir?: string | undefined;
   /** atlas#25 opt-in; absent/unrecognised ⇒ `false`. See `threadConversation`. */
   threadConversation?: string | boolean | undefined;
+  /** atlas#47 opt-in; absent/unrecognised ⇒ `false`. See `principalOnly`. */
+  principalOnly?: string | boolean | undefined;
 }): EffectsConfigLoad {
   const repo = typeof input.planRepo === "string" ? input.planRepo.trim() : "";
   if (repo.length === 0) {
@@ -395,7 +424,8 @@ export function makeEffectsConfig(input: {
       baseBranch,
       checkoutDir: checkoutRaw.length > 0 ? checkoutRaw : null,
       trustedAdapterInstances,
-      threadConversation: parseThreadConversation(input.threadConversation),
+      threadConversation: parseBooleanFlag(input.threadConversation),
+      principalOnly: parseBooleanFlag(input.principalOnly),
     }),
   };
 }
@@ -414,6 +444,10 @@ export function makeEffectsConfig(input: {
  *   ATLAS_THREAD_CONVERSATION        optional opt-in (atlas#25); `1`/`true`/`yes`/`on`
  *                                    ⇒ surface a proposal into a thread Atlas opens.
  *                                    Anything else, including unset ⇒ off.
+ *   ATLAS_PRINCIPAL_ONLY             optional opt-in (atlas#47); `1`/`true`/`yes`/`on`
+ *                                    ⇒ admit only the configured ratifier principal.
+ *                                    Anything else, including unset ⇒ off (today's
+ *                                    behaviour: any author may surface a proposal).
  */
 export function loadEffectsConfig(
   env: Record<string, string | undefined> = process.env,
@@ -426,6 +460,7 @@ export function loadEffectsConfig(
     baseBranch: env.ATLAS_PLAN_BASE_BRANCH,
     checkoutDir: env.ATLAS_PLAN_CHECKOUT,
     threadConversation: env.ATLAS_THREAD_CONVERSATION,
+    principalOnly: env.ATLAS_PRINCIPAL_ONLY,
   });
 }
 
