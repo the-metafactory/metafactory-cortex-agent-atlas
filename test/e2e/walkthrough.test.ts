@@ -600,14 +600,20 @@ shadow("shadow rehearsal — the DoD walkthrough against throwaway targets", () 
             `  revisions Atlas recorded: ${observed}\n` +
             `  revision GitHub reports now: ${live?.revisedAt ?? "(unreadable)"}\n` +
             `\n` +
-            `  KNOWN DEFECT — atlas#26. This currently FAILS, and the failure is the finding.\n` +
-            `  Drift is keyed on GitHub's issue \`updatedAt\`, which advances on comments and\n` +
-            `  cross-references, not only on body edits. The whole walkthrough makes exactly\n` +
-            `  TWO body edits (the seed, and Atlas's one ratified apply — asserted exactly in\n` +
-            `  DoD 3+4), so a longer list of "revisions recorded" than that is the bug\n` +
-            `  reproducing, not a flake. The unit suite cannot catch it: the fake plan writer\n` +
-            `  bumps revisedAt only on write (brain/test-support.ts), which is precisely the\n` +
-            `  property GitHub lacks. Remove this note when atlas#26 lands.`,
+            `  KNOWN DEFECT — atlas#34. This currently FAILS, and the failure is the finding.\n` +
+            `\n` +
+            `  GitHub itself edits the plan body: when a plan line references an issue in the\n` +
+            `  same repo, GitHub ticks that checkbox on closure. Neither Atlas nor this harness\n` +
+            `  writes "[x]" (Atlas: zero occurrences in apply.ts; harness: seeds the body once).\n` +
+            `  So the bytes genuinely change with no ledger entry, and detector (c) correctly\n` +
+            `  reports it. A body-hash revision identity CANNOT filter this — unlike timestamp\n` +
+            `  noise, the content really did change. atlas#26 is fixed and is not the cause.\n` +
+            `\n` +
+            `  NOTE for whoever reads this next: an earlier version of this note claimed the\n` +
+            `  walkthrough makes "exactly TWO body edits". That was WRONG — it ratifies three\n` +
+            `  ADDs (DoD 3+4, DoD 8's RATIFY 2, DoD 5's RATIFY 3), and GitHub's tick is a\n` +
+            `  fourth. Verified against the live issue via GraphQL userContentEdits. Do not\n` +
+            `  re-derive a bug from that arithmetic. Remove this note when atlas#34 lands.`,
         );
       }
       expect(second.kind).toBe("clean");
