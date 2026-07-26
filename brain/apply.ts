@@ -56,6 +56,7 @@
  */
 
 import { certificateMatchesStorage, type RatificationCertificate } from "./ratification";
+import { planBodyRevision } from "./plan-revision";
 import type { RatifyIdentityConfig } from "./identity";
 import type { AtlasProposals, ProposalRecord } from "./state";
 import type { EffectsConfig } from "./effects/config";
@@ -178,7 +179,11 @@ export async function applyRatified(
     return refuse("edit-refused", edit.reason);
   }
 
-  let revision = before.revisedAt;
+  // atlas#26: the revision is a hash of the BODY, not GitHub's `updatedAt` —
+  // see plan-revision.ts. `before.body` already IS the body Atlas is about to
+  // act on, so the unconditional default below is right even when `edit.kind`
+  // turns out to be `unchanged`.
+  let revision = planBodyRevision(before.body);
   const bodyChanged = edit.kind === "changed";
   if (edit.kind === "changed") {
     const after = await deps.gh.writePlanBody(edit.body);
@@ -189,7 +194,13 @@ export async function applyRatified(
       // already present, which is the `unchanged` branch above.
       return refuse("plan-write-failed", "the plan body edit did not produce a revision receipt");
     }
-    revision = after.revisedAt;
+    // The write is still verified by reading the receipt back (`after`) — a
+    // "successful" write that produced no readable receipt is not a receipt
+    // for anything, per `writePlanBody`'s own contract. But the REVISION
+    // itself is computed from `edit.body` — the exact bytes Atlas wrote —
+    // rather than trusting `after.revisedAt` (`updatedAt`), which is not a
+    // body-revision identity at all (that was the bug).
+    revision = planBodyRevision(edit.body);
   }
 
   // ── 5. Record `applied` with the body-revision receipt ───────────────────

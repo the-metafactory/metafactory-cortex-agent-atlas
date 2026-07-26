@@ -292,7 +292,15 @@ export interface ProposalRecord {
 
 /** The receipt for half (a) of the atomic pair: the plan body was edited. */
 export interface AppliedReceipt {
-  /** GitHub's `updatedAt` for the plan issue after the edit — the body revision. */
+  /**
+   * The body-revision identity produced by `plan-revision.ts`'s
+   * `planBodyRevision` (atlas#26) — a hash of the plan body itself, NOT
+   * GitHub's `updatedAt` for the issue. `updatedAt` advances on comments,
+   * label changes, and cross-references from other issues/PRs, so it never
+   * meant "the body revision" — that was the bug atlas#26 fixed. A value
+   * recorded before that fix is a legacy `updatedAt` ISO timestamp; see
+   * `isHashedPlanRevision` for how reconcile tells the two apart.
+   */
   readonly revision: string;
   readonly ts: number;
 }
