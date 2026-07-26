@@ -238,9 +238,24 @@ export interface EffectsConfig {
    *      window opened from the bound channel itself.
    *
    * `false` (the default) ⇒ the emitted effect stream is byte-identical to
-   * pre-atlas#25 Atlas. The owned-thread ADMISSION half (atlas#22) is
-   * unconditional and needs no flag: with no thread ever opened the registry
-   * stays empty and admits nothing extra.
+   * pre-atlas#25 Atlas.
+   *
+   * ── It is a KILL SWITCH, and it works in both directions (BLOCKER 2) ──────
+   * This flag gates BOTH halves: opening threads AND admitting a message from
+   * a thread already opened (`runtime.ts`'s admission union). An earlier draft
+   * gated only the first — which meant an operator who enabled threads, saw
+   * trouble, and flipped the flag off had NOT narrowed admission back. Rows
+   * never expire and there is no revoke verb, so every thread ever opened
+   * stayed admitted, forever. An irrevocable widening of the surface in front
+   * of the ratification gate, with no operator control, is not a defensible
+   * thing to ship.
+   *
+   * So: OFF ⇒ on the next boot Atlas admits the bound channel and nothing
+   * else, whatever the registry holds. One honest cost, stated rather than
+   * hidden: while it is off, a reply typed in a thread Atlas opened earlier is
+   * refused in silence and the conversation must return to the channel.
+   * Turning it back on re-admits those same threads (rows are kept, not
+   * deleted), which is what makes this a switch and not a demolition.
    */
   readonly threadConversation: boolean;
 }
@@ -251,12 +266,21 @@ export interface EffectsConfig {
  * turn a capability ON by accident, and there is no refusal for it because a
  * typo here should degrade to today's behaviour, not disable Atlas's whole
  * effect layer.
+ *
+ * FAIL-CLOSED BY ALLOWLIST, never by denylist (adversarial review, M1). The
+ * distinction is the whole property: a denylist (`v !== "0" && v !== "false"`)
+ * reads as equivalent and arms the capability on a blank string, a typo,
+ * `off`, `no`, `disabled`, or anything else nobody thought to list — and the
+ * capability it arms sits in front of the ledger. The allowlist below is
+ * pinned by negative tests in `config.test.ts` precisely because the wrong
+ * version passes every positive test.
  */
+const THREAD_CONVERSATION_TRUE: ReadonlySet<string> = new Set(["1", "true", "yes", "on"]);
+
 function parseThreadConversation(raw: string | boolean | undefined): boolean {
   if (typeof raw === "boolean") return raw;
   if (typeof raw !== "string") return false;
-  const v = raw.trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes" || v === "on";
+  return THREAD_CONVERSATION_TRUE.has(raw.trim().toLowerCase());
 }
 
 export type EffectsConfigRefusal =

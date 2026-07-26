@@ -255,9 +255,36 @@ CREATE TABLE IF NOT EXISTS linked_issue_title_cache (
  */
 const OWNED_THREAD_ID_RE = /^[A-Za-z0-9:_.-]{1,128}$/;
 
+/**
+ * Values that PASS the shape check above but can only ever be a bug by the
+ * time they reach this table: the STRING FORMS of absent/empty values, which
+ * is exactly what a mis-serialised or coerced id looks like once it is a
+ * string. No path that produces one is proven — this is a denylist on the one
+ * table that WIDENS admission, and one line is a cheap way to make "a
+ * stringified `undefined` became an admitted room" impossible rather than
+ * merely unobserved (adversarial review, nit 1). It is not theoretical
+ * paranoia either: cortex's own config layer coerces an absent
+ * `agentChannelId` to the literal string `"undefined"` under the zod it ships
+ * (4.3.6), so this class of value demonstrably exists in this ecosystem.
+ * Compared case-insensitively: `Null` is no more a thread id than `null`.
+ */
+const IMPLAUSIBLE_THREAD_IDS: ReadonlySet<string> = new Set([
+  "undefined",
+  "null",
+  "nan",
+  "none",
+  "nil",
+  "false",
+  "true",
+  "0",
+  "-1",
+]);
+
 /** True when `id` is a plausible platform thread id. Never throws. */
 export function isPlausibleThreadId(id: unknown): id is string {
-  return typeof id === "string" && OWNED_THREAD_ID_RE.test(id);
+  if (typeof id !== "string") return false;
+  if (!OWNED_THREAD_ID_RE.test(id)) return false;
+  return !IMPLAUSIBLE_THREAD_IDS.has(id.toLowerCase());
 }
 
 /**

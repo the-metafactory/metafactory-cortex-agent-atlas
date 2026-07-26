@@ -317,14 +317,20 @@ watch:
 #
 # Two halves, and only one of them is switchable:
 #
-#   ADMISSION (atlas#22) — always on, no flag. Atlas admits a task from the
-#     bound channel OR from a thread IT OPENED and durably recorded opening
-#     (brain/state.ts `owned_threads`). Before this, a reply typed in a thread
-#     was refused in silence — including a RATIFY Atlas had itself invited —
-#     because the shipped Discord adapter puts the THREAD's snowflake in
-#     `source.channel` and sends no parent-channel signal at all. With no
-#     thread ever opened the registry is empty and nothing extra is admitted,
-#     so this half is inert until the half below is enabled.
+#   ADMISSION (atlas#22) — Atlas admits a task from the bound channel OR from
+#     a thread IT OPENED and durably recorded opening (brain/state.ts
+#     `owned_threads`). Before this, a reply typed in a thread was refused in
+#     silence — including a RATIFY Atlas had itself invited — because the
+#     shipped Discord adapter puts the THREAD's snowflake in `source.channel`
+#     and sends no parent-channel signal at all.
+#
+#     The owned-thread half is gated by the SAME switch below, which is what
+#     makes that switch a real kill switch: off ⇒ on the next boot Atlas
+#     admits the bound channel and nothing else, whatever the registry holds.
+#     Rows are kept, not deleted, so switching it back on restores the same
+#     threads. Cost of switching it off, stated rather than hidden: a reply
+#     typed in a thread Atlas opened earlier is refused in silence and the
+#     conversation must return to the channel.
 #
 #   CONVERSATION (atlas#25) — `ATLAS_THREAD_CONVERSATION`, OFF by default.
 #     On, a surfaced proposal asks the host to open a thread and the exchange
@@ -342,7 +348,14 @@ watch:
 #        silently ship the other choice.
 #     3. `presence.discord.agentChannelId` is what the host uses as the thread
 #        parent — see the presence block below, which does not currently set
-#        it under that name.
+#        it under that name. Corrected separately on
+#        `fix/presence-agent-channel-id`: that change alters the deployment's
+#        binding whether or not this flag is on, so it does not belong in a
+#        branch whose safety argument is "the flag is off".
+#     4. Every valid ADD from anyone asks for a thread, against cortex's
+#        budget of 10 creates/hour/agent; the eleventh is refused and the
+#        exchange stays in the channel. Bounded and safe, but outsider-paced —
+#        recorded with atlas#38's rate-policy family, not fixed here.
 threads:
   conversation: __ATLAS_THREAD_CONVERSATION__   # OPTIONAL. 1|true|yes|on ⇒ on. Default OFF.
 
@@ -357,23 +370,7 @@ presence:
     enabled: true
     token: __ATLAS_BOT_TOKEN__              # resolved at cortex load
     guildId: __ATLAS_GUILD_ID__             # resolve-at-install
-    # THE FIELD NAME IS `agentChannelId`, not `channelId` (atlas#25, found
-    # while wiring threads). cortex's `DiscordPresenceSchema`
-    # (src/common/types/cortex-config.ts) has no `channelId` member at all:
-    # zod DROPS the unknown key, and because `agentChannelId` is declared
-    # `z.coerce.string().min(1)`, an ABSENT value coerces to the literal
-    # string "undefined" and passes validation. So the previous spelling did
-    # not bind this agent to #iteration-plan — it bound it to a channel named
-    # "undefined", silently. It is also the name cortex's placeholder resolver
-    # recognises (`resolve-env-placeholders.ts` DISCORD_ID_FIELDS = token,
-    # guildId, agentChannelId, logChannelId), so under the old spelling
-    # `__ATLAS_CHANNEL_ID__` was never resolved either. Same env var, same
-    # intent, correct field — matching escort's own agents.d fragment.
-    #
-    # It is ALSO the thread parent: cortex derives `create_private_thread`'s
-    # channel from exactly this field (cortex#2206), which is why the fix
-    # belongs to the thread slice.
-    agentChannelId: __ATLAS_CHANNEL_ID__    # the #iteration-plan channel Atlas is bound to
+    channelId: __ATLAS_CHANNEL_ID__         # the #iteration-plan channel Atlas is bound to
     dmOwner: false                          # Atlas never claims DMs
     contextDepth: 10
     surfaceSubjects: []                     # no raw envelope surface
