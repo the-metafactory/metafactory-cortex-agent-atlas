@@ -69,6 +69,14 @@ describe("malformedReply's advertised format actually parses", () => {
         expect(result.proposal.why).toBe("because it improves onboarding");
       }
     });
+
+    // atlas#45: someone who just got the format wrong is exactly the person
+    // who needs to know HELP exists — this is the "hook discovery into
+    // malformedReply" acceptance criterion.
+    test(`${verb}: advertises HELP as the recovery path`, () => {
+      const reply = malformedReply(verb, "some parse failure reason");
+      expect(reply).toContain("@atlas HELP");
+    });
   }
 });
 

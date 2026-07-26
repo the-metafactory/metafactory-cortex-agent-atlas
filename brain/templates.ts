@@ -79,8 +79,71 @@ export function declinedReply(proposal: ParsedProposal, reason: ValidationFailur
 export function malformedReply(verb: ProposalVerb, reason: string): string {
   return (
     `This looked like a ${verb} proposal but couldn't be parsed (${reason}). ` +
-    `Format: "@atlas ${verb}: <github issue url> — <why>".`
+    `Format: "@atlas ${verb}: <github issue url> — <why>". ` +
+    `Or say "@atlas HELP" to see every command Atlas answers.`
   );
+}
+
+// ── HELP (atlas#45) ─────────────────────────────────────────────────────────
+
+/**
+ * The `HELP` verb's one reply. Deterministic template text, no compose/voice
+ * call — Atlas has no compose voice wired at all in this pack, so a template
+ * is the only kind of reply it could produce here regardless.
+ *
+ * ── Identity-neutral by CONSTRUCTION, not by convention ─────────────────────
+ * This function takes NO argument — there is no identity, no principal-check
+ * result, no sender-specific fact it could branch on even by accident. Every
+ * admitted sender — the configured principal, a known proposer, a total
+ * stranger — reaches this exact same string. That is the whole point (see
+ * the issue's warning): a help text that says "you may RATIFY" to one reader
+ * and "you may propose" to another turns Atlas into an oracle for "am I the
+ * principal?", which is precisely the fact the ratification gate exists to
+ * protect. So this text describes the PROTOCOL ("the configured principal
+ * may RATIFY/DECLINE") and never the reader ("you may…").
+ *
+ * ── The three causes of silence, named because they are indistinguishable
+ *    from outside (issue #45, echoing atlas#17/#22/#24/#25) ─────────────────
+ * A user who posts and hears nothing cannot tell "never arrived" from "not
+ * admitted" from "not parsed" from "Atlas is down" — so this text enumerates
+ * the three causes THIS pack can actually name, rather than leaving the
+ * reader guessing which is true. "Not admitted" reflects what is currently
+ * enforced on `runtime.ts`'s `serveTask`: channel/thread admission (atlas#22)
+ * AND the adapter-instance check (atlas#24) — two dimensions, both silent,
+ * both named here rather than only the older, single-dimension version.
+ *
+ * ── Examples are asserted against the real parsers, not eyeballed ──────────
+ * Every `@atlas …` line below is extracted and parsed by
+ * `help.test.ts` with `parseComment`/`parseGateCommand` — the same functions
+ * `docs-grammar.test.ts` and `templates.test.ts` hold the README and the
+ * other templates to — after stripping the mention exactly as the adapter
+ * does. A change here that breaks one of those shapes turns that test red.
+ */
+export function helpText(): string {
+  return [
+    "Atlas answers four commands, always after an @-mention:",
+    "",
+    "  @atlas ADD: <github issue url> — <why>",
+    "  @atlas REMOVE: <github issue url> — <why>",
+    "  @atlas RATIFY <id>",
+    "  @atlas DECLINE <id> <reason>",
+    "",
+    "ADD/REMOVE propose a plan change and come from anyone. RATIFY/DECLINE " +
+      "decide a proposal, and only reach the gate from the one configured " +
+      "plan-steward principal — everyone else's RATIFY/DECLINE is ignored, " +
+      "by design, which is also why this reply cannot say who that is.",
+    "",
+    "A message that gets no reply at all is exactly one of three things:",
+    "  1. it never arrived — Atlas is only ever delivered a message that " +
+      "@-mentions it",
+    "  2. it wasn't admitted — the channel or thread it came from isn't one " +
+      "Atlas listens in, or it came from an adapter instance Atlas doesn't " +
+      "recognize",
+    "  3. it wasn't parsed — the command has to be the very first thing on " +
+      "the line",
+    "",
+    'Say "@atlas HELP" (or "@atlas help") any time to see this again.',
+  ].join("\n");
 }
 
 // ── W2b, the ratification gate (issue #3) ──────────────────────────────────
