@@ -211,6 +211,40 @@ CREATE TABLE IF NOT EXISTS owned_threads (
 `;
 
 /**
+ * Atlas-OWNED auxiliary tables (atlas#28) — same posture as
+ * `GATE_REPLAY_KEYS_SCHEMA` above: outside the `schema_migrations` version
+ * gate, created unconditionally every open, guarded only by `IF NOT EXISTS`.
+ *
+ * These feed the `atlas status` CLI's zero-network "ledger view" (issue #28):
+ * a status answer must be instant and offline BY DEFAULT, which means the
+ * plan body's raw text and a linked issue's title have to be cached
+ * SOMEWHERE durable rather than fetched fresh on every invocation — the same
+ * "cache at watch time" decision issue #28 makes explicitly for titles,
+ * extended to the one other thing the status tool needs and nothing already
+ * caches: the plan body itself (`watch.ts` already fetches it every pass).
+ *
+ * `plan_body_cache` is a SINGLETON row (`id` CHECK'd to `1`) — there is
+ * exactly one configured plan, so exactly one cached snapshot; a newer write
+ * replaces the older one outright. History of past snapshots is not this
+ * table's job (the `events` log already keeps that, via `reconcile_completed`
+ * and `work_item_resolved`'s `plan_revision` fields).
+ */
+const PLAN_STATUS_CACHE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS plan_body_cache (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  body       TEXT NOT NULL,
+  revision   TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS linked_issue_title_cache (
+  url        TEXT PRIMARY KEY,
+  title      TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
+`;
+
+/**
  * The shape a platform thread id must have before it is stored or matched.
  * Discord snowflakes are decimal digit strings; this repo's fixtures use
  * `thread-fixture-…`. Deliberately permissive about WHICH characters (a pack
@@ -225,6 +259,15 @@ const OWNED_THREAD_ID_RE = /^[A-Za-z0-9:_.-]{1,128}$/;
 export function isPlausibleThreadId(id: unknown): id is string {
   return typeof id === "string" && OWNED_THREAD_ID_RE.test(id);
 }
+
+/**
+ * Plan bodies are operator-sized (GitHub's own issue-body ceiling is 65536
+ * bytes — see `effects/gh.ts`'s `MAX_BODY_BYTES`) but this cache has no
+ * upstream enforcement of that limit of its own, so it caps defensively,
+ * well above GitHub's real ceiling — the same "cap rather than trust an
+ * upstream bound" discipline every other stored field in this file follows.
+ */
+const MAX_PLAN_BODY_CACHE_LEN = 100_000;
 
 /** owner_agent + event actor for everything this brain writes. */
 const OWNER = "atlas";
@@ -863,6 +906,47 @@ export class AtlasStateStore {
       warn(
         `unavailable, running memory-only: ${err instanceof Error ? err.message : String(err)}`,
       );
+      return null;
+    }
+  }
+
+  /**
+   * Read-only open (atlas#28) — for the `atlas status` CLI, and for nothing
+   * else. Opens `state.sqlite` with `SQLITE_OPEN_READONLY` and runs NO
+   * migration: a migration is a schema WRITE (`CREATE TABLE`, `PRAGMA
+   * journal_mode`), and a handle opened this way must be STRUCTURALLY unable
+   * to attempt one, not merely relied on not to. If the file has never been
+   * created (no daemon has ever run here), or the open fails for any other
+   * reason, this fails soft exactly like `open` does above: `null`, logged,
+   * never thrown — the CLI reports "no local state yet" rather than crashing.
+   *
+   * This is the ONLY sanctioned way anything outside the daemon process may
+   * read `state.sqlite`. SQLite readers never block a WAL writer and a
+   * read-only handle cannot itself acquire a write lock, so a concurrently
+   * running daemon is untouched by it — and every write-shaped method on the
+   * returned instance (e.g. `createIntake`, `markRatified`) would throw
+   * "attempt to write a readonly database" at the SQLite layer if a caller
+   * somehow reached for one, which is a second, structural line of defence
+   * on top of "the status CLI's code never calls them".
+   */
+  static openReadOnly(dir: string): AtlasStateStore | null {
+    try {
+      const path = join(dir, "state.sqlite");
+      if (!existsSync(path)) {
+        warn(`read-only open: no state.sqlite at ${path} — nothing has run here yet`);
+        return null;
+      }
+      const db = new Database(path, { readonly: true });
+      return new AtlasStateStore(
+        db,
+        dir,
+        null,
+        null,
+        DEFAULT_DASHBOARD_DEBOUNCE_MS,
+        defaultSpawnDashboardProcess,
+      );
+    } catch (err) {
+      warn(`read-only open failed: ${err instanceof Error ? err.message : String(err)}`);
       return null;
     }
   }
@@ -2057,6 +2141,115 @@ export class AtlasStateStore {
     return row?.n ?? 0;
   }
 
+  // ── atlas#28: the status cache + the watch-pass marker ───────────────────
+  //
+  // Everything in this block is either a durable write `watch.ts` makes on
+  // its own already-scheduled pass, or a read the STATUS CLI makes through
+  // `openReadOnly` above. Nothing here is reachable from admission or thread
+  // handling — it is a sibling concern (freshness + a zero-network ledger
+  // view), not a change to either.
+
+  /**
+   * Cache the plan body's raw text plus its `plan-revision.ts` hash, at the
+   * moment `watch.ts` (which already fetches it every pass) reads it.
+   * Singleton row — see `PLAN_STATUS_CACHE_SCHEMA`'s header for why an
+   * `INSERT OR REPLACE` is correct here and not elsewhere in this file.
+   */
+  recordPlanBodyCache(body: string, revision: string, ts: number = Date.now()): void {
+    this.db
+      .query(
+        `INSERT INTO plan_body_cache (id, body, revision, fetched_at) VALUES (1, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET body = excluded.body, revision = excluded.revision,
+             fetched_at = excluded.fetched_at`,
+      )
+      .run(cap(body, MAX_PLAN_BODY_CACHE_LEN), cap(revision, 128), ts);
+  }
+
+  /** The cached plan-body snapshot, or `null` if none has ever landed. */
+  getPlanBodyCache(): { body: string; revision: string; fetchedAt: number } | null {
+    const row = this.db
+      .query<{ body: string; revision: string; fetched_at: number }, []>(
+        `SELECT body, revision, fetched_at FROM plan_body_cache WHERE id = 1`,
+      )
+      .get();
+    if (row === null || row === undefined) return null;
+    return { body: row.body, revision: row.revision, fetchedAt: row.fetched_at };
+  }
+
+  /**
+   * Cache one linked issue's title — issue #28's D1(a): cheap, at the exact
+   * point `watch.ts` already reads it, so the default (offline) status path
+   * has something better to show than a bare URL. Titles may go stale on a
+   * rename; that staleness is disclosed by the status tool's freshness
+   * block, not hidden here.
+   */
+  recordLinkedIssueTitle(url: string, title: string, ts: number = Date.now()): void {
+    const key = boundedKey(cap(url, 300));
+    if (key.length === 0) return;
+    this.db
+      .query(
+        `INSERT INTO linked_issue_title_cache (url, title, fetched_at) VALUES (?, ?, ?)
+           ON CONFLICT(url) DO UPDATE SET title = excluded.title, fetched_at = excluded.fetched_at`,
+      )
+      .run(key, cap(title, 200), ts);
+  }
+
+  /** The cached title for a linked-issue URL, or `null` if never fetched. */
+  getLinkedIssueTitle(url: string): { title: string; fetchedAt: number } | null {
+    const key = boundedKey(cap(url, 300));
+    if (key.length === 0) return null;
+    const row = this.db
+      .query<{ title: string; fetched_at: number }, [string]>(
+        `SELECT title, fetched_at FROM linked_issue_title_cache WHERE url = ?`,
+      )
+      .get(key);
+    if (row === null || row === undefined) return null;
+    return { title: row.title, fetchedAt: row.fetched_at };
+  }
+
+  /**
+   * Mark one watcher pass complete — written on EVERY pass (same discipline
+   * `recordReconcilePass` already follows for reconcile), not only when a
+   * closure is found. Without this, "how current can the ledger view
+   * possibly be" was simply not observable: a poll that found nothing new
+   * left no trace at all.
+   */
+  recordWatchPass(ts: number = Date.now()): void {
+    this.db
+      .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, NULL, ?)`)
+      .run(ts, "watch_pass_completed", OWNER, JSON.stringify({}));
+  }
+
+  /** When the watcher last completed a pass, or `null` if it never has. */
+  lastWatchPassTs(): number | null {
+    const row = this.db
+      .query<{ ts: number | null }, []>(
+        `SELECT MAX(ts) AS ts FROM events WHERE type = 'watch_pass_completed'`,
+      )
+      .get();
+    const ts = row?.ts ?? null;
+    return typeof ts === "number" && Number.isSafeInteger(ts) && ts > 0 ? ts : null;
+  }
+
+  /**
+   * The last completed reconcile pass — when, and how much drift it found.
+   * `null` if reconcile has never run. `hasReconciled` already answers the
+   * boolean; this is the same fact plus the two numbers a freshness block
+   * needs (`recordReconcilePass` writes both onto the identical event).
+   */
+  lastReconcilePass(): { ts: number; driftCount: number } | null {
+    const row = this.db
+      .query<{ ts: number; drift_count: number | null }, []>(
+        `SELECT ts, ${jsonField("payload", "$.drift_count")} AS drift_count FROM events
+          WHERE type = 'reconcile_completed' ORDER BY ts DESC LIMIT 1`,
+      )
+      .get();
+    if (row === null || row === undefined) return null;
+    const driftCount =
+      typeof row.drift_count === "number" && Number.isFinite(row.drift_count) ? row.drift_count : 0;
+    return { ts: row.ts, driftCount };
+  }
+
   close(): void {
     try {
       this.db.close();
@@ -2418,6 +2611,21 @@ class MemoryProposals {
   /** Nothing durable to record — see `recordGateEvent` above. */
   recordCompletionAnnounced(): void {
     // deliberately empty; degraded mode records nothing.
+  }
+
+  /** atlas#28: nothing durable to cache in degraded mode — the status CLI reads storage directly anyway. */
+  recordPlanBodyCache(): void {
+    // deliberately empty
+  }
+
+  /** atlas#28: see `recordPlanBodyCache` above. */
+  recordLinkedIssueTitle(): void {
+    // deliberately empty
+  }
+
+  /** atlas#28: see `recordPlanBodyCache` above. */
+  recordWatchPass(): void {
+    // deliberately empty
   }
 
   // ── W3a in degraded mode: every answer is the one that CAUSES NO POST ─────
@@ -2788,6 +2996,33 @@ export class AtlasProposals {
     );
   }
 
+  // ── atlas#28: written from `watch.ts`'s already-scheduled pass; read back
+  // read-only by the `atlas status` CLI via `AtlasStateStore.openReadOnly`.
+
+  /** See `AtlasStateStore.recordPlanBodyCache`. */
+  recordPlanBodyCache(body: string, revision: string): void {
+    this.run(
+      (db) => db.recordPlanBodyCache(body, revision),
+      (m) => m.recordPlanBodyCache(),
+    );
+  }
+
+  /** See `AtlasStateStore.recordLinkedIssueTitle`. */
+  recordLinkedIssueTitle(url: string, title: string): void {
+    this.run(
+      (db) => db.recordLinkedIssueTitle(url, title),
+      (m) => m.recordLinkedIssueTitle(),
+    );
+  }
+
+  /** See `AtlasStateStore.recordWatchPass`. */
+  recordWatchPass(ts?: number): void {
+    this.run(
+      (db) => db.recordWatchPass(ts),
+      (m) => m.recordWatchPass(),
+    );
+  }
+
   recordGateEvent(type: string, payload: Record<string, unknown>): void {
     this.run(
       (db) => db.recordGateEvent(type, payload),
@@ -3026,5 +3261,18 @@ function applyMigration(db: Database): void {
   // Atlas-owned, outside the agent-state version gate, `IF NOT EXISTS` every
   // open. There is nothing to backfill: before this table existed Atlas owned
   // no threads, so an empty table is the accurate history, not a gap.
+  //
+  // NOTE this runs from `applyMigration`, which is on the READ-WRITE open path
+  // ONLY — `openReadOnly` (atlas#28) constructs the store without it, because a
+  // read-only handle cannot `CREATE TABLE` at all. That is why the status CLI
+  // can open a DB this table has never touched: it never gets here, and it
+  // never queries `owned_threads` either (admission is a daemon concern). Both
+  // halves are pinned by a test in `state.test.ts`.
   db.exec(OWNED_THREADS_SCHEMA);
+
+  // atlas#28's status cache — same "outside the version gate, IF NOT EXISTS"
+  // posture as the replay-key table above. Nothing to backfill: an empty
+  // cache just means the status CLI's ledger view has nothing yet, which it
+  // already has to report honestly (no watcher pass has ever landed).
+  db.exec(PLAN_STATUS_CACHE_SCHEMA);
 }

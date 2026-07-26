@@ -106,6 +106,34 @@ Two halves. Only one of them is switchable.
 
 License: MIT
 
+## `atlas status` — a callable, freshness-carrying view of the plan
+
+Unlike the daemon, `atlas-status` (installed on `PATH` by the package) is a
+plain CLI, runnable by hand, by an agent, or by a hook — and it needs no
+daemon running, because it reads `state.sqlite` **read-only**.
+
+```
+atlas-status                          # overall — totals, freshness
+atlas-status --section "Wave 2"       # one section, with its tickets
+atlas-status --ticket arc#369         # one ticket (also accepts a full URL)
+atlas-status --held                   # only ✋ items awaiting a human
+atlas-status --running                # only 🏃 in-flight items
+
+  --json        machine-readable atlas.plan.status.v1 envelope
+  --live        also check GitHub directly (costs API calls; reports
+                divergence from the ledger view rather than picking one)
+  --plan <url>  assert against a specific plan (refuses on a mismatch —
+                this instance has state for exactly one plan)
+```
+
+The **default view is instant and offline** — it never makes a network call.
+Every answer, human or `--json`, carries its own freshness: the plan
+revision, the last watcher pass, the last reconcile pass (and whether it
+found drift), the last ledger entry, and whether the daemon looks to be
+running. If the plan snapshot has never been cached (the daemon has not
+completed a pass yet), the tool refuses and says so — it never reports zero
+of everything as if that were the real answer.
+
 ## Configuration
 
 Atlas's brain reads its entire configuration from environment variables. Every one is declared in `agent.yaml` (`plan:`, `gate:`, `watch:`) as an `__ATLAS_*__` placeholder and in `arc-manifest.yaml` under `capabilities.secrets`. **No real id, name, or channel is ever stored in this repo.**

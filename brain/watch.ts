@@ -37,6 +37,7 @@
  */
 
 import { parseIssueUrl, type LinkedIssueReader } from "./gh";
+import { planBodyRevision } from "./plan-revision";
 import type { AtlasProposals } from "./state";
 import type { PlanWriter } from "./effects/gh";
 import type { CompletionItem, DiscordLedger, FlushOutcome } from "./effects/discord";
@@ -137,6 +138,12 @@ export async function pollCompletions(
     return { kind: "refused", reason: "plan-unreadable", detail: "could not read the plan body" };
   }
 
+  // atlas#28: cache the plan body this pass just fetched — the `atlas status`
+  // CLI's default (offline) view reads this back rather than making its own
+  // network call. Cheap: it is the SAME read this pass already paid for, just
+  // written down alongside the completion index instead of discarded.
+  deps.state.recordPlanBodyCache(snapshot.body, planBodyRevision(snapshot.body));
+
   const urls = extractLinkedIssueUrls(snapshot.body);
   let checked = 0;
   let enqueued = 0;
@@ -151,8 +158,13 @@ export async function pollCompletions(
       warn(`read failed for a linked issue: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
+    if (state === null) continue;
+    // atlas#28, D1(a): cache the title at the exact point it is fetched —
+    // regardless of open/closed — so the status CLI's per-ticket view has
+    // something better than a bare URL without a network call of its own.
+    deps.state.recordLinkedIssueTitle(url, state.title);
     // A failed read is NEVER "closed". Silence beats a wrong ✅.
-    if (state === null || !state.closed) continue;
+    if (!state.closed) continue;
     const item = toCompletionItem(url, state.title, state.referencingPrUrl);
     if (item === null) continue;
     deps.ledger.enqueueCompletion(item);
@@ -169,6 +181,10 @@ export async function pollCompletions(
       recorded += 1;
     }
   }
+  // atlas#28: written on EVERY completed pass (not only when something was
+  // found) — the freshness fact "the watcher last ran at T" must exist even
+  // on a pass with nothing to announce.
+  deps.state.recordWatchPass(now);
   return { kind: "polled", checked, enqueued, flush, recorded };
 }
 
