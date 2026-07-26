@@ -24,6 +24,7 @@ function armedEnv(): Record<string, string> {
     ATLAS_PLAN_REPO: "acme/widgets",
     ATLAS_PLAN_ISSUE: "4",
     ATLAS_CHANNEL_ID: CHANNEL_ID,
+    ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:instance-fixture-0000",
   };
 }
 
@@ -122,6 +123,18 @@ describe("the verdict", () => {
     expect(line).toContain("unreachable:missing-channel-id");
     expect(line).toContain("IGNORED");
     expect(line).toContain("the gate never sees it");
+  });
+
+  test("no trusted adapter instance ⇒ UNARMED, naming unreachability as the reason (atlas#24)", () => {
+    // Same shape as the missing-channel-id case above: identity loads and
+    // state is durable, but the second admission check (`runtime.ts`) still
+    // makes every message unreachable, so ARMED would overstate the promise.
+    const env = armedEnv();
+    delete env.ATLAS_TRUSTED_ADAPTER_INSTANCES;
+    const line = buildStartupLine(facts({ stateDurable: true }, env));
+    expect(line.startsWith("atlas: GATE UNARMED (")).toBe(true);
+    expect(line).toContain("unreachable:missing-adapter-instances");
+    expect(line).toContain("IGNORED");
   });
 
   test("every blocking reason is named at once, not one reboot at a time", () => {

@@ -69,11 +69,15 @@ let sent: BrainEffect[];
 let layer: EffectLayer;
 let taskSeq = 0;
 
+const ADAPTER_INSTANCE_ID = "adapter-fixture";
+const OTHER_ADAPTER_INSTANCE_ID = "adapter-fixture-untrusted";
+
 function makeEffects(): EffectsConfig {
   const loaded = makeEffectsConfig({
     planRepo: PLAN_REPO,
     planIssue: 4,
     channelId: CHANNEL_ID,
+    adapterInstances: ADAPTER_INSTANCE_ID,
   });
   if (loaded.kind !== "ok") throw new Error("fixture: effects config refused");
   return loaded.config;
@@ -152,8 +156,20 @@ function makeRuntime(
   });
 }
 
-/** A task event as cortex builds it for an inbound surface message. */
-function task(text: string, authorId: string, channel = CHANNEL_ID): TaskEvent {
+/**
+ * A task event as cortex builds it for an inbound surface message.
+ *
+ * `adapterInstance` uses `null` — not `undefined` — as its "omit the field"
+ * sentinel: a default PARAMETER value still applies when a caller explicitly
+ * passes `undefined`, so `undefined` could not mean "omit" here without also
+ * silently meaning "use the default" for anyone who passed it by accident.
+ */
+function task(
+  text: string,
+  authorId: string,
+  channel = CHANNEL_ID,
+  adapterInstance: string | null = ADAPTER_INSTANCE_ID,
+): TaskEvent {
   taskSeq += 1;
   return {
     v: 1,
@@ -166,7 +182,7 @@ function task(text: string, authorId: string, channel = CHANNEL_ID): TaskEvent {
       channel,
       thread: channel,
       user: authorId,
-      adapter_instance: "adapter-fixture",
+      ...(adapterInstance !== null && { adapter_instance: adapterInstance }),
     },
   };
 }
@@ -296,6 +312,39 @@ describe("admission is config-pinned", () => {
     // is NOT a duplicate.
     await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
     expect(posts()).toHaveLength(1);
+  });
+
+  // atlas#24 — the wire-forged shape: a `task` published straight onto
+  // `brain.>` (bypassing every real adapter) can set `source.channel` to
+  // whatever it likes, but a genuine live-surface task ALWAYS carries
+  // `adapter_instance`. These two cases are the mutation guard for that check:
+  // reverting it (dropping the `trustedAdapterInstances` branch in
+  // `serveTask`) must turn both back into a successful RATIFY.
+  test("a task with no adapter_instance cannot ratify — ignored, nothing recorded", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    sent.length = 0;
+    // The bus-forged shape atlas#24 found admitted: same channel, same
+    // authenticated-looking author id, but no adapter_instance at all.
+    await serve(runtime, task("RATIFY 1", PRINCIPAL_PLATFORM_ID, CHANNEL_ID, null));
+    expect(posts()).toHaveLength(0);
+    expect(repo.body).not.toContain(NEW_URL);
+    expect(runtime.stats.ratified).toBe(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+  });
+
+  test("a task from an untrusted adapter instance cannot ratify — ignored, nothing recorded", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    sent.length = 0;
+    await serve(
+      runtime,
+      task("RATIFY 1", PRINCIPAL_PLATFORM_ID, CHANNEL_ID, OTHER_ADAPTER_INSTANCE_ID),
+    );
+    expect(posts()).toHaveLength(0);
+    expect(repo.body).not.toContain(NEW_URL);
+    expect(runtime.stats.ratified).toBe(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
   });
 
   test("with no effect layer nothing is admitted and nothing is recorded", async () => {

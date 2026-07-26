@@ -89,7 +89,12 @@ let plan: GhCliPlanWriter;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "atlas-dashboard-test-"));
-  const loaded = makeEffectsConfig({ planRepo: "acme/widgets", planIssue: 4, channelId: CHANNEL_ID });
+  const loaded = makeEffectsConfig({
+    planRepo: "acme/widgets",
+    planIssue: 4,
+    channelId: CHANNEL_ID,
+    adapterInstances: "adapter-fixture",
+  });
   if (loaded.kind !== "ok") throw new Error("fixture: effects config refused");
   effects = loaded.config;
   repo = new FakePlanRepo(PLAN_BODY);

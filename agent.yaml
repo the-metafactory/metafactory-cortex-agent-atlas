@@ -89,6 +89,10 @@ runtime:
       - ATLAS_PLAN_REPO
       - ATLAS_PLAN_ISSUE
       - ATLAS_CHANNEL_ID
+      # The SECOND admission check (atlas#24). REQUIRED; missing ⇒ Atlas admits
+      # NO message at all — same "cannot act" posture as the block above, not
+      # an optional hardening flag. See the note near `gate:` below.
+      - ATLAS_TRUSTED_ADAPTER_INSTANCES
       # Optional effect knobs. Unset ⇒ `main` / doc-change PRs disabled.
       - ATLAS_PLAN_BASE_BRANCH
       - ATLAS_PLAN_CHECKOUT
@@ -235,6 +239,33 @@ gate:
   # So: rotate the bot token, re-invite Atlas, or change its application, and
   # UPDATE THIS FIELD in the same change. A stale entry produces no error.
   selfPlatformIds: __ATLAS_SELF_PLATFORM_IDS__
+
+# The SECOND admission check (atlas#24), alongside the channel check above.
+# Read by brain/effects/config.ts (`loadEffectsConfig`) and enforced by
+# brain/runtime.ts's `serveTask` — NOT by identity.ts/ratify.ts, even though it
+# is a trust-boundary concern like `gate:` above.
+#
+# WHY THIS EXISTS: verified directly against cortex, `source.channel` and
+# `source.user` on a `task` event are only as trustworthy as "some
+# bus-authenticated publisher set them" — nothing enforces that a `task` on the
+# brain's inbound subject actually came from cortex's real inbound-surface
+# path (see brain/protocol.ts's `TaskSource` header for the full trail). A
+# GENUINE live-surface task always also carries `adapter_instance`, set by
+# cortex from the real adapter connection's own id; a forged/replayed envelope
+# generally will not, and even if it does, would have to guess this value.
+# REQUIRED; missing ⇒ Atlas admits NO message — same "cannot act" posture as
+# a missing `plan:`/`channelId`, not an optional hardening flag a deployment
+# can leave off.
+adapterTrust:
+  # Adapter-instance id(s) Atlas accepts a task from, comma- or
+  # whitespace-separated. Compared with `===`; never normalised. Set this to
+  # the SAME value cortex resolves for Atlas's bound surface —
+  # `{platform}:{demuxKey}`, e.g. `discord:<guildId>` (cortex's
+  # `src/adapters/registry.ts`) — copied here independently rather than
+  # derived from cortex's internal formula, so a mismatch fails LOUD (a live
+  # message stops being admitted) instead of silently trusting the wrong
+  # instance. Yielding no usable id ⇒ `missing-adapter-instances`.
+  trustedInstances: __ATLAS_TRUSTED_ADAPTER_INSTANCES__
 
 # The completion watcher's poll cadence. Read by brain/watch.ts
 # (`resolvePollIntervalMs`). OPTIONAL: unset, non-numeric, or non-positive ⇒

@@ -57,6 +57,9 @@ const PRINCIPAL_PLATFORM_ID = "pid-principal-fixture";
 const ATLAS_PLATFORM_ID = "pid-atlas-self-fixture";
 const PROPOSER_PLATFORM_ID = "pid-proposer-fixture";
 const CHANNEL_ID = "chan-fixture-0000";
+// atlas#24 — the adapter-instance id a genuine live-surface task carries.
+const ADAPTER_INSTANCE_ID = "discord:instance-fixture-0000";
+const UNTRUSTED_ADAPTER_INSTANCE_ID = "discord:instance-fixture-forged";
 const OTHER_CHANNEL = "chan-fixture-9999";
 const PLAN_REPO = "acme/widgets";
 const PLAN_ISSUE = "4";
@@ -280,20 +283,37 @@ class FakeCortexHost {
     });
   }
 
-  /** Deliver a surface message exactly as `buildBrainTaskPayload` shapes it. */
-  task(taskId: string, text: string, user: string, channel = CHANNEL_ID): void {
+  /**
+   * Deliver a surface message exactly as `buildBrainTaskPayload` shapes it.
+   *
+   * `adapterInstance` defaults to the fixture id `armedHostEnv()` trusts, so
+   * every existing call site keeps exercising a genuinely-admitted task.
+   * Passing `null` explicitly reproduces atlas#24's bus-forged shape — the
+   * wire-e2e's own fixture used to omit the field entirely and still be
+   * admitted. (`null`, not `undefined`: a default PARAMETER value still
+   * applies when a caller explicitly passes `undefined`, so `undefined` could
+   * not double as an explicit "omit it" signal here.)
+   */
+  task(
+    taskId: string,
+    text: string,
+    user: string,
+    channel = CHANNEL_ID,
+    adapterInstance: string | null = ADAPTER_INSTANCE_ID,
+  ): void {
+    const routing: Record<string, unknown> = { surface: "discord", channel, thread: channel };
+    const source: Record<string, unknown> = { surface: "discord", channel, thread: channel, user };
+    if (adapterInstance !== null) {
+      routing.adapter_instance = adapterInstance;
+      source.adapter_instance = adapterInstance;
+    }
     this.send({
       v: 1,
       type: "task",
       task_id: taskId,
       capability: "atlas.plan.steward",
-      payload: {
-        text,
-        scenario: text,
-        user,
-        response_routing: { surface: "discord", channel, thread: channel },
-      },
-      source: { surface: "discord", channel, thread: channel, user },
+      payload: { text, scenario: text, user, response_routing: routing },
+      source,
     });
   }
 
@@ -371,6 +391,7 @@ function armedHostEnv(): Record<string, string> {
     ATLAS_PLAN_REPO: PLAN_REPO,
     ATLAS_PLAN_ISSUE: PLAN_ISSUE,
     ATLAS_CHANNEL_ID: CHANNEL_ID,
+    ATLAS_TRUSTED_ADAPTER_INSTANCES: ADAPTER_INSTANCE_ID,
     ATLAS_STATE_DIR: join(dir, "state"),
   };
 }
@@ -430,6 +451,7 @@ describe("agent.yaml declares the env contract", () => {
       "ATLAS_PLAN_REPO",
       "ATLAS_PLAN_ISSUE",
       "ATLAS_CHANNEL_ID",
+      "ATLAS_TRUSTED_ADAPTER_INSTANCES",
       "ATLAS_PLAN_BASE_BRANCH",
       "ATLAS_PLAN_CHECKOUT",
       "ATLAS_WATCH_INTERVAL_MS",
@@ -520,6 +542,30 @@ describe("the daemon starts and stays up", () => {
     expect(h.postsFor("t-unreachable")).toEqual([]);
   }, 20_000);
 
+  test("no trusted adapter instance is UNARMED too (atlas#24) — same unreachable shape", async () => {
+    // Same failure family as the missing-channel-id case above: the SECOND
+    // admission check (`runtime.ts`) is just as capable of making the gate
+    // unreachable, and the startup line must say so rather than printing
+    // ARMED over a message that will never get past `serveTask`.
+    const env = armedHostEnv();
+    delete env.ATLAS_TRUSTED_ADAPTER_INSTANCES;
+    const h = await boot(env);
+    h.hello();
+    await h.waitFor(() => h.stderrText().includes("connected"), 5_000, "never connected");
+
+    const verdict = h.stderr.find((l) => l.includes("GATE ARMED") || l.includes("GATE UNARMED"));
+    expect(verdict).toBeDefined();
+    expect(verdict).toContain("GATE UNARMED");
+    expect(verdict).not.toContain("GATE ARMED");
+    expect(verdict).toContain("unreachable:missing-adapter-instances");
+    expect(verdict).toContain("IGNORED");
+
+    h.task("t-unreachable-adapter", "RATIFY 1", PRINCIPAL_PLATFORM_ID);
+    const result = await h.awaitResult("t-unreachable-adapter");
+    expect(result.summary).toBe("no-effect-layer");
+    expect(h.postsFor("t-unreachable-adapter")).toEqual([]);
+  }, 20_000);
+
   test("an unknown event type is dropped, not fatal", async () => {
     const h = await boot(armedHostEnv());
     h.hello();
@@ -577,6 +623,48 @@ describe("the full loop over a real socket", () => {
     expect(result.summary).toBe("not-admitted");
     expect(h.postsFor("t-elsewhere")).toEqual([]);
   });
+
+  // atlas#24 — the exact gap the independent adversarial review of PR #16
+  // found: a `task` event published straight onto the bus (bypassing every
+  // real adapter) can carry the RIGHT channel and an authenticated-LOOKING
+  // author id while omitting `adapter_instance` entirely, because cortex's own
+  // consumer builds `source` from an arbitrary envelope with no origin check.
+  // These two cases prove that shape can no longer ratify — the mutation
+  // guard is: revert the `trustedAdapterInstances` check in `runtime.ts`'s
+  // `serveTask` and BOTH of these must start ratifying again.
+  test("a RATIFY with no adapter_instance is ignored — the bus-forged shape cannot ratify", async () => {
+    const h = await boot(armedHostEnv());
+    h.hello();
+    h.task("t-add", `ADD: ${NEW_URL} — [Backend] why`, PROPOSER_PLATFORM_ID);
+    await h.awaitResult("t-add");
+
+    h.task("t-forged", "RATIFY 1", PRINCIPAL_PLATFORM_ID, CHANNEL_ID, null);
+    const result = await h.awaitResult("t-forged");
+    expect(result.status).toBe("complete");
+    expect(result.summary).toBe("not-admitted");
+    expect(readFileSync(planFile, "utf8")).not.toContain(NEW_URL);
+    expect(h.postsFor("t-forged")).toEqual([]);
+  }, 20_000);
+
+  test("a RATIFY from an untrusted adapter_instance is ignored — cannot ratify", async () => {
+    const h = await boot(armedHostEnv());
+    h.hello();
+    h.task("t-add", `ADD: ${NEW_URL} — [Backend] why`, PROPOSER_PLATFORM_ID);
+    await h.awaitResult("t-add");
+
+    h.task(
+      "t-forged2",
+      "RATIFY 1",
+      PRINCIPAL_PLATFORM_ID,
+      CHANNEL_ID,
+      UNTRUSTED_ADAPTER_INSTANCE_ID,
+    );
+    const result = await h.awaitResult("t-forged2");
+    expect(result.status).toBe("complete");
+    expect(result.summary).toBe("not-admitted");
+    expect(readFileSync(planFile, "utf8")).not.toContain(NEW_URL);
+    expect(h.postsFor("t-forged2")).toEqual([]);
+  }, 20_000);
 });
 
 // ── Shutdown ────────────────────────────────────────────────────────────────

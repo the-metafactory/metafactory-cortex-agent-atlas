@@ -41,12 +41,26 @@
  * non-admitted task is answered with silence (a `log` effect, no `post`):
  * replying would let anyone anywhere make Atlas speak.
  *
+ * A SECOND admission check, same disposition, same silence (atlas#24):
+ * `source.adapter_instance` must be a member of `effects.trustedAdapterInstances`.
+ * Verified against cortex directly — see `effects/config.ts`'s header — nothing
+ * on the bus stops an envelope published straight onto `brain.>` (bypassing
+ * every real adapter) from also carrying a channel id that matches, so the
+ * channel check ALONE is not the defence-in-depth it reads as. The adapter
+ * instance is host-set only on a genuine live-surface task; requiring it (and
+ * requiring it to be a RECOGNISED one) is what actually makes "the adapter is
+ * expected not to deliver that" a claim about the WIRE and not just about
+ * `source.channel`, which a forged envelope can set to anything it likes.
+ *
  * ── Untrusted input is DATA ────────────────────────────────────────────────
  * `payload.text` is written by arbitrary internet users. It is passed to
  * `processComment` / `processGateMessage` as an opaque body and NOWHERE else —
  * never into a `result` summary, never into a log line, never into any
  * structural field of any effect. Identity comes only from `source.surface` +
- * `source.user`, which are platform-authenticated and host-resolved.
+ * `source.user` — HOST-SET on the real inbound-surface path, but (atlas#24)
+ * only as trustworthy as the two admission checks above make them: this file
+ * does not treat `source.*` as authenticated by construction, only as admitted
+ * by config.
  */
 
 import { applyRatified } from "./apply";
@@ -272,6 +286,8 @@ export class AtlasRuntime {
     const layer = this.deps.effectLayer;
     const source = task.source;
     const channel = typeof source?.channel === "string" ? source.channel : "";
+    const adapterInstance =
+      typeof source?.adapter_instance === "string" ? source.adapter_instance : "";
     let disposition: TaskDisposition;
 
     if (layer === null) {
@@ -285,6 +301,20 @@ export class AtlasRuntime {
       // would let anyone, anywhere, make Atlas speak.
       this.stats.notAdmitted += 1;
       this.log("warn", "task from a channel Atlas is not bound to — ignored, nothing recorded");
+      disposition = "not-admitted";
+    } else if (!layer.effects.trustedAdapterInstances.has(adapterInstance)) {
+      // Second config-pinned admission check (atlas#24). SAME disposition as
+      // the channel check and SAME silence, deliberately: a distinguishable
+      // response would tell a forger which of the two checks it failed, and
+      // "wrong channel" vs "wrong/missing adapter instance" is not a
+      // distinction an outsider is owed. An empty `adapterInstance` (the field
+      // omitted entirely — the bus-forged shape) never matches a non-empty
+      // configured set, so absence refuses exactly like a wrong value.
+      this.stats.notAdmitted += 1;
+      this.log(
+        "warn",
+        "task from an adapter instance Atlas does not recognize — ignored, nothing recorded",
+      );
       disposition = "not-admitted";
     } else {
       layer.transport.openWindow(task.task_id, channel);

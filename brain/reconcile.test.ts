@@ -113,7 +113,12 @@ beforeEach(() => {
   });
   if (cfg === null) throw new Error("fixture: expected an identity config");
   identity = cfg;
-  const loaded = makeEffectsConfig({ planRepo: PLAN_REPO, planIssue: 4, channelId: CHANNEL_ID });
+  const loaded = makeEffectsConfig({
+    planRepo: PLAN_REPO,
+    planIssue: 4,
+    channelId: CHANNEL_ID,
+    adapterInstances: "adapter-fixture",
+  });
   if (loaded.kind !== "ok") throw new Error("fixture: effects config refused");
   effects = loaded.config;
   repo = new FakePlanRepo(PLAN_BODY);

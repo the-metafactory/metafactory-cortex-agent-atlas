@@ -27,6 +27,48 @@
  * ratify — it simply cannot ACT, and says so, rather than acting somewhere
  * half-configured. (The failure mode this pack most fears is a silently dead
  * gate; the mirror-image fear is a silently mis-aimed effect.)
+ *
+ * ── `trustedAdapterInstances` (atlas#24) ────────────────────────────────────
+ * `protocol.ts`'s `TaskSource.adapter_instance` is the one field cortex sets
+ * ONLY on a genuine live-surface task (`dispatchInboundToBrain` in cortex's
+ * `src/cortex.ts`, from the real adapter connection's own `instanceId`). It is
+ * declared OPTIONAL on the wire because the mirror rule tolerates a malformed
+ * or forged envelope — but nothing upstream of this brain enforces that only
+ * cortex's own inbound-surface path can publish onto the `brain.>` subject a
+ * `task` event arrives on. Verified against cortex directly: the consumer that
+ * builds `source` from an arbitrary bus envelope (`deriveTaskSource`,
+ * `src/bus/brain-consumer.ts`) runs no origin check, the daemon's own bot
+ * credential is minted with no `--pub`/`--sub` scope
+ * (`network-make-live-adapters.ts`), and no account-level default restricts a
+ * second bot under the same agents account either. So `source.adapter_instance`
+ * is NOT independently authenticated by the bus — it is exactly as trustworthy
+ * as `source.channel`, which is to say: only as far as "the deployment decided
+ * to admit it", never further.
+ *
+ * `trustedAdapterInstances` is that decision, made explicit and config-pinned,
+ * the same way `channelId` already is. It is REQUIRED — there is no default
+ * that silently disables the check — because an opt-in flag nobody sets is
+ * this repo's most repeated defect (an inert control that only LOOKS active).
+ * `runtime.ts`'s `serveTask` refuses (config-pinned admission, same disposition
+ * as a wrong channel) any task whose `source.adapter_instance` is absent or is
+ * not a MEMBER of this set — compared with `===`, never normalised, exactly
+ * like `channelId`. A deployment sets it to the same value cortex's own
+ * `PlatformAdapter.instanceId` resolves to for Atlas's bound surface
+ * (`{platform}:{demuxKey}`, e.g. `discord:<guildId>` — see cortex's
+ * `src/adapters/registry.ts`), copied here independently rather than derived
+ * from cortex's internal formula, so a future change to that formula fails
+ * LOUD (a live message no longer admits) rather than silently trusting the
+ * wrong instance.
+ *
+ * This is defence in depth, not a cryptographic guarantee: `adapter_instance`
+ * is a deployment-known identifier, not a secret, so this check closes the
+ * "trivially forged/replayed envelope" gap (the wire's own e2e fixture used to
+ * omit the field entirely and still be admitted) without claiming to close the
+ * deeper one — an attacker who can ALSO discover the exact instance id AND get
+ * a credential onto the bus's agents account. That deeper gap is a NATS
+ * subject-permission / account-isolation question for arc/cortex, out of this
+ * repo's reach; it is recorded, not silently assumed away (see the PR/issue
+ * this shipped with).
  */
 
 import type { PlanCoordinates } from "../gh";
@@ -51,6 +93,25 @@ const CHANNEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 /** A git branch name Atlas is willing to push. No refspec syntax, no leading dash. */
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
 
+/**
+ * `platform:instance` ids, comma- or whitespace-separated — the same
+ * separator convention `identity.ts`'s `parsePlatformActors` uses. Unlike
+ * that parser this one does NOT require a colon: an adapter-instance id's
+ * internal shape is cortex's business (`{platform}:{demuxKey}` today), not
+ * this repo's, so a token is kept verbatim as long as it is non-blank and
+ * carries no leading/trailing whitespace of its own. Blank tokens are
+ * dropped, not counted as usable — a stray comma must never widen the set.
+ */
+function parseAdapterInstances(raw: string | undefined): ReadonlySet<string> {
+  if (typeof raw !== "string" || raw.length === 0) return new Set();
+  const out = new Set<string>();
+  for (const token of raw.split(/[,\s]+/)) {
+    if (token.length === 0) continue;
+    out.add(token);
+  }
+  return out;
+}
+
 export interface EffectsConfig {
   /** The ONE repo + issue Atlas may write to. */
   readonly plan: PlanCoordinates;
@@ -67,6 +128,13 @@ export interface EffectsConfig {
    * a directory".
    */
   readonly checkoutDir: string | null;
+  /**
+   * Adapter-instance ids `runtime.ts`'s admission check accepts a task from
+   * (atlas#24). Opaque strings, compared with `===` — see the header note.
+   * Always non-empty on an `ok` config: an empty set would admit nothing,
+   * which is exactly what `missing-adapter-instances` refuses instead.
+   */
+  readonly trustedAdapterInstances: ReadonlySet<string>;
 }
 
 export type EffectsConfigRefusal =
@@ -81,7 +149,9 @@ export type EffectsConfigRefusal =
   /** `ATLAS_CHANNEL_ID` carries whitespace or is over-long. */
   | "malformed-channel-id"
   /** `ATLAS_PLAN_BASE_BRANCH` is not a plain branch name. */
-  | "malformed-base-branch";
+  | "malformed-base-branch"
+  /** `ATLAS_TRUSTED_ADAPTER_INSTANCES` missing, blank, or yields no usable id (atlas#24). */
+  | "missing-adapter-instances";
 
 export type EffectsConfigLoad =
   | { kind: "ok"; config: EffectsConfig }
@@ -91,6 +161,7 @@ export function makeEffectsConfig(input: {
   planRepo: string;
   planIssue: string | number;
   channelId: string;
+  adapterInstances: string;
   baseBranch?: string | undefined;
   checkoutDir?: string | undefined;
 }): EffectsConfigLoad {
@@ -139,6 +210,19 @@ export function makeEffectsConfig(input: {
     };
   }
 
+  // atlas#24 — required, same posture as channelId: no default that would
+  // silently admit every adapter instance.
+  const trustedAdapterInstances = parseAdapterInstances(
+    typeof input.adapterInstances === "string" ? input.adapterInstances : "",
+  );
+  if (trustedAdapterInstances.size === 0) {
+    return {
+      kind: "refused",
+      reason: "missing-adapter-instances",
+      detail: "no trusted adapter instance id was configured",
+    };
+  }
+
   const checkoutRaw = typeof input.checkoutDir === "string" ? input.checkoutDir.trim() : "";
 
   return {
@@ -149,6 +233,7 @@ export function makeEffectsConfig(input: {
       channelId,
       baseBranch,
       checkoutDir: checkoutRaw.length > 0 ? checkoutRaw : null,
+      trustedAdapterInstances,
     }),
   };
 }
@@ -156,12 +241,14 @@ export function makeEffectsConfig(input: {
 /**
  * Build the effect config from the daemon environment:
  *
- *   ATLAS_PLAN_REPO         `owner/repo` of the plan issue (agent.yaml `plan.repo`)
- *   ATLAS_PLAN_ISSUE        the plan issue number      (agent.yaml `plan.issue`)
- *   ATLAS_CHANNEL_ID        the ONE channel Atlas posts to (agent.yaml
- *                           `presence.discord.channelId`)
- *   ATLAS_PLAN_BASE_BRANCH  optional, default `main`
- *   ATLAS_PLAN_CHECKOUT     optional local clone for doc-change PRs (J6)
+ *   ATLAS_PLAN_REPO                  `owner/repo` of the plan issue (agent.yaml `plan.repo`)
+ *   ATLAS_PLAN_ISSUE                 the plan issue number      (agent.yaml `plan.issue`)
+ *   ATLAS_CHANNEL_ID                 the ONE channel Atlas posts to (agent.yaml
+ *                                    `presence.discord.channelId`)
+ *   ATLAS_TRUSTED_ADAPTER_INSTANCES  adapter-instance id(s) `runtime.ts` admits a task
+ *                                    from (atlas#24); comma/whitespace-separated
+ *   ATLAS_PLAN_BASE_BRANCH           optional, default `main`
+ *   ATLAS_PLAN_CHECKOUT              optional local clone for doc-change PRs (J6)
  */
 export function loadEffectsConfig(
   env: Record<string, string | undefined> = process.env,
@@ -170,6 +257,7 @@ export function loadEffectsConfig(
     planRepo: env.ATLAS_PLAN_REPO ?? "",
     planIssue: env.ATLAS_PLAN_ISSUE ?? "",
     channelId: env.ATLAS_CHANNEL_ID ?? "",
+    adapterInstances: env.ATLAS_TRUSTED_ADAPTER_INSTANCES ?? "",
     baseBranch: env.ATLAS_PLAN_BASE_BRANCH,
     checkoutDir: env.ATLAS_PLAN_CHECKOUT,
   });

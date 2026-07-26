@@ -16,6 +16,7 @@ const OK = {
   ATLAS_PLAN_REPO: "acme/widgets",
   ATLAS_PLAN_ISSUE: "4",
   ATLAS_CHANNEL_ID: "chan-fixture-0000",
+  ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:instance-fixture-0000",
 };
 
 function refusalFor(env: Record<string, string | undefined>): EffectsConfigRefusal | "ok" {
@@ -32,6 +33,7 @@ describe("loadEffectsConfig", () => {
     expect(loaded.config.planUrl).toBe("https://github.com/acme/widgets/issues/4");
     expect(loaded.config.baseBranch).toBe("main");
     expect(loaded.config.checkoutDir).toBeNull();
+    expect(loaded.config.trustedAdapterInstances.has("discord:instance-fixture-0000")).toBe(true);
   });
 
   test("each missing or malformed value is its own NAMED refusal", () => {
@@ -44,6 +46,41 @@ describe("loadEffectsConfig", () => {
     expect(refusalFor({ ...OK, ATLAS_CHANNEL_ID: "  " })).toBe("missing-channel-id");
     expect(refusalFor({ ...OK, ATLAS_CHANNEL_ID: "chan fixture" })).toBe("malformed-channel-id");
     expect(refusalFor({ ...OK, ATLAS_PLAN_BASE_BRANCH: "--force" })).toBe("malformed-base-branch");
+    expect(refusalFor({ ...OK, ATLAS_TRUSTED_ADAPTER_INSTANCES: "" })).toBe(
+      "missing-adapter-instances",
+    );
+    expect(refusalFor({ ...OK, ATLAS_TRUSTED_ADAPTER_INSTANCES: "   " })).toBe(
+      "missing-adapter-instances",
+    );
+  });
+
+  describe("trustedAdapterInstances (atlas#24)", () => {
+    test("accepts multiple comma/whitespace-separated ids", () => {
+      const loaded = loadEffectsConfig({
+        ...OK,
+        ATLAS_TRUSTED_ADAPTER_INSTANCES: "discord:one, discord:two\tdiscord:three",
+      });
+      if (loaded.kind !== "ok") throw new Error(`expected ok, got ${loaded.reason}`);
+      expect(loaded.config.trustedAdapterInstances.has("discord:one")).toBe(true);
+      expect(loaded.config.trustedAdapterInstances.has("discord:two")).toBe(true);
+      expect(loaded.config.trustedAdapterInstances.has("discord:three")).toBe(true);
+      expect(loaded.config.trustedAdapterInstances.size).toBe(3);
+    });
+
+    test("an id not in the configured set is simply absent — no fuzzy match", () => {
+      const loaded = loadEffectsConfig(OK);
+      if (loaded.kind !== "ok") throw new Error(`expected ok, got ${loaded.reason}`);
+      expect(loaded.config.trustedAdapterInstances.has("discord:instance-fixture-0001")).toBe(
+        false,
+      );
+      expect(loaded.config.trustedAdapterInstances.has("")).toBe(false);
+    });
+
+    test("a comma-only value yields no usable id, refused rather than admitting everything", () => {
+      expect(refusalFor({ ...OK, ATLAS_TRUSTED_ADAPTER_INSTANCES: " , , " })).toBe(
+        "missing-adapter-instances",
+      );
+    });
   });
 
   test("an unresolved installer placeholder is refused, not treated as a repo", () => {
@@ -63,6 +100,7 @@ describe("loadEffectsConfig", () => {
       planRepo: "  acme/widgets  ",
       planIssue: " 4 ",
       channelId: " chan-fixture-0000 ",
+      adapterInstances: "discord:instance-fixture-0000",
       checkoutDir: "  ",
     });
     if (loaded.kind !== "ok") throw new Error("expected ok");
@@ -75,6 +113,7 @@ describe("loadEffectsConfig", () => {
       planRepo: "acme/widgets",
       planIssue: 4,
       channelId: "chan-fixture-0000",
+      adapterInstances: "discord:instance-fixture-0000",
     });
     if (loaded.kind !== "ok") throw new Error("expected ok");
     const cfg = loaded.config;
