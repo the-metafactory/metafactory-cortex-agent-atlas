@@ -392,6 +392,133 @@ describe("admission is config-pinned", () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ATLAS_PRINCIPAL_ONLY (atlas#47) — the FOURTH admission dimension.
+//
+// A staging lockdown for Atlas's first live deployment: when on, admission
+// narrows to "the author is the configured principal", reusing the EXACT
+// identity `ratify.ts`'s gate itself checks (`identity.ts`'s
+// `isConfiguredPrincipal`) rather than a second notion of "the principal".
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Effects config with the atlas#47 lockdown ON. */
+function makePrincipalOnlyEffects(): EffectsConfig {
+  const loaded = makeEffectsConfig({
+    planRepo: PLAN_REPO,
+    planIssue: 4,
+    channelId: CHANNEL_ID,
+    adapterInstances: ADAPTER_INSTANCE_ID,
+    principalOnly: "1",
+  });
+  if (loaded.kind !== "ok") throw new Error("fixture: principal-only effects config refused");
+  return loaded.config;
+}
+
+describe("admission is config-pinned — the author dimension (atlas#47)", () => {
+  test("OFF by default — a non-principal ADD still surfaces a proposal (DoD 2, byte-identical)", async () => {
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+    expect(posts()[0]!.text).toContain("Proposal #1 — ADD:");
+    expect(runtime.stats.notAdmitted).toBe(0);
+  });
+
+  test("ON — a non-principal ADD is refused in silence, and nothing is recorded", async () => {
+    rebuildLayer(makePrincipalOnlyEffects());
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+    expect(summaryOf(results()[0])).toBe("not-admitted");
+    // Nothing was recorded — the very same text from the principal is not a
+    // "duplicate", it surfaces as proposal #1.
+    sent.length = 0;
+    await serve(runtime, task(ADD_TEXT, PRINCIPAL_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+    expect(posts()[0]!.text).toContain("Proposal #1 — ADD:");
+  });
+
+  test("ON — the configured principal's ADD is admitted and surfaces normally", async () => {
+    rebuildLayer(makePrincipalOnlyEffects());
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, PRINCIPAL_PLATFORM_ID));
+    expect(posts()).toHaveLength(1);
+    expect(runtime.stats.notAdmitted).toBe(0);
+  });
+
+  test("ON — a non-principal RATIFY is refused at ADMISSION, before it ever reaches the gate", async () => {
+    rebuildLayer(makePrincipalOnlyEffects());
+    const runtime = makeRuntime();
+    // Surface as the principal (the only author admitted), then have the
+    // proposer try to ratify — refused already, same as always, but now the
+    // refusal happens a layer earlier: admission, not the gate.
+    await serve(runtime, task(ADD_TEXT, PRINCIPAL_PLATFORM_ID));
+    sent.length = 0;
+    await serve(runtime, task("RATIFY 1", PROPOSER_PLATFORM_ID));
+    expect(posts()).toHaveLength(0);
+    expect(repo.body).not.toContain(NEW_URL);
+    expect(runtime.stats.ratified).toBe(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+    expect(summaryOf(results()[0])).toBe("not-admitted");
+  });
+
+  test("ON — Atlas's own id never resolves to the principal, so it is refused at admission too", async () => {
+    rebuildLayer(makePrincipalOnlyEffects());
+    const runtime = makeRuntime();
+    await serve(runtime, task(ADD_TEXT, ATLAS_PLATFORM_ID));
+    expect(posts()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+  });
+
+  // ── The fail-closed caveat the issue is emphatic about ──────────────────
+  test("ON + identity UNUSABLE ⇒ a TOTAL MUTE — even the real principal is refused", async () => {
+    rebuildLayer(makePrincipalOnlyEffects());
+    const runtime = makeRuntime({ identity: null });
+    await serve(runtime, task(ADD_TEXT, PRINCIPAL_PLATFORM_ID));
+    expect(posts()).toHaveLength(0);
+    expect(runtime.stats.notAdmitted).toBe(1);
+    expect(summaryOf(results()[0])).toBe("not-admitted");
+  });
+
+  // ── It is a real, working, two-directional switch ───────────────────────
+  // Unlike ATLAS_THREAD_CONVERSATION (which widens admission via a DURABLE
+  // `owned_threads` row that can outlive the flag unless the read path is
+  // ALSO gated), this control reads NO durable state: every task
+  // re-evaluates `effects.principalOnly`, parsed fresh from THIS boot's
+  // environment, against the author on the wire. There is nothing to "carry
+  // forward" in either direction.
+  describe("it is a REAL switch, in both directions", () => {
+    test("turning it OFF (a fresh boot with a new config) restores full admission immediately", async () => {
+      rebuildLayer(makePrincipalOnlyEffects());
+      const locked = makeRuntime();
+      await serve(locked, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+      expect(posts()).toHaveLength(0); // refused while ON
+
+      // The operator turns it off and restarts — same store, same registry.
+      rebuildLayer(makeEffects());
+      sent.length = 0;
+      const afterOff = makeRuntime();
+      await serve(afterOff, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+      expect(posts()).toHaveLength(1); // admitted again, nothing durable held it back
+      expect(afterOff.stats.notAdmitted).toBe(0);
+    });
+
+    test("turning it back ON immediately re-restricts — nothing durable widened it", async () => {
+      rebuildLayer(makeEffects());
+      const before = makeRuntime();
+      await serve(before, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+      expect(posts()).toHaveLength(1);
+
+      rebuildLayer(makePrincipalOnlyEffects());
+      sent.length = 0;
+      const afterOn = makeRuntime();
+      await serve(afterOn, task(ADD_TEXT, PROPOSER_PLATFORM_ID));
+      expect(posts()).toHaveLength(0);
+      expect(afterOn.stats.notAdmitted).toBe(1);
+    });
+  });
+});
+
 // ── The post window ─────────────────────────────────────────────────────────
 
 describe("the post window", () => {

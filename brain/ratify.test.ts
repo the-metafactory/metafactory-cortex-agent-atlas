@@ -16,6 +16,7 @@ import { join } from "node:path";
 import {
   authorizeRatifierAction,
   identityConfigFromPorts,
+  isConfiguredPrincipal,
   isConfiguredRatifier,
   isGateAuthority,
   loadIdentityConfig,
@@ -2207,6 +2208,83 @@ describe("authorizeRatifierAction — the only producer of a gate authority", ()
         }),
       ).toBeNull();
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// isConfiguredPrincipal (atlas#47) — the reused identity behind
+// ATLAS_PRINCIPAL_ONLY. `runtime.ts`'s admission check calls this directly;
+// these tests pin that it is EXACTLY the same resolution `processGateMessage`
+// step 3 performs (`config.principals.resolve(...) === config.ratifier.
+// principalId`), so "who may ratify" and "who Atlas admits" cannot drift.
+// ═══════════════════════════════════════════════════════════════════════════
+describe("isConfiguredPrincipal", () => {
+  test("true for the configured principal's authenticated platform id", () => {
+    expect(isConfiguredPrincipal(config, PLATFORM, PRINCIPAL_PLATFORM_ID)).toBe(true);
+  });
+
+  test("false for an unmapped stranger", () => {
+    expect(isConfiguredPrincipal(config, PLATFORM, STRANGER_PLATFORM_ID)).toBe(false);
+  });
+
+  // Structurally guaranteed, not merely observed: `makeIdentityConfig` refuses
+  // any config where an id appears in BOTH the self set and the ratifier's
+  // platform ids, so a config built through the production loader can never
+  // let Atlas's own id resolve to the principal. Ports-built configs (the test
+  // seam) can still construct that shape, and this pins the outcome anyway —
+  // it is the resolver's honest answer, not a special-cased self-block, since
+  // `isConfiguredPrincipal` deliberately runs NO self-check of its own (see
+  // its docstring for why one is not needed).
+  test("false for Atlas's own id — never resolves to the principal in a real config", () => {
+    expect(isConfiguredPrincipal(config, PLATFORM, ATLAS_PLATFORM_ID)).toBe(false);
+  });
+
+  test("false for a different platform naming the same raw id", () => {
+    expect(isConfiguredPrincipal(config, "slack", PRINCIPAL_PLATFORM_ID)).toBe(false);
+  });
+
+  test("false for blank or missing components — never a wildcard match", () => {
+    expect(isConfiguredPrincipal(config, "", PRINCIPAL_PLATFORM_ID)).toBe(false);
+    expect(isConfiguredPrincipal(config, PLATFORM, "")).toBe(false);
+  });
+
+  test("resolves to the principal even when the map has MULTIPLE platform ids for them", () => {
+    const multi = makeConfig({
+      principalPlatformIds: [PRINCIPAL_PLATFORM_ID, "pid-principal-second-fixture"],
+    });
+    expect(isConfiguredPrincipal(multi, PLATFORM, PRINCIPAL_PLATFORM_ID)).toBe(true);
+    expect(isConfiguredPrincipal(multi, PLATFORM, "pid-principal-second-fixture")).toBe(true);
+    expect(isConfiguredPrincipal(multi, PLATFORM, STRANGER_PLATFORM_ID)).toBe(false);
+  });
+
+  test("a throwing resolver fails closed rather than throwing out of this function", () => {
+    const exploding = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: {
+        resolve(): string | null {
+          throw new Error("cortex config read failed");
+        },
+        knows: () => true,
+      },
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    expect(() => isConfiguredPrincipal(exploding, PLATFORM, PRINCIPAL_PLATFORM_ID)).not.toThrow();
+    expect(isConfiguredPrincipal(exploding, PLATFORM, PRINCIPAL_PLATFORM_ID)).toBe(false);
+  });
+
+  test("MUTATION GUARD: resolving to a DIFFERENT principal than configured is false", () => {
+    // Proves the comparison is against `config.ratifier.principalId`
+    // specifically, not merely "resolved to SOMETHING" — the exact shape of
+    // check `not-the-ratifier` in `processGateMessage` guards against.
+    const otherPrincipal = ports({
+      ratifierPrincipalId: PRINCIPAL_ID,
+      principals: new StaticPrincipalMap([
+        { actor: { platform: PLATFORM, id: STRANGER_PLATFORM_ID }, principalId: "someone-else" },
+      ]),
+      self: new StaticSelfIdentity([{ platform: PLATFORM, id: ATLAS_PLATFORM_ID }]),
+    });
+    expect(otherPrincipal.principals.resolve(PLATFORM, STRANGER_PLATFORM_ID)).toBe("someone-else");
+    expect(isConfiguredPrincipal(otherPrincipal, PLATFORM, STRANGER_PLATFORM_ID)).toBe(false);
   });
 });
 

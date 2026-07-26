@@ -48,7 +48,7 @@ provides:
 # merges and never self-ratifies, so this pack carries no gh write credential
 # either; it uses whatever `gh` the host is already authenticated as.
 #
-# It does, however, READ fifteen environment variables — eight of them
+# It does, however, READ sixteen environment variables — eight of them
 # load-bearing, three of them gating constitution rule 3. They are declared in
 # `capabilities.secrets` below and in agent.yaml's `plan:`, `gate:` and
 # `watch:` blocks, with an operator table in README.md § Configuration.
@@ -133,6 +133,7 @@ capabilities:
     - ATLAS_PLAN_BASE_BRANCH       # default `main`; malformed refuses the WHOLE effect config
     - ATLAS_PLAN_CHECKOUT          # unset ⇒ doc-change PRs disabled (fail closed)
     - ATLAS_THREAD_CONVERSATION    # atlas#25 — 1|true|yes|on ⇒ surface a proposal into a thread Atlas opens; unset ⇒ OFF (today's cortex refuses the effect anyway — see README)
+    - ATLAS_PRINCIPAL_ONLY         # atlas#47 — 1|true|yes|on ⇒ admit ONLY the configured ratifier principal, everyone else refused in silence; unset ⇒ OFF (today's behaviour: any author may surface a proposal). A staging lockdown for first deployment, not the end state.
     - ATLAS_WATCH_INTERVAL_MS      # default 900000 ms, clamped to [60000, 86400000]
     - ATLAS_RECONCILE_INTERVAL_MS  # default 21600000 ms, clamped (brain/reconcile.ts) — found missing from this block, atlas#19 honesty pass
     - ATLAS_STATE_DIR              # default ~/.config/cortex/agents/atlas

@@ -33,6 +33,17 @@
  * `effects/config.ts` already echoes it verbatim in its own malformed-value
  * diagnostic. Masking it would make the line unable to answer the question it
  * exists for.
+ *
+ * ── PRINCIPAL-ONLY is a second, separate verdict on the SAME line (atlas#47) ─
+ * `ATLAS_PRINCIPAL_ONLY` gates ADMISSION (`runtime.ts`'s `serveTask`, before a
+ * task ever reaches the gate), not ratification — so it is deliberately not
+ * folded into GATE ARMED/UNARMED, which answers a narrower question ("will a
+ * RATIFY from the principal be honoured?"). It gets its own clause, appended
+ * to the same one-line string, with its own two states: `ARMED` (working as
+ * intended) and `ARMED-MUTE` (on, but the principal identity is unusable, so
+ * EVERY author including the real principal is refused — see the clause's own
+ * comment for why that is named ARMED rather than UNARMED). Both exist to make
+ * "on and silently admitting nobody" impossible to mistake for "off".
  */
 
 import type { EffectsConfigLoad } from "./effects/config";
@@ -178,13 +189,60 @@ export function buildStartupLine(facts: StartupFacts): string {
         // means the bound channel is the whole universe. An operator debugging
         // "why did nothing happen" should not have to read code to find out
         // which one is live.
-        `threads=${cfg.threadConversation ? "on" : "off"}`,
+        `threads=${cfg.threadConversation ? "on" : "off"} ` +
+        // atlas#47 — the FOURTH admission dimension, always echoed (on or off)
+        // for the same reason `threads=` is: silence about a field here is
+        // exactly the atlas#20/#24 shape (a dimension the line never mentions
+        // can reject 100% of traffic while everything else reads fine). The
+        // richer ARMED / ARMED-MUTE clause below fires only when this is on.
+        `principalOnly=${cfg.principalOnly ? "on" : "off"}`,
     );
   } else {
     parts.push(
       `effects: NONE (${facts.effects.reason}) — Atlas admits no message and can edit ` +
         `nothing. ${facts.effects.detail}`,
     );
+  }
+
+  // ── PRINCIPAL-ONLY (atlas#47) — a SEPARATE clause from GATE ARMED/UNARMED ──
+  //
+  // Deliberately not folded into the verdict above. GATE ARMED/UNARMED answers
+  // "will a RATIFY from the principal be honoured?" — a question about
+  // `ratify.ts`'s gate, reached only AFTER a task is admitted. Principal-only
+  // is an ADMISSION rule `runtime.ts`'s `serveTask` enforces BEFORE that, and
+  // conflating the two would either bury this dimension inside a verdict that
+  // already means something else, or (worse) make an operator read "GATE
+  // ARMED" as covering a check it does not perform.
+  //
+  // Two states are possible once this is ON, and they must never look like
+  // each other or like "off":
+  //
+  //   ARMED       — identity loaded; only the configured principal is
+  //                 admitted. The intended, working state.
+  //   ARMED-MUTE  — identity did NOT load (the same failure GATE UNARMED
+  //                 already reports above). The check "is this author the
+  //                 principal?" is then trivially false for EVERYONE,
+  //                 including the real principal — a TOTAL MUTE. That is the
+  //                 safe direction (never admits an impostor), but is
+  //                 indistinguishable from a dead bot unless stated loudly.
+  //
+  // Named ARMED-MUTE rather than UNARMED on purpose: the check IS engaged and
+  // IS doing exactly what a fail-closed control should — refusing everyone —
+  // so "unarmed" would wrongly read as "not running, fell back to wide-open",
+  // which is precisely the reading this line exists to foreclose.
+  if (facts.effects.kind === "ok" && facts.effects.config.principalOnly) {
+    if (identityOk) {
+      parts.push(
+        "PRINCIPAL-ONLY: ARMED — only the configured ratifier principal is admitted; " +
+          "everyone else is refused in silence",
+      );
+    } else {
+      parts.push(
+        "PRINCIPAL-ONLY: ARMED-MUTE — principal-only is ON but the principal identity is " +
+          "UNUSABLE, so Atlas admits NOBODY AT ALL, not even the real principal, until " +
+          "identity is fixed",
+      );
+    }
   }
 
   parts.push(`state=${facts.stateDurable ? "durable" : "MEMORY-ONLY"}`);

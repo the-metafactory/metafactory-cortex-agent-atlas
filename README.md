@@ -96,6 +96,27 @@ The owned-thread half of admission is gated by the **same** flag that opens thre
 4. **The thread parent is `presence.discord.agentChannelId`.** That is the field cortex reads (and the one its placeholder resolver recognises); `channelId` is not a member of cortex's `DiscordPresenceSchema` at all. This pack's fragment still declares `channelId`, which means the binding does not currently resolve — fixed separately on `fix/presence-agent-channel-id`, deliberately not bundled here, because that change ships regardless of this flag.
 5. **It is an outsider-paced amplifier, and bounded.** Every valid `ADD:` from anyone asks for a thread, against cortex's budget of 10 creates per hour per agent; the eleventh in an hour is refused and the exchange stays in the channel. The brain also waits up to 10s for the host's answer on its single serialised queue. Both degrade safely, neither is reachable with the flag off, and the fix belongs with the wider rate-policy work (atlas#38) rather than here.
 
+## Principal-only lockdown (atlas#47)
+
+A **staging control for a first live deployment, not the end state.** `ATLAS_PRINCIPAL_ONLY`, off by default: on, Atlas admits a task only when its author is the configured ratifier principal — everyone else is refused **silently**, exactly as a wrong channel is today. Off (and unset), behaviour is byte-identical to today: any author may surface a proposal, and only `RATIFY`/`DECLINE` are principal-gated.
+
+**One identity, reused — never a second notion of "the principal".** This is *"the author is in `ATLAS_RATIFIER_PLATFORM_IDS`"* and nothing more, checked through the exact same resolution `ratify.ts`'s gate uses (`identity.ts`'s `isConfiguredPrincipal`). A second identity source would let "who may ratify" and "who Atlas listens to" silently disagree.
+
+**It is a real, working switch, in both directions — trivially.** Unlike the threads flag above (which widens admission via a durable row that can outlive the flag unless the read path is also gated), principal-only reads **no durable state at all**: every task re-checks the author against the CURRENT boot's config. There is nothing to "carry forward" either way — turn it off and the very next task from a non-principal author is admitted; turn it back on and the very next one from that same author is refused.
+
+**Fail-closed, and the one caveat worth knowing.** If the flag is on but the principal identity itself fails to load (see "Required — the ratification gate" above), Atlas admits **nobody at all** — a total mute, not even the real principal is heard. That is the safe direction (never admits an impostor), but on its own it is indistinguishable from a dead bot. The startup line makes this unmistakable with its own clause, separate from `GATE ARMED`/`UNARMED` (which answers a narrower question — "will a RATIFY from the principal be honoured?" — reached only *after* a task is admitted):
+
+```
+PRINCIPAL-ONLY: ARMED — only the configured ratifier principal is admitted; everyone else is refused in silence
+```
+```
+PRINCIPAL-ONLY: ARMED-MUTE — principal-only is ON but the principal identity is UNUSABLE, so Atlas admits NOBODY AT ALL, not even the real principal, until identity is fixed
+```
+
+Named `ARMED-MUTE` rather than `UNARMED` deliberately: the check *is* engaged and *is* doing exactly what a fail-closed control should — refusing everyone — so `UNARMED` would wrongly read as "not running, fell back to wide-open", the one reading this exists to foreclose. With the flag off, neither clause appears at all.
+
+**Interaction with HELP** (once shipped — see atlas#45): with principal-only on, a non-principal `HELP` gets silence like everything else. That is consistent and intended for a staging lockdown, not a regression in HELP's own identity-neutrality.
+
 ### Two wiring limits worth knowing
 
 1. **Ledger posts ride a live task.** `cortex-brain/v1` has no free-standing
@@ -187,6 +208,7 @@ cortex resolves `PlatformAdapter.instanceId` **three different ways** depending 
 | `ATLAS_PLAN_BASE_BRANCH` | Base branch for doc-change PRs. Atlas never pushes to it directly. | Defaults to `main`. A value that is not a plain branch name is `malformed-base-branch`, which refuses the **entire** effect config — a typo here disables the ledger too. |
 | `ATLAS_PLAN_CHECKOUT` | A local working checkout of the plan repo, used to build doc-change PR branches. | Doc-change PRs are **disabled** — fail closed: an unset checkout means "Atlas cannot do doc changes here", never "Atlas guesses a directory". Every other effect still works. |
 | `ATLAS_THREAD_CONVERSATION` | atlas#25 — when **exactly** `1`/`true`/`yes`/`on` (case- and whitespace-insensitive), a surfaced proposal's **conversation** moves into a thread Atlas opens off the bound channel; ledger entries never follow it. The same flag gates whether Atlas *admits* messages from threads it owns, so it is a working kill switch in both directions. | **Off** — byte-identical to pre-atlas#25 Atlas. Any other value, including a blank one, `off`, `no` or a typo, is also **off** (allowlist, not denylist). Read ["Threads"](#threads-atlas22--atlas25) before turning it on: on today's cortex the request is refused `cant_do`, because `create_private_thread` is wired only for `openOnboarding` agents. |
+| `ATLAS_PRINCIPAL_ONLY` | atlas#47 — when **exactly** `1`/`true`/`yes`/`on` (case- and whitespace-insensitive), Atlas admits a task only when its author is the configured ratifier principal (same identity `ATLAS_RATIFIER_PLATFORM_IDS` names); everyone else is refused silently. A staging lockdown for a first live deployment. | **Off** — byte-identical to today's Atlas: any author may surface a proposal. Any other value, including a blank one, `off`, `no` or a typo, is also **off** (allowlist, not denylist). Read ["Principal-only lockdown"](#principal-only-lockdown-atlas47) before enabling — in particular, if the ratification gate's own identity fails to load, this admits **nobody at all**, not even the principal. |
 | `ATLAS_WATCH_INTERVAL_MS` | Completion-watcher poll cadence, in milliseconds. | Defaults to `900000` (15 minutes). Any accepted value is clamped to `[60000, 86400000]`, so an out-of-range number is corrected rather than refused. |
 | `ATLAS_RECONCILE_INTERVAL_MS` | Self-healing reconcile-loop poll cadence, in milliseconds. | Defaults to `21600000` (6 hours). Clamped to `[60000, 604800000]` (1 minute to 7 days); an out-of-range number is corrected rather than refused. |
 | `ATLAS_STATE_DIR` | Instance-state directory (`state.sqlite`, events). | Defaults to `~/.config/cortex/agents/atlas`. |

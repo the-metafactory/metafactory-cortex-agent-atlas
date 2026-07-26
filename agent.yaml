@@ -105,6 +105,11 @@ runtime:
       # it cannot succeed, and what it would do if it could is a product call
       # that is recorded there rather than made here.
       - ATLAS_THREAD_CONVERSATION
+      # atlas#47 — the principal-only lockdown. Unset, or anything other than
+      # 1|true|yes|on ⇒ OFF, and OFF is byte-identical to today's Atlas (any
+      # author may surface a proposal). See the `principalOnly:` block below
+      # before turning it on for a first live deployment.
+      - ATLAS_PRINCIPAL_ONLY
       # Optional durable-state locations. Unset ⇒ the documented defaults.
       - ATLAS_STATE_DIR
       - ATLAS_AGENT_STATE_DIR
@@ -358,6 +363,39 @@ watch:
 #        recorded with atlas#38's rate-policy family, not fixed here.
 threads:
   conversation: __ATLAS_THREAD_CONVERSATION__   # OPTIONAL. 1|true|yes|on ⇒ on. Default OFF.
+
+# ── PRINCIPAL-ONLY (atlas#47) ───────────────────────────────────────────────
+#
+# A STAGING LOCKDOWN for Atlas's first live deployment, not the end state.
+# When on, `runtime.ts`'s `serveTask` admits a task only when its author
+# resolves — via `identity.ts`'s `isConfiguredPrincipal`, the SAME resolution
+# `ratify.ts`'s gate itself performs against `gate:` above — to the ONE
+# configured ratifier principal. Everything else is refused SILENTLY, exactly
+# like a wrong channel: no reply on ANY path (ADD, RATIFY, or ordinary chat),
+# because a "you're not the principal" reply would leak the trust map, the
+# same property the constitution's silence on an outsider's RATIFY protects.
+#
+# There is deliberately NO second identity source here — it reuses
+# `ATLAS_RATIFIER_PLATFORM_IDS` above rather than naming a new principal, so
+# "who may ratify" and "who Atlas admits" cannot silently drift apart.
+#
+# DEFAULT OFF: the live rehearsal asserts a non-principal ADD surfaces a
+# proposal (DoD 2), and default-on would silently change that for every
+# deployment that never heard of this flag. A REAL switch in both directions —
+# unlike `ATLAS_THREAD_CONVERSATION`, this control reads NO durable state at
+# all (every task re-checks the author against THIS boot's config), so there
+# is nothing that could carry a widened-or-narrowed admission across a
+# restart.
+#
+# If this is on but the principal identity itself is unusable (see `gate:`
+# above — `ATLAS_RATIFIER_PRINCIPAL`/`ATLAS_RATIFIER_PLATFORM_IDS`/
+# `ATLAS_SELF_PLATFORM_IDS` failed to load), Atlas admits NOBODY AT ALL — a
+# total mute, not even the real principal is heard. That is the safe
+# direction (never admits an impostor), but it is indistinguishable from a
+# dead bot unless stated loudly — which is exactly what the boot line's
+# `PRINCIPAL-ONLY: ARMED-MUTE` clause exists to do (see `brain/startup.ts`).
+principalOnly:
+  only: __ATLAS_PRINCIPAL_ONLY__   # OPTIONAL. 1|true|yes|on ⇒ on. Default OFF.
 
 # Discord presence — placeholders ONLY. Every identifier below resolves at
 # cortex config-load from the daemon environment (compass#84 / L2), same
